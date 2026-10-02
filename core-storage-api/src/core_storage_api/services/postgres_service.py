@@ -9004,6 +9004,15 @@ class PostgresService:
         canonical_id = canonical.id
         dupe_id = dupe.id
 
+        # The subject pointer is a separate reference from entity links and
+        # relations. Repoint it before deleting the duplicate; its FK would
+        # otherwise set it to NULL and erase the memory's RDF subject.
+        await db.execute(
+            sql_update(Memory)
+            .where(Memory.tenant_id == tenant_id, Memory.subject_entity_id == dupe_id)
+            .values(subject_entity_id=canonical_id)
+        )
+
         # 4a. Repoint MemoryEntityLink (scoped via memories.tenant_id) ──
         await db.execute(
             text("""
@@ -9281,7 +9290,13 @@ class PostgresService:
                         content_lower = content.lower() if content else ""
                         if not any(n.lower() in content_lower for n in names_to_check):
                             continue
-                    to_insert.append({"memory_id": memory_id, "entity_id": entity_id})
+                    to_insert.append(
+                        {
+                            "memory_id": memory_id,
+                            "entity_id": entity_id,
+                            "source": LINK_SOURCE_EXTRACTION,
+                        }
+                    )
 
             links_created = 0
             with phases.phase("insert"):
