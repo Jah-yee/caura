@@ -1,0 +1,208 @@
+# Caura Benchmarks
+
+How Caura (formerly MemClaw) performs on the two most-cited public agent-memory benchmarks — <!-- legacy-name-floor: taught as legacy alias -->
+**LoCoMo** and **LongMemEval** — plus the fleet-shaped dimensions those
+single-agent benchmarks can't measure.
+
+> **TL;DR** — The approved results below cover accuracy and token efficiency.
+> Production fleet decisions also require workload-specific latency and
+> governance validation; no current public production-latency figure is claimed.
+
+## Results
+
+<!-- BEGIN GENERATED: evidence-benchmarks -->
+- **LoCoMo accuracy:** Caura scored 77.9% (1,199/1,540) under its documented LoCoMo semantic-judge protocol using the retrieval-augmented agentic-v1 pipeline.
+- **LongMemEval reference judge:** Caura answered 461 of 500 LongMemEval_S questions correctly (92.2%) under the benchmark's GPT-4o reference judge.
+- **LongMemEval secondary judge:** The same 500 frozen LongMemEval_S answers scored 90.2% (451/500) under the secondary Gemini 3.5 Flash-Lite judge.
+- **LongMemEval token efficiency:** On LongMemEval_S, the median compact retrieved context was 22,410 tokens versus a 107,706-token full haystack: 79.2% context-only savings; counting every reader call yields 75.4%.
+
+Only active, approved claims appear here. Control, withdrawn, and withheld
+records remain in the evidence registry and are excluded from promotional copy.
+See [`evidence/claims.json`](evidence/claims.json) and
+[`EVIDENCE.md`](EVIDENCE.md). Do not hand-edit this block.
+<!-- END GENERATED: evidence-benchmarks -->
+
+## What we measure, and how
+
+- **Accuracy** — an LLM judge scores the answer the retrieval-then-answer
+  pipeline produces against each benchmark's question, rather than `recall@k`
+  over a fixed gold set. The whole pipeline gets the credit, because that's what
+  maps to product behavior.
+- **Token efficiency** — total tokens sent to the answering LLM divided by the
+  same prompt with the full prior conversation inlined (the "no memory system"
+  baseline). The ratio, not the absolute count, is what scales into your bill.
+- **Search latency** — p50 / p95 of `POST /api/v1/search` against a warm
+  pgvector cache under a stated load profile. No current public latency figure
+  is approved; a future claim must publish its raw result or reproducible
+  harness with the hardware, request count, and concurrency.
+
+## What these benchmarks can't measure
+
+Single-agent benchmarks can't ask the questions that decide whether a memory
+system is deployable inside a company:
+
+- Did agent #17's mistake this morning stop agents #1–#40 from repeating it this
+  afternoon? (cross-agent outcome propagation)
+- Does a new agent joining the fleet inherit what the fleet already knows?
+- Is a memory written by the sales fleet correctly **invisible** to a support
+  agent? (scoped visibility)
+- Does cross-tenant data ever leak when the recall query is ambiguous?
+
+None of this moves a `recall@k` number; all of it moves whether you can deploy.
+Caura is built around these — scoped memory (agent / fleet / cross-fleet),
+per-agent trust tiers, keystone policies, PII quarantine before cross-fleet
+exposure, a full audit log, and the `caura_evolve` → `caura_insights`
+outcome-propagation loop. The field still needs a benchmark for the
+fleet-shaped problem; we're working toward one.
+
+## Reproduce it yourself
+
+The accuracy and token-efficiency numbers run against the **public** datasets,
+so you can reproduce the methodology against your own Caura instance:
+
+1. **Stand up Caura locally** — follow the [Quick Start](README.md#quick-start)
+   (`docker compose up -d`). Set an embedding/LLM provider key so memories are
+   embedded and enriched (standalone dummy-embedding mode runs but won't produce
+   meaningful recall).
+2. **Get the datasets** — [LoCoMo](https://arxiv.org/abs/2402.17753) and
+   [LongMemEval](https://arxiv.org/abs/2410.10813) are publicly available.
+3. **Ingest** — for each conversation, write its turns with
+   `POST /api/v1/memories` (one memory per turn / fact).
+   **Then wait for the store to settle before querying.** Embedding, LLM
+   enrichment and atomic-fact fan-out can finish long after the write returns
+   (always so for `POST /api/v1/memories/bulk` on a deferred deployment), and
+   a store measured mid-flight scores differently from the same store later.
+   Poll `GET /api/v1/memories/stats?tenant_id=…` (optionally `agent_id` /
+   `fleet_id`) until it returns `"settled": true`; `pending` breaks the
+   outstanding work down by `embedding` / `enrichment` / `fanout`. Contradiction
+   marks carry no row marker and land a few seconds after the last of those, so
+   allow a short grace period after the flip. A `pending` count that stops
+   shrinking means stranded work (e.g. a disabled embed backfill), not a store
+   that is still converging.
+4. **Query** — for each benchmark question, call `POST /api/v1/search` and pass
+   the retrieved memories to your answering LLM.
+5. **Score** — judge each answer against the benchmark's expected answer with an
+   LLM judge, and compute token usage against the full-context baseline.
+6. **Latency** — measure p50/p95 of `POST /api/v1/search` under your expected
+   concurrency against a warm cache.
+
+> The benchmark runners live in the pinned public
+> [LoCoMo](https://github.com/caura-ai/yanki-locomo/tree/254737614b228ecc4a272e4f17dbb9197c5fb146)
+> and
+> [LongMemEval](https://github.com/caura-ai/caura-longmemeval/tree/3b1e293aacc652694822ab4062c15fef73536335)
+> harnesses. Use the exact commits and configurations recorded in the evidence
+> registry; operator-scale guidance and caveats live in
+> [`docs/performance.md`](docs/performance.md).
+
+### Reranking, specifically
+
+One piece **is** bundled:
+[`scripts/benchmark_rerank_locomo.py`](scripts/benchmark_rerank_locomo.py)
+answers "does second-stage reranking order results better than first-stage
+similarity alone?" on LoCoMo. It scores the *same* candidate pool two ways —
+embedding cosine vs that pool reordered by a `/rerank` sidecar — against each
+question's `evidence` turns, so recall is identical by construction and the
+only variable is ordering. Reports nDCG@5/@10, MRR and P@5 with paired
+bootstrap confidence intervals and a sign test, overall and per LoCoMo
+category. Stdlib only, no cloud dependencies:
+
+```bash
+python scripts/benchmark_rerank_locomo.py \
+    --dataset locomo10.json \
+    --embed-url http://localhost:8080 \
+    --rerank-url http://localhost:8081
+```
+
+Note this isolates the reranker: the baseline is pure cosine, whereas the real
+first-stage also applies freshness decay, weight blending and recall boost. It
+answers "is the cross-encoder worth its latency", not "what is the end-to-end
+pipeline delta".
+
+### First-stage retrieval, specifically
+
+[`scripts/benchmark_blend_locomo.py`](scripts/benchmark_blend_locomo.py) is the
+companion one stage earlier: it varies the **first-stage** score, so which turns
+are retrieved at all is what moves, and **recall** is the headline rather than an
+invariant. It A/Bs the keyword half of
+
+```
+similarity = (1 - FTS_WEIGHT) * vec_sim + FTS_WEIGHT * fts_score
+```
+
+by rescaling `ts_rank_cd` before saturation (`--k`, defaulting to what
+production ships; `k=1` is the **pre-#687** `r/(1+r)` formula), ranking the
+*whole* corpus in both arms. Reports
+recall@5/@10/@20, nDCG@10 and MRR with the same paired bootstrap CI and sign
+test, overall, per category, and — separately — over just the queries where
+`plainto_tsquery` matched anything, since the rest are a mathematical no-op that
+only dilutes the average.
+
+Unlike the rerank harness it needs a Postgres, because `ts_rank_cd` is the thing
+under test and reimplementing Postgres FTS in Python would measure something
+else. Any empty database works; it uses a `TEMP` table and never touches
+application tables.
+
+```bash
+python scripts/benchmark_blend_locomo.py \
+    --dataset locomo10.json \
+    --embed-url http://localhost:8080 \
+    --pg-dsn postgresql://caura:changeme@localhost:5433/caura \
+    --k 6
+```
+
+`k=1` asserts a delta of exactly zero on every metric — a self-check that the
+harness isn't manufacturing differences the change cannot cause. Since #687 shipped
+`FTS_RANK_SCALE`, `k=1` is a *historical* arm: an A/B from it measures the delta
+since before that change, not a delta against what production runs today.
+
+Two limits worth knowing before quoting a number from it. Only ~17% of LoCoMo
+questions lexically match any turn (they are paraphrases), so the overall delta is
+diluted by a large majority of queries the change cannot affect — read the
+`fts-matched-only` block for the effect on queries it applies to. And the measured
+effect rises monotonically with `k` across the range tested, so this benchmark can
+say whether more keyword weight helps on LoCoMo, but it does **not** locate an
+optimum; don't read the largest `k` as the best one.
+
+## Regression sample: comparing a run to the golden
+
+[`benchmark/regression_sample/compare_to_baseline.py`](benchmark/regression_sample/compare_to_baseline.py)
+scores a LongMemEval-runner results file (or directory of them) against a golden
+baseline and prints the per-category accuracy / recall@k delta table with
+threshold flags (exit 1 on a breach).
+
+Its recall is **supersession-aware** by default. The product deliberately
+retires the older side of an update — the contradiction detector marks it
+`outdated`/`conflicted` and chains `supersedes_id` from the newer row, and
+present-state search excludes retired rows — so a status-blind recall counts
+every *correct* supersession of a gold memory as a miss. That false-regression
+signature (category recall drops while its accuracy holds or rises) fired three
+times in the 2026-08-27 A63 sessions (#1023, #1025). The scorer instead credits
+a superseded gold **when a retrieved memory's supersedes chain reaches it**; a
+superseded gold with no retrieved successor still counts as a miss, so a
+detector that buries information without surfacing a replacement keeps hurting
+recall. The denominator is never reduced.
+
+Two things to know before quoting it:
+
+- `--recall-mode legacy` reproduces the historical status-blind counting, for
+  comparability with goldens captured before the scorer existed.
+- Every superseded gold is listed in the report (credited or lost, and by which
+  memory). *Credited* means the metric no longer penalises the supersession —
+  it does **not** certify the supersession was correct. When the
+  `gold superseded` count moves under unchanged data, the detector fired more:
+  audit the listed pairs before trusting either verdict (reg-d15).
+
+## How Caura compares
+
+For a single chatbot, the public-benchmark leaders (Caura, Mem0, Zep) cluster
+in a narrow accuracy band — the choice usually comes down to stack fit, latency,
+and token budget. Caura differentiates on the dimensions a single-agent
+benchmark can't see; see [`docs/performance.md`](docs/performance.md#how-caura-compares)
+for the fleet-scale breakdown and the [feature comparison](README.md#how-caura-compares)
+in the README.
+
+## Sources
+
+- **Blog write-up (canonical, current):** [Fast, Token-Efficient, and Built for Fleets](https://caura.ai/blog/caura-benchmarks) (2026-04-19)
+- **Operator companion:** [`docs/performance.md`](docs/performance.md)
+- **Public benchmarks:** [LoCoMo](https://arxiv.org/abs/2402.17753) · [LongMemEval](https://arxiv.org/abs/2410.10813)

@@ -1,0 +1,3127 @@
+{
+  "components": {
+    "schemas": {
+      "BulkItemResult": {
+        "description": "Per-item outcome of a bulk write (CAURA-602).\n\nStatus semantics:\n\n- ``\"created\"``: this attempt newly inserted the row; ``id`` is the\n  new row's id.\n- ``\"duplicate_attempt\"``: same ``X-Bulk-Attempt-Id``+index already\n  committed in a prior call. ``id`` is the canonical row from that\n  first attempt. Returned when a retry hits the per-item unique\n  constraint — what eliminates the silent-create class.\n- ``\"duplicate_content\"``: a different attempt's row with the same\n  ``content_hash`` already exists. ``id`` and ``duplicate_of`` both\n  point at the existing row; emitted in place of an insert.\n- ``\"error\"``: the row could not be processed (validation,\n  enrichment timeout, missing storage id). ``error`` describes.\n\nThe legacy ``\"duplicate\"`` status is gone — callers must read\n``duplicate_attempt`` vs ``duplicate_content`` because they imply\ndifferent client-side actions (an idempotent retry succeeded vs\n\"you already wrote this content earlier\").",
+        "properties": {
+          "client_request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Request Id"
+          },
+          "duplicate_of": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duplicate Of"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "index": {
+            "title": "Index",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "created",
+              "duplicate_attempt",
+              "duplicate_content",
+              "error"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "index",
+          "status"
+        ],
+        "title": "BulkItemResult",
+        "type": "object"
+      },
+      "BulkMemoryCreate": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "fleet_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fleet Id"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/BulkMemoryItem"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Items",
+            "type": "array"
+          },
+          "tenant_id": {
+            "default": "",
+            "description": "Tenant to operate on. Omit it and the tenant is resolved from the credential, which is what a tenant- or agent-scoped key already identifies — no prior /whoami call is needed. Supply it to act on a different tenant your credential may read (and for an admin key, which belongs to no single tenant, it is required).",
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "visibility": {
+            "anyOf": [
+              {
+                "pattern": "^(scope_agent|scope_team|scope_org)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Visibility"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "BulkMemoryCreate",
+        "type": "object"
+      },
+      "BulkMemoryItem": {
+        "additionalProperties": true,
+        "description": "Single item in a bulk write request. tenant_id/fleet_id/agent_id inherited from parent.",
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "entity_links": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EntityLinkIn"
+            },
+            "title": "Entity Links",
+            "type": "array"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional retention hint. Once this time passes, the row moves to status outdated on the next lifecycle tick and drops out of default search results. Not a hard cutoff: the row remains readable until that tick runs. Distinct from ts_valid_end, which closes a temporal-validity interval rather than expressing retention.",
+            "title": "Expires At"
+          },
+          "memory_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Memory type. Auto-classified by LLM if omitted. Valid values: fact, episode, decision, preference, task, plan, action.",
+            "title": "Memory Type"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          },
+          "object_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Object Value"
+          },
+          "predicate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Predicate"
+          },
+          "reference_datetime": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference Datetime"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "source_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Uri"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "subject_entity_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject Entity Id"
+          },
+          "ts_valid_end": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ts Valid End"
+          },
+          "ts_valid_start": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ts Valid Start"
+          },
+          "weight": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight"
+          },
+          "write_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-item write mode. 'strong' embeds this item inline, so it is searchable as soon as the write is persisted rather than after the background backfill — at the cost of an embedding provider call on the request path. Any other value behaves as 'fast': the item follows the deployment's embedding mode. On a deployment that already embeds inline this has no effect, since every item is embedded inline anyway. Narrower than MemoryCreate.write_mode: on the bulk path 'strong' affects only the embedding — LLM enrichment defers either way — and the tenant's default_write_mode is not consulted, so only an explicit per-item opt-in embeds inline.",
+            "title": "Write Mode"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "title": "BulkMemoryItem",
+        "type": "object"
+      },
+      "BulkMemoryResponse": {
+        "description": "Aggregate response from the bulk-write endpoint.\n\n``duplicates`` rolls up both ``duplicate_attempt`` and\n``duplicate_content`` for top-level metric continuity; per-item\ndetail lives in ``results``. The route returns 200 when everything\nsucceeded and 207 Multi-Status when at least one item is in error —\ncallers must read per-item ``status`` and never infer success from\na 2xx alone.",
+        "properties": {
+          "bulk_ms": {
+            "title": "Bulk Ms",
+            "type": "integer"
+          },
+          "created": {
+            "title": "Created",
+            "type": "integer"
+          },
+          "duplicates": {
+            "title": "Duplicates",
+            "type": "integer"
+          },
+          "errors": {
+            "title": "Errors",
+            "type": "integer"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/BulkItemResult"
+            },
+            "title": "Results",
+            "type": "array"
+          }
+        },
+        "required": [
+          "created",
+          "duplicates",
+          "errors",
+          "results",
+          "bulk_ms"
+        ],
+        "title": "BulkMemoryResponse",
+        "type": "object"
+      },
+      "CauraError": {
+        "description": "Canonical error envelope. ``detail`` is the human-readable message and is retained for backwards compatibility; ``error.code`` is the stable machine-readable identifier and is what clients should branch on.",
+        "properties": {
+          "detail": {
+            "description": "Human-readable message.",
+            "type": "string"
+          },
+          "error": {
+            "properties": {
+              "code": {
+                "description": "Stable UPPER_SNAKE identifier. Derived from the status code unless the raiser supplied a specific one — e.g. READ_ONLY_CREDENTIAL vs PLAN_LIMIT_READ_ONLY, which are both 403 and need different responses from the caller.",
+                "type": "string"
+              },
+              "details": {
+                "additionalProperties": true,
+                "description": "Optional structured context, e.g. remediation or existing_id.",
+                "type": "object"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "detail",
+          "error"
+        ],
+        "title": "CauraError",
+        "type": "object"
+      },
+      "ContradictionInfo": {
+        "description": "Summary of a contradiction detected on write.\n\n``old_memory_id`` always refers to the **pre-existing candidate**\n(never to ``new_memory``), regardless of which row ended up being\nthe older one in the supersession chain. The ``direction`` field\ndisambiguates the two cases:\n\n  - ``\"canonical\"`` — the candidate is older than ``new_memory``;\n    the candidate became outdated/conflicted, ``new_memory``\n    carries ``supersedes_id`` pointing at it. (Historical behaviour.)\n  - ``\"flipped\"`` — the candidate is newer than ``new_memory``;\n    ``new_memory`` is the row that became outdated/conflicted, and\n    the candidate now carries ``supersedes_id`` pointing back at\n    ``new_memory``. This branch was previously unreachable\n    (CAURA-125; gap A6) and is now exercised by deferred-embedding\n    races and ``created_at`` ties.",
+        "properties": {
+          "direction": {
+            "default": "canonical",
+            "enum": [
+              "canonical",
+              "flipped"
+            ],
+            "title": "Direction",
+            "type": "string"
+          },
+          "old_content_preview": {
+            "title": "Old Content Preview",
+            "type": "string"
+          },
+          "old_memory_id": {
+            "format": "uuid",
+            "title": "Old Memory Id",
+            "type": "string"
+          },
+          "old_status": {
+            "title": "Old Status",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "old_memory_id",
+          "old_status",
+          "reason",
+          "old_content_preview"
+        ],
+        "title": "ContradictionInfo",
+        "type": "object"
+      },
+      "EntityLinkIn": {
+        "additionalProperties": false,
+        "properties": {
+          "entity_id": {
+            "format": "uuid",
+            "title": "Entity Id",
+            "type": "string"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entity_id",
+          "role"
+        ],
+        "title": "EntityLinkIn",
+        "type": "object"
+      },
+      "EntityLinkOut": {
+        "properties": {
+          "entity_id": {
+            "format": "uuid",
+            "title": "Entity Id",
+            "type": "string"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entity_id",
+          "role"
+        ],
+        "title": "EntityLinkOut",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HealthResponse": {
+        "properties": {
+          "event_bus": {
+            "description": "ok, unhealthy, or error.",
+            "title": "Event Bus",
+            "type": "string"
+          },
+          "platform_init_errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Only when platform init recorded errors and all dependencies are up (status=degraded).",
+            "title": "Platform Init Errors"
+          },
+          "redis": {
+            "description": "connected, unavailable, or not configured.",
+            "title": "Redis",
+            "type": "string"
+          },
+          "status": {
+            "description": "ok, degraded, or unhealthy (unhealthy is served as 503).",
+            "title": "Status",
+            "type": "string"
+          },
+          "storage": {
+            "description": "connected or unreachable.",
+            "title": "Storage",
+            "type": "string"
+          },
+          "unhealthy_dependencies": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Only on 503: names of failing dependencies.",
+            "title": "Unhealthy Dependencies"
+          }
+        },
+        "required": [
+          "status",
+          "storage",
+          "redis",
+          "event_bus"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "KeystoneData": {
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Only when scope=agent.",
+            "title": "Agent Id"
+          },
+          "author_user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Only when supplied at write time.",
+            "title": "Author User Id"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "scope": {
+            "description": "tenant, fleet, or agent.",
+            "title": "Scope",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "weight": {
+            "description": "Priority bucket 25, 50, or 100 (request labels low/med/high are converted).",
+            "title": "Weight",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "title",
+          "content",
+          "weight",
+          "scope"
+        ],
+        "title": "KeystoneData",
+        "type": "object"
+      },
+      "KeystoneDoc": {
+        "properties": {
+          "collection": {
+            "description": "Always \"_keystones\".",
+            "title": "Collection",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "data": {
+            "$ref": "#/components/schemas/KeystoneData"
+          },
+          "doc_id": {
+            "title": "Doc Id",
+            "type": "string"
+          },
+          "fleet_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null for tenant-scope rules.",
+            "title": "Fleet Id"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "fleet_id",
+          "collection",
+          "doc_id",
+          "data",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "KeystoneDoc",
+        "type": "object"
+      },
+      "KeystonesEnvelope": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/KeystoneDoc"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "rule_set_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The rule-set hash of the rules in items: lowercase hex SHA-256, as the broker computes it for the rules it delivers. Null when a rule can't be hashed (a missing updated_at, a weight that isn't a number).",
+            "title": "Rule Set Hash"
+          }
+        },
+        "required": [
+          "count",
+          "items",
+          "rule_set_hash"
+        ],
+        "title": "KeystonesEnvelope",
+        "type": "object"
+      },
+      "MemoryDetailResponse": {
+        "description": "Full detail for one memory: row fields, entity links, embedding stats.",
+        "properties": {
+          "agent_display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Display Name"
+          },
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "content_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content Hash"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "deleted_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deleted At"
+          },
+          "embedding_preview": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "number"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Embedding Preview"
+          },
+          "embedding_stats": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Embedding Stats"
+          },
+          "entity_links": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Entity Links",
+            "type": "array"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "fleet_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fleet Id"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "last_recalled_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Recalled At"
+          },
+          "memory_type": {
+            "title": "Memory Type",
+            "type": "string"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          },
+          "object_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Object Value"
+          },
+          "predicate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Predicate"
+          },
+          "recall_count": {
+            "title": "Recall Count",
+            "type": "integer"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "source_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Uri"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "subject_entity_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject Entity Id"
+          },
+          "supersedes_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Supersedes Id"
+          },
+          "system_metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "System Metadata"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "ts_valid_end": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ts Valid End"
+          },
+          "ts_valid_start": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ts Valid Start"
+          },
+          "visibility": {
+            "title": "Visibility",
+            "type": "string"
+          },
+          "weight": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "agent_id",
+          "memory_type",
+          "content",
+          "status",
+          "visibility",
+          "recall_count"
+        ],
+        "title": "MemoryDetailResponse",
+        "type": "object"
+      },
+      "MemoryOut": {
+        "properties": {
+          "agent_display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Display Name"
+          },
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "entity_links": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EntityLinkOut"
+            },
+            "title": "Entity Links",
+            "type": "array"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "fleet_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fleet Id"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "injected": {
+            "default": false,
+            "title": "Injected",
+            "type": "boolean"
+          },
+          "is_inferred": {
+            "default": false,
+            "title": "Is Inferred",
+            "type": "boolean"
+          },
+          "last_recalled_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Recalled At"
+          },
+          "memory_type": {
+            "title": "Memory Type",
+            "type": "string"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          },
+          "object_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Object Value"
+          },
+          "predicate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Predicate"
+          },
+          "recall_count": {
+            "default": 0,
+            "title": "Recall Count",
+            "type": "integer"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "score_parts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScoreParts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "similarity": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Similarity"
+          },
+          "source_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Uri"
+          },
+          "status": {
+            "default": "active",
+            "title": "Status",
+            "type": "string"
+          },
+          "subject_entity_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject Entity Id"
+          },
+          "superseded_by": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ContradictionInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Superseded By"
+          },
+          "supersedes_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Supersedes Id"
+          },
+          "system_metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "System Metadata"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "ts_valid_end": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ts Valid End"
+          },
+          "ts_valid_start": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ts Valid Start"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UsageSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "visibility": {
+            "default": "scope_team",
+            "title": "Visibility",
+            "type": "string"
+          },
+          "weight": {
+            "title": "Weight",
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "agent_id",
+          "memory_type",
+          "content",
+          "weight",
+          "source_uri",
+          "run_id",
+          "metadata",
+          "created_at",
+          "expires_at"
+        ],
+        "title": "MemoryOut",
+        "type": "object"
+      },
+      "MemoryType": {
+        "description": "Typed enum for the memory-type vocabulary.\n\nInheriting from ``str`` keeps full backward compatibility with the\nstring-based call sites: ``MemoryType.FACT == \"fact\"`` is True,\ndict lookup with the enum hashes the same as the literal, JSON\nserialisation emits the bare string, and SQLAlchemy reads of a\n``Text`` column coerce cleanly via Pydantic.",
+        "enum": [
+          "fact",
+          "episode",
+          "decision",
+          "preference",
+          "task",
+          "semantic",
+          "intention",
+          "plan",
+          "commitment",
+          "action",
+          "outcome",
+          "cancellation",
+          "rule",
+          "insight"
+        ],
+        "title": "MemoryType",
+        "type": "string"
+      },
+      "MemoryUpdate": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "anyOf": [
+              {
+                "maxLength": 10000,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content"
+          },
+          "entity_links": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/EntityLinkIn"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Entity links to **add** to this memory. Additive, unlike ``metadata``: links already on the memory are kept even when this list does not name them, and re-sending a pair already present leaves its existing ``role`` unchanged rather than overwriting it. There is no replace mode and no way to remove a link through this endpoint. An ``entity_id`` outside the caller's tenant is rejected with 422.",
+            "title": "Entity Links"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional retention hint. Once this time passes, the row moves to status outdated on the next lifecycle tick and drops out of default search results. Not a hard cutoff: the row remains readable until that tick runs. Distinct from ts_valid_end, which closes a temporal-validity interval rather than expressing retention.",
+            "title": "Expires At"
+          },
+          "memory_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Memory type. Auto-classified by LLM if omitted. Valid values: fact, episode, decision, preference, task, plan, action."
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Free-form metadata stored with the memory. Keys you send are yours: enrichment never overwrites a `summary` or `tags` you supply here, on this write or on any later one — the platform's own versions go to `system_metadata` instead. Platform-reserved keys (timings, governance verdicts, provenance) are stripped from this dict; send them and they are dropped, not stored.",
+            "title": "Metadata"
+          },
+          "metadata_mode": {
+            "anyOf": [
+              {
+                "pattern": "^(merge|replace)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How to apply ``metadata``: ``merge`` (default when omitted or ``null``) does a top-level JSONB ``||`` merge, preserving keys not present in the patch; ``replace`` overwrites the column wholesale.",
+            "title": "Metadata Mode"
+          },
+          "object_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Object Value"
+          },
+          "predicate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Predicate"
+          },
+          "source_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Uri"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "pattern": "^(active|pending|confirmed|cancelled|outdated|conflicted|archived|deleted)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "subject_entity_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject Entity Id"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "ts_valid_end": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ts Valid End"
+          },
+          "ts_valid_start": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ts Valid Start"
+          },
+          "visibility": {
+            "anyOf": [
+              {
+                "pattern": "^(scope_agent|scope_team|scope_org)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Visibility"
+          },
+          "weight": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight"
+          }
+        },
+        "title": "MemoryUpdate",
+        "type": "object"
+      },
+      "PaginatedMemoryResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryOut"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "PaginatedMemoryResponse",
+        "type": "object"
+      },
+      "ScoreParts": {
+        "description": "D12 — per-factor breakdown of the ranking composite ``MemoryOut.score``.\n\nEvery factor mirrors a column the scored-search SQL already computes and\nreturns per row; this model only surfaces them. All fields are nullable:\nFTS-only rows have no ``vec_sim``, entity-lookup short-circuit rows have no\nFTS rank, and successor-injected rows were never scored at all.",
+        "properties": {
+          "entity_boost": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entity Boost"
+          },
+          "freshness": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Freshness"
+          },
+          "fts_score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fts Score"
+          },
+          "recall_boost": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recall Boost"
+          },
+          "status_penalty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Penalty"
+          },
+          "temporal_boost": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Temporal Boost"
+          },
+          "vec_sim": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vec Sim"
+          }
+        },
+        "title": "ScoreParts",
+        "type": "object"
+      },
+      "SearchDiagnostic": {
+        "description": "D12 — retrieval trace returned when ``SearchRequest.diagnostic`` is true.\n\nAnswers \"why did each result appear (and what got cut)\": the full widened\ncandidate set with per-row score factors and exclusion reasons, the applied\nknobs, and the strategy the classifier picked. Requesting it does NOT change\nthe ``items`` a caller gets back, and a diagnostic call never bumps\n``recall_count`` — it is inspection, not use.",
+        "properties": {
+          "all_candidates": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "All Candidates",
+            "type": "array"
+          },
+          "candidates_considered": {
+            "default": 0,
+            "title": "Candidates Considered",
+            "type": "integer"
+          },
+          "entity_match_declined": {
+            "default": false,
+            "description": "True when the entity match was refused as over-broad (> ENTITY_LOOKUP_MAX_MATCHES). This is the only decline that also suppresses the per-row entity boost; an under-filled pool falls through with the boost still applied and reports False here.",
+            "title": "Entity Match Declined",
+            "type": "boolean"
+          },
+          "entity_matches": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Entities the query's tokens matched in entity FTS, counted before the over-broad decline empties the set. None means the lookup never ran (entity retrieval off, no entity-shaped tokens, or a swallowed failure) — distinct from 0, which means it ran and matched nothing.",
+            "title": "Entity Matches"
+          },
+          "excluded_below_min_similarity": {
+            "default": 0,
+            "title": "Excluded Below Min Similarity",
+            "type": "integer"
+          },
+          "excluded_by_top_k_trim": {
+            "default": 0,
+            "title": "Excluded By Top K Trim",
+            "type": "integer"
+          },
+          "min_similarity_applied": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Similarity Applied"
+          },
+          "retrieval_strategy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retrieval Strategy"
+          },
+          "returned": {
+            "default": 0,
+            "title": "Returned",
+            "type": "integer"
+          },
+          "search_params": {
+            "additionalProperties": true,
+            "default": {},
+            "title": "Search Params",
+            "type": "object"
+          },
+          "top_k_requested": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Top K Requested"
+          }
+        },
+        "title": "SearchDiagnostic",
+        "type": "object"
+      },
+      "SearchRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "caller_agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Assert the agent identity this search runs as, WITHOUT filtering results to that agent's own memories (use filter_agent_id for that). Determines which scope_agent memories are visible and whose trust/fleet level the read is gated against. Ignored when the credential already carries an agent identity, which wins. An agent-scoped credential may only name itself.",
+            "title": "Caller Agent Id"
+          },
+          "diagnostic": {
+            "default": false,
+            "title": "Diagnostic",
+            "type": "boolean"
+          },
+          "entity_boost": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Set false for this call only to rank by the plain hybrid (vector + full-text) score: entity/graph retrieval is skipped, so no entity boost multiplier is applied and the ENTITY_LOOKUP short-circuit cannot fire. Omit (or true) for the tenant's search.entity_retrieval behaviour; a request cannot enable entity retrieval over a tenant that disabled it. REST only: the MCP tools do not expose this per request.",
+            "title": "Entity Boost"
+          },
+          "filter_agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filter Agent Id"
+          },
+          "fleet_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fleet Ids"
+          },
+          "include_derived": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether to return atomic-fact fan-out children — short single-claim rows the platform derives from a memory you wrote, which stay retrievable alongside it. Omit to inherit the tenant's search.include_derived setting, which in turn falls back to the global default (currently true). Precedence: this field beats the tenant setting beats the global default. Excluded rows are dropped BEFORE the top_k trim, so top_k still returns top_k rows. Does not affect auto-chunk children, which are the only sub-document vectors a long document has. REST only: the MCP tools do not expose this per request — an MCP caller sets the tenant's search.include_derived instead, and an unknown argument sent to an MCP tool is dropped silently rather than reported (oss-0923-h-01).",
+            "title": "Include Derived"
+          },
+          "memory_type_filter": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Filter results to a single memory type. Valid values: fact, episode, decision, preference, task, semantic, intention, plan, commitment, action, outcome, cancellation, rule, insight."
+          },
+          "min_similarity": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-request similarity floor (0.0-1.0) applied to the raw cosine; overrides the agent/tenant search-profile value for this call.",
+            "title": "Min Similarity"
+          },
+          "query": {
+            "maxLength": 5000,
+            "minLength": 1,
+            "title": "Query",
+            "type": "string"
+          },
+          "recall_boost": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Set false for this call only to neutralise the popularity recall_boost factor (score multiplier fixed at 1.0) AND to skip the recall_count bump for the returned rows, so the read neither uses nor feeds the recall signal (the response reports recall_tracked: false). Omit (or true) for the tenant's behaviour; a request cannot enable the boost over a tenant that disabled it. REST only: the MCP tools do not expose this per request.",
+            "title": "Recall Boost"
+          },
+          "status_filter": {
+            "anyOf": [
+              {
+                "pattern": "^(active|pending|confirmed|cancelled|outdated|conflicted|archived|deleted)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Restrict results to one status. When omitted, superseded memories are hidden: 'outdated' rows are excluded, and 'conflicted' rows are excluded unless they exactly match the query text. Their replacements are injected in their place. Pass an explicit status to bypass this and read the superseded rows directly.",
+            "title": "Status Filter"
+          },
+          "tenant_id": {
+            "default": "",
+            "description": "Tenant to operate on. Omit it and the tenant is resolved from the credential, which is what a tenant- or agent-scoped key already identifies — no prior /whoami call is needed. Supply it to act on a different tenant your credential may read (and for an admin key, which belongs to no single tenant, it is required).",
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "top_k": {
+            "default": 5,
+            "description": "Maximum results the query returns (1-200, default 5). Not the response ceiling: each returned outdated/conflicted row also carries its newest correction, injected beyond this budget and marked injected: true (with score: null), so a response holds at most 2*top_k items. Also accepted as 'limit': sent on its own it is absorbed silently and no warning is raised. Sent together with 'top_k', top_k wins and the response carries a 'superseded_parameter_alias' warning naming 'limit' as superseded by 'top_k' — not an 'unrecognized_parameters' one, because the endpoint does read 'limit'; it was simply outranked.",
+            "maximum": 200.0,
+            "minimum": 1.0,
+            "title": "Top K",
+            "type": "integer"
+          },
+          "valid_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "As-of time for the question (ISO 8601). Rows whose ts_valid_start is after this date are excluded and rows whose ts_valid_end is before it are down-weighted; relative dates in the query ('last month') are resolved against it. When the tenant's search.default_profile sets freshness_reference=1, freshness and the temporal window are ALSO measured from this time against each row's event time (ts_valid_start, else created_at) instead of from now() — the setting for backfilled corpora where ingest time carries no signal. Naive values are read as UTC.",
+            "title": "Valid At"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "SearchRequest",
+        "type": "object"
+      },
+      "SearchResponse": {
+        "description": "Envelope for search results — matches PaginatedMemoryResponse shape.",
+        "properties": {
+          "diagnostic": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SearchDiagnostic"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryOut"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "recall_tracked": {
+            "default": false,
+            "description": "Whether this search bumped recall_count for the memories it returned. False means they were not reinforced: the caller presented no agent identity (a tenant-scoped key that did not set filter_agent_id — recall_count stays 0 for that caller and recall_boost never engages), the call set diagnostic=true or recall_boost=false, or nothing matched.",
+            "title": "Recall Tracked",
+            "type": "boolean"
+          },
+          "warnings": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SearchWarning"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Warnings"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "SearchResponse",
+        "type": "object"
+      },
+      "SearchWarning": {
+        "description": "A28 — a coded, non-fatal caveat about the result set.\n\nThe search succeeded, but something the caller would reasonably assume\nhappened did not. Distinct from ``SearchDiagnostic``: that is opt-in\nintrospection, this is unsolicited and only present when there is something\nto say.",
+        "properties": {
+          "code": {
+            "description": "Stable slug, e.g. 'successor_enrichment_incomplete'.",
+            "title": "Code",
+            "type": "string"
+          },
+          "details": {
+            "additionalProperties": true,
+            "description": "Machine-readable context.",
+            "title": "Details",
+            "type": "object"
+          },
+          "message": {
+            "description": "Human-readable summary of what is incomplete.",
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "SearchWarning",
+        "type": "object"
+      },
+      "UsageSummary": {
+        "properties": {
+          "memories_limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memories Limit"
+          },
+          "memories_stored": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memories Stored"
+          },
+          "writes_remaining": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Writes Remaining"
+          }
+        },
+        "title": "UsageSummary",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "VersionResponse": {
+        "properties": {
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version"
+        ],
+        "title": "VersionResponse",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "APIKeyHeader": {
+        "in": "header",
+        "name": "X-API-Key",
+        "type": "apiKey"
+      }
+    }
+  },
+  "info": {
+    "title": "Caura core-api broker contract",
+    "version": "v1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/health": {
+      "get": {
+        "description": "Liveness + readiness probe.\n\nReturns 503 when any required dependency is unavailable so deploy\ngates and Cloud Run health checks can fail-fast on status code alone.\nRequired deps:\n  - storage (core-storage-api): always\n  - redis:                      only when ``settings.redis_url`` is set\n                                (empty url = in-memory fallback, OSS default)\n  - event_bus:                  ``InProcessEventBus`` always reports ok;\n                                ``PubSubEventBus`` reports ``unhealthy``\n                                when a pull loop has halted on a permanent\n                                subscription / IAM error.\n\nNon-critical issues (platform provider init errors) flip status to\n``\"degraded\"`` but keep a 200 — the app can still serve requests.",
+        "operationId": "health_api_v1_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authentication failed or was not supplied."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authenticated, but not permitted to perform this operation."
+          }
+        },
+        "summary": "Health",
+        "tags": [
+          "System"
+        ]
+      }
+    },
+    "/api/v1/keystones": {
+      "get": {
+        "description": "Return scope-merged keystone rules. No trust gate — reads are\nsafe and the plugin needs this on every session start.\n\nCross-tenant credentials may inspect any tenant in their readable set\nby pinning ``tenant_id`` to it; the read is scoped to that single\ntenant's rules. Aggregate keystone view across the readable set\nisn't exposed here — agents should keep keystones explicitly per\ntenant for scope clarity.\n\nThe envelope's ``rule_set_hash`` names the rules in ``items``, so a\ncaller can tell whether a set it holds is still current.",
+        "operationId": "list_keystones_api_v1_keystones_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "fleet_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Fleet Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "description": "C30/D1 opt-in: return {count, items} instead of the bare array. The bare array stays the default until a separate announced deprecation wave.",
+            "in": "query",
+            "name": "envelope",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "C30/D1 opt-in: return {count, items} instead of the bare array. The bare array stays the default until a separate announced deprecation wave.",
+              "title": "Envelope",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "items": {
+                        "$ref": "#/components/schemas/KeystoneDoc"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KeystonesEnvelope"
+                    }
+                  ],
+                  "title": "Response 200 List Keystones Api V1 Keystones Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authentication failed or was not supplied."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authenticated, but not permitted to perform this operation."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "List Keystones",
+        "tags": [
+          "Keystones"
+        ]
+      }
+    },
+    "/api/v1/memories": {
+      "get": {
+        "description": "List memories with filtering, sorting, and pagination.\n\n**Visibility scoping:** When ``agent_id`` is provided, the caller can see\ntheir own ``scope_agent`` memories plus all ``scope_team``/``scope_org``\nmemories. When ``agent_id`` is omitted, ``scope_agent`` memories are hidden\n(safe default). This means memory types like ``insight`` that are typically\ncreated with agent-scoped visibility will only appear when ``agent_id`` is\npassed. A signed-in person (a dashboard session or JWT through the gateway)\nsees every scope, whatever ``agent_id`` says, as ``GET /memories/{id}``\nalready lets them open any row.\n\n**Author filter:** ``written_by`` selects the authoring agent. It is separate\nfrom ``agent_id`` (the visibility identity) so a caller can ask for a peer's\nauthored rows without claiming that peer's identity; ``agent_id`` remains the\nauthor filter when ``written_by`` is omitted. Filtering by author only ever\nnarrows the caller's existing visibility — it cannot surface a row an\nunfiltered list would have hidden.\n\n**Scope:** ``scope`` is optional and mirrors the MCP / plugin ``caura_list``\ncontract, including its trust ladder (see ``_resolve_scoped_read``). Omit it\nand the route behaves exactly as before.\n\n**Pagination:** Both cursor-based and offset-based pagination are supported.\nCursor pagination (via ``cursor``) is recommended for large datasets and only\nworks with ``sort=created_at&order=desc``. Offset pagination works with any\nsort order.",
+        "operationId": "list_memories_api_v1_memories_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "tenant_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tenant Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "fleet_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Fleet Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "description": "Opt-in read scope, mirroring the MCP/plugin contract. 'agent' = your own memories (trust >= 1); 'fleet' = cross-agent within a fleet (own fleet trust >= 1, a different fleet trust >= 2); 'all' = tenant-wide (trust >= 2). Omit for the historical behaviour, where `agent_id` is the author filter. Unrelated to the `visibility` parameter despite the shared word: this selects how wide to look at read time, `visibility=scope_*` filters on the tier a writer stamped on the row. Keystone routes spell their own scope with a different enum again ('tenant' where this says 'all').",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(agent|fleet|all)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opt-in read scope, mirroring the MCP/plugin contract. 'agent' = your own memories (trust >= 1); 'fleet' = cross-agent within a fleet (own fleet trust >= 1, a different fleet trust >= 2); 'all' = tenant-wide (trust >= 2). Omit for the historical behaviour, where `agent_id` is the author filter. Unrelated to the `visibility` parameter despite the shared word: this selects how wide to look at read time, `visibility=scope_*` filters on the tier a writer stamped on the row. Keystone routes spell their own scope with a different enum again ('tenant' where this says 'all').",
+              "title": "Scope"
+            }
+          },
+          {
+            "description": "Author filter. Distinct from `agent_id`, which also serves as the visibility identity; falls back to `agent_id` when omitted.",
+            "in": "query",
+            "name": "written_by",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Author filter. Distinct from `agent_id`, which also serves as the visibility identity; falls back to `agent_id` when omitted.",
+              "title": "Written By"
+            }
+          },
+          {
+            "in": "query",
+            "name": "memory_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Memory Type"
+            }
+          },
+          {
+            "in": "query",
+            "name": "exclude_memory_types",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Exclude Memory Types"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "description": "Filter on the write-time visibility tier stamped on the row (`scope_agent`, `scope_team`, `scope_org`). Not the `scope` parameter above, which chooses read breadth — the two words look alike and control different things.",
+            "in": "query",
+            "name": "visibility",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter on the write-time visibility tier stamped on the row (`scope_agent`, `scope_team`, `scope_org`). Not the `scope` parameter above, which chooses read breadth — the two words look alike and control different things.",
+              "title": "Visibility"
+            }
+          },
+          {
+            "in": "query",
+            "name": "run_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Run Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "weight_min",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 1,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Weight Min"
+            }
+          },
+          {
+            "in": "query",
+            "name": "weight_max",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 1,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Weight Max"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "default": "created_at",
+              "pattern": "^(created_at|weight|memory_type|agent_id|status|recall_count|fleet_id|tenant_id|expires_at|deleted_at)$",
+              "title": "Sort",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "desc",
+              "pattern": "^(asc|desc)$",
+              "title": "Order",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page, 1-500. A value above 500 is rejected with 422 (not silently clamped); page via `cursor`/`offset` for more.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "Items per page, 1-500. A value above 500 is rejected with 422 (not silently clamped); page via `cursor`/`offset` for more.",
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include soft-deleted rows. Honoured for tenant credentials; an agent credential needs trust >= 3, below which it is ignored (as on MCP `caura_list`).",
+            "in": "query",
+            "name": "include_deleted",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Include soft-deleted rows. Honoured for tenant credentials; an agent credential needs trust >= 3, below which it is ignored (as on MCP `caura_list`).",
+              "title": "Include Deleted",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedMemoryResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authentication failed or was not supplied."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authenticated, but not permitted to perform this operation."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "List Memories",
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/api/v1/memories/bulk": {
+      "post": {
+        "description": "Write up to 100 memories with per-attempt idempotency (CAURA-602).\n\nRequired header ``X-Bulk-Attempt-Id`` identifies the *attempt*. A\nretry of the same logical batch reuses the same value; storage's\nper-item unique constraint then converts each row into either\n``created`` or ``duplicate_attempt`` deterministically.\n\nA retry may carry the WHOLE batch or only the items that did not\nsucceed — both are safe, because the per-item key is derived from the\nitem's content rather than its position in the body (H-08; the\nderivation in ``create_memories_bulk`` records what positional keys did\nto a trimmed retry). Since the 207 below hands back per-item results\nnaming exactly which items failed, trimming is the obvious thing for a\nclient to do, and it now behaves as a smaller batch rather than as a\nbody whose every index means something else.\n\nThe route returns:\n\n- ``200`` when every item resolved as ``created``,\n  ``duplicate_attempt``, or ``duplicate_content``.\n- ``207 Multi-Status`` when at least one item has ``status=\"error\"``\n  (validation, enrichment timeout, missing storage id) AND at least\n  one item succeeded — partial outcomes are explicit, never inferred\n  from a 5xx with side effects.\n- ``200`` when every item is an error too — the request was processed\n  successfully; per-item ``status`` carries the rejection. We\n  deliberately don't reuse 422 here because FastAPI already emits\n  422 for request-body Pydantic validation, and clients that branch\n  on status code alone shouldn't have to disambiguate \"request was\n  malformed\" from \"request parsed and every item was rejected on\n  merit.\"\n- ``504`` when the bulk-only budget burns before storage commits;\n  the response carries no per-item state, so a retry with the same\n  attempt id is the recovery path.\n\nThe pre-existing ``Idempotency-Key`` header still controls\n*response*-level replay; ``X-Bulk-Attempt-Id`` is a separate\ncontract operating one layer down. Both are honoured: the header\ncache short-circuits when the receipt is final, the per-row\nconstraint resolves the slow path when the receipt is missing or\npending.",
+        "operationId": "write_memories_bulk_api_v1_memories_bulk_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Bulk-Attempt-Id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Bulk-Attempt-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkMemoryCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkMemoryResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkMemoryResponse"
+                }
+              }
+            },
+            "description": "Multi-Status"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authentication failed or was not supplied."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authenticated, but not permitted to perform this operation."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Write Memories Bulk",
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/api/v1/memories/{memory_id}": {
+      "delete": {
+        "operationId": "delete_memory_api_v1_memories__memory_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "memory_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Memory Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authentication failed or was not supplied."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authenticated, but not permitted to perform this operation."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Delete Memory",
+        "tags": [
+          "Memory"
+        ]
+      },
+      "get": {
+        "description": "Get a single memory with full details including embedding and entity links.",
+        "operationId": "get_memory_api_v1_memories__memory_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "memory_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Memory Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryDetailResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authentication failed or was not supplied."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authenticated, but not permitted to perform this operation."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Get Memory",
+        "tags": [
+          "Memory"
+        ]
+      },
+      "patch": {
+        "description": "Update a memory. Only provide fields you want to change.\n\nIf content changes, embedding and entity extraction are re-run automatically.\n\nConcurrency contract (intentional, not a bug):\n\n- Each top-level column is **last-write-wins**. Two concurrent PATCHes that\n  set the same column (e.g. ``title``) will both return 200 and the row\n  will hold whichever update commits second. There is no compare-and-swap\n  and no optimistic-lock token — callers that need that must coordinate\n  externally or use ``If-Match`` semantics layered on top.\n- ``metadata`` defaults to a **JSONB top-level merge** (``||``): keys not\n  present in the patch are preserved, keys present in both patches resolve\n  last-write-wins per key. Pass ``metadata_mode: \"replace\"`` for a full\n  overwrite. Two concurrent PATCHes that each set a distinct metadata key\n  will therefore leave **both keys present** on the row — that is the\n  defined behaviour, not a partial-merge anomaly.\n- ``entity_links`` is **add-only**, and has no replace mode. Links already\n  on the memory survive a PATCH that does not name them, and re-sending a\n  pair already present keeps its existing ``role`` rather than overwriting\n  it (the insert is ``ON CONFLICT DO NOTHING``). So concurrent PATCHes\n  naming different entities leave **both links present**, and there is no\n  request through this endpoint that removes one.",
+        "operationId": "update_memory_endpoint_api_v1_memories__memory_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "memory_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Memory Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "description": "C7: alias for the body field of the same name. Body wins on conflict. When supplied as a query param without a matching ``metadata`` field in the body, returns 422 (same contract as the body-side validator). Provided so SDK callers that thread the toggle through a URL query don't silently get the default merge behaviour.",
+            "in": "query",
+            "name": "metadata_mode",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(merge|replace)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "C7: alias for the body field of the same name. Body wins on conflict. When supplied as a query param without a matching ``metadata`` field in the body, returns 422 (same contract as the body-side validator). Provided so SDK callers that thread the toggle through a URL query don't silently get the default merge behaviour.",
+              "title": "Metadata Mode"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authentication failed or was not supplied."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authenticated, but not permitted to perform this operation."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Update Memory Endpoint",
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/api/v1/search": {
+      "post": {
+        "operationId": "search_api_v1_search_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authentication failed or was not supplied."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authenticated, but not permitted to perform this operation."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Search",
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/api/v1/version": {
+      "get": {
+        "operationId": "version_api_v1_version_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authentication failed or was not supplied."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CauraError"
+                }
+              }
+            },
+            "description": "Authenticated, but not permitted to perform this operation."
+          }
+        },
+        "summary": "Version",
+        "tags": [
+          "System"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,2070 @@
+"""GCP Pub/Sub event bus — used in SaaS deployments.
+
+Publishers push JSON-encoded `Event` payloads to per-topic Pub/Sub
+topics; subscribers pull messages from per-subscriber subscriptions and
+dispatch to async handlers.
+
+Topic + *durable* subscription provisioning is *not* done here — it's
+expected to be managed via Terraform / gcloud at deploy time so
+subscription configuration (ack deadlines, retry policies, dead-letter
+topics) lives with infra. This class assumes those already exist. The
+SOLE exception is per-process *broadcast* subscriptions (see
+``subscribe(broadcast=True)``): their names embed a per-process id so
+Terraform can't pre-provision them, so ``_ensure_broadcast_subscription``
+creates one at ``start()`` (with an ``expiration_policy`` backstop) and
+deletes it at ``stop()``.
+
+That per-process id is a claimed *slot* (see ``_claim_broadcast_slot``),
+not a random value. The distinction is the difference between a leak
+bounded by how many workers are alive and a leak bounded by how many
+workers have ever died: a SIGKILLed worker's replacement re-derives the
+same name and reuses the subscription, where a random name orphans one
+per death for a full ``BROADCAST_SUBSCRIPTION_TTL_SECONDS``. Deletion at
+``stop()`` is still load-bearing and is NOT made redundant by this — the
+two cover different exits. See ``release_broadcast_subscriptions``.
+
+Import is lazy so `common.events` can be imported in OSS standalone
+installs that don't have `google-cloud-pubsub` installed.
+
+**Cross-environment isolation.** When two environments (e.g. production
+and a sandbox/staging) share one GCP project, they also share the topic
+namespace — topic names are not env-scoped. Each env gets its *own*
+subscription per topic, so Pub/Sub fans every published message out to
+*both* environments' subscribers. The foreign-env subscriber then does
+real work (a worker re-runs the embed/enrich provider call on the payload
+content) before its tenant-scoped DB write no-ops, wasting spend and
+emitting `target row missing` noise. To prevent this, the bus stamps each
+message with a `source_env` attribute (see ``SOURCE_ENV_ATTRIBUTE``) and
+``_pull_loop`` ack-drops any message whose `source_env` differs from this
+process's ``env`` *before* decode/dispatch. The guard is a no-op when
+``env`` is unset or the attribute is absent (backward-compatible with
+publishers that predate the attribute), so it is safe to roll out in any
+order. A follow-up moves the same drop server-side via a subscription
+`filter` on the attribute.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import contextlib
+import functools
+import json
+import logging
+import os
+import tempfile
+import threading
+import uuid
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+from pydantic import ValidationError
+
+from common.events import trace_filters
+from common.events.base import Event, EventBus, EventHandler
+from common.events.topics import publish_name, subscribe_names, unbound_publish_topics
+
+logger = logging.getLogger(__name__)
+
+# Pub/Sub message attribute carrying the publishing environment's identity
+# (e.g. "production" / "sandbox"). Stamped on every publish when the bus is
+# constructed with an ``env`` and used by ``_pull_loop`` to drop foreign-env
+# messages. It is a Pub/Sub *attribute* (not a field in the JSON envelope) so
+# a future subscription ``filter`` can drop foreign messages server-side —
+# filters can only match attributes, never the message body. See the
+# cross-environment leakage note in the module docstring.
+SOURCE_ENV_ATTRIBUTE = "source_env"
+
+# Ephemeral broadcast subscriptions (``subscribe(broadcast=True)``) are created
+# per-process at ``start()`` and deleted at ``stop()``. This TTL is the backstop
+# for an unclean shutdown: Pub/Sub auto-deletes a subscription left idle this
+# long, so a crashed process can't leak its subscription forever. 1 day is the
+# Pub/Sub minimum for ``expiration_policy``.
+BROADCAST_SUBSCRIPTION_TTL_SECONDS = 86400
+
+# How long a lease extension asks for, and how often ``_hold_leases``
+# refreshes it while a batch drains.
+#
+# Subscriptions created HERE use ``ack_deadline_seconds: 30`` and an existing
+# subscription keeps whatever it was created with (see
+# ``_ensure_broadcast_subscription``), so raising that constant would not reach
+# a single deployment already running. Extending the lease per batch does.
+#
+# 60 rather than the 600 the API permits, because an extension is also how long
+# a message stays invisible when THIS process dies holding it: at 600 a pod kill
+# would strand every in-flight message for ten minutes. Once the first extension
+# has landed the lease is 60s, so refreshing every 15s leaves 45s of slack --
+# room for a slow RPC without ever letting it lapse.
+LEASE_EXTENSION_SECONDS = 60
+LEASE_REFRESH_INTERVAL_SECONDS = 15.0
+
+# The FIRST refresh comes sooner than the rest, because the initial deadline is
+# NOT ours to assume. Only the ephemeral subscriptions above are created here;
+# durable ones are provisioned outside this codebase and Pub/Sub permits as
+# little as 10s. Against a 10s deadline a first refresh at 15s arrives after the
+# lease has already lapsed, which leaves the keeper permanently one step behind
+# and the batch redelivering exactly as it did before the keeper existed -- the
+# failure is silent, because the keeper is running and issuing RPCs throughout.
+#
+# 5s clears that 10s floor with room for a slow RPC, and still costs nothing in
+# the common case: the keeper is stopped when the batch ends, so a batch that
+# drains in under 5s issues no extension at all. Refreshing immediately on spawn
+# would also have been correct and is simpler, but it puts an RPC on EVERY
+# non-empty pull including the fast majority that need none.
+LEASE_FIRST_REFRESH_SECONDS = 5.0
+
+# How long a nacked message stays invisible before Pub/Sub redelivers it.
+#
+# A nack used to be ``modify_ack_deadline`` of 0 — "redeliver now". Nothing
+# else spaces redeliveries out: no subscription this codebase creates carries a
+# ``RetryPolicy``, durable ones are provisioned elsewhere, and some handlers
+# raise on purpose to be retried LATER (a lifecycle message whose claim is held
+# by a run still in progress raises ``claim_conflict`` expecting the holder to
+# have finished by the next attempt). At deadline 0 that message comes straight
+# back at pull-loop speed for the holder's whole run, and under a
+# ``max_delivery_attempts`` dead-letter policy it is dead-lettered within
+# seconds.
+#
+# So a nack now asks for a delay that grows with ``delivery_attempt``:
+# ``NACK_BACKOFF_BASE_SECONDS * 2**(attempt - 1)``, capped at
+# ``NACK_BACKOFF_MAX_SECONDS`` (600 is the API's ceiling). Pub/Sub only fills
+# ``delivery_attempt`` on subscriptions with a dead-letter policy — exactly the
+# ones that can run out of attempts — and reports 0 elsewhere, where every
+# redelivery gets the base delay. Base 10 keeps a one-off failure cheap; it is
+# deliberately not ``LEASE_EXTENSION_SECONDS``, so a nack and a lease extension
+# are distinguishable on the wire. A subscription-level ``RetryPolicy`` with a
+# minimum backoff is still the recommended setting for durable subscriptions;
+# this makes the bus safe without one.
+NACK_BACKOFF_BASE_SECONDS = 10
+NACK_BACKOFF_MAX_SECONDS = 600
+
+
+def _nack_delay_seconds(delivery_attempt: object) -> int:
+    """Ack deadline to nack with, for a message on its ``delivery_attempt``-th
+    delivery. Anything that is not a positive ``int`` (0 = not tracked by the
+    subscription) gets the base delay.
+    """
+    attempt = delivery_attempt if isinstance(delivery_attempt, int) else 0
+    if attempt <= 1:
+        return NACK_BACKOFF_BASE_SECONDS
+    # ``min`` on the exponent first, so a huge attempt count can't build a
+    # huge int just to be capped.
+    exponent = min(attempt - 1, 16)
+    return min(NACK_BACKOFF_BASE_SECONDS * 2**exponent, NACK_BACKOFF_MAX_SECONDS)
+
+
+# Per-call ceiling on the delete RPC in ``release_broadcast_subscriptions()``.
+#
+# The SDK's generated default is 60s, with a retry deadline also 60s — six times
+# Cloud Run's entire 10s SIGTERM budget for a single call. Since that method
+# exists precisely to finish inside that budget, inheriting the default defeats
+# it: one slow Pub/Sub call and the process is killed mid-release, leaking the
+# subscriptions the method was added to reclaim.
+#
+# A timed-out delete costs nothing that matters. ``expiration_policy`` still
+# reaps the subscription, so bounding the call only trades a slow failure mode
+# for a fast one — which is the entire point. Prefer failing fast and leaving
+# the TTL to clean up over blocking a shutdown that has nine seconds to live.
+BROADCAST_RELEASE_TIMEOUT_SECONDS = 2.0
+
+# Directory holding the broadcast slot-claim files. See
+# ``_claim_broadcast_slot`` for what they are and why they exist.
+#
+# **Precondition, and the only one that matters**: this directory must be
+# INSTANCE-LOCAL — shared by every worker process of one instance, and shared
+# with nothing else. On Cloud Run it is the instance's own in-memory
+# filesystem, which is exactly that: the two ``--workers 2`` children see one
+# ``/tmp``, and a different instance is a different container with a different
+# ``/tmp``. The same holds for a plain Docker container or a VM.
+#
+# If this were ever backed by a volume shared BETWEEN instances *and* that
+# volume did not enforce ``flock`` (GCS FUSE, say), two instances' slot-0
+# workers would agree on both the token and the slot, land on one subscription,
+# and broadcast would silently become load-balanced. That is the failure this
+# whole scheme exists to prevent, so do not point this at a mounted volume.
+BROADCAST_SLOT_DIR = Path(tempfile.gettempdir()) / "caura-broadcast-slots"
+
+# Ceiling on how many slots a single instance will probe.
+#
+# Deliberately larger than any real ``--workers`` count. uvicorn can exceed its
+# configured worker count transiently — ``Multiprocess.restart_all`` (SIGHUP)
+# starts a replacement and waits for it to be READY *before* retiring the
+# worker it replaces, so both are live at once — and ``handle_ttin`` (SIGTTIN)
+# raises the count outright. Sizing this to ``--workers`` exactly would push
+# those overlap workers onto the uuid4 fallback for no reason. Slots are
+# reclaimed lowest-first, so the population self-compacts back down and this is
+# a ceiling, not a steady state.
+BROADCAST_MAX_SLOTS = 16
+
+# Process-scoped memo for ``_process_broadcast_slot_id``. The identity is a
+# property of the PROCESS, not of a bus object: a start/stop/start cycle must
+# reuse the same name, or the restart mints a fresh subscription and reopens
+# the leak this exists to close.
+_slot_id: str | None = None
+# Guards the claim so two threads racing through a first ``start()`` cannot
+# each take a slot and strand one of them flocked-but-unused.
+_slot_lock = threading.Lock()
+
+
+def _instance_token(slot_dir: Path) -> str | None:
+    """Return the token shared by every worker process of THIS instance.
+
+    Distinguishes slot 0 here from slot 0 on every other instance — without it
+    two instances' slot-0 workers would land on one subscription and broadcast
+    would quietly become load-balanced.
+
+    Deliberately derived from the same directory the slot locks live in, rather
+    than from the Cloud Run metadata server. The token and the mutual exclusion
+    must describe the SAME boundary; if the token said "instance" while the
+    locks coordinated over some wider or narrower scope, the two would disagree
+    and the disagreement would show up as a silent delivery bug rather than an
+    error. One filesystem, one coordination domain, one token.
+
+    Published by hard-linking a fully-written temp file into place: the link is
+    atomic and refuses to overwrite, so a reader either sees no file or sees the
+    complete token, and the first writer's value is the one everybody gets. A
+    plain create-then-write would let a second worker read the file in the
+    window before the contents landed.
+    """
+    token_path = slot_dir / "instance"
+
+    def _read() -> str:
+        try:
+            return token_path.read_text().strip()
+        except OSError:
+            # ``OSError``, not just ``FileNotFoundError``. Missing is the
+            # ordinary case, but a ``PermissionError`` or ``IsADirectoryError``
+            # on this read is still just "no token available", and it must
+            # degrade to the same ``None`` the rest of this module returns —
+            # this runs on the service startup path, and an escape here would
+            # crash boot rather than fall back to a random id.
+            return ""
+
+    token = _read()
+    if token:
+        return token
+    # Missing (we are the first worker on this instance) — or present but
+    # empty, which this function never produces and so cannot be trusted.
+    # Either way, try to publish one; the hard link decides who wins.
+    tmp_path = slot_dir / f"instance.{os.getpid()}.tmp"
+    try:
+        tmp_path.write_text(uuid.uuid4().hex[:12])
+        # FileExistsError means a sibling published first, so the re-read
+        # below adopts that sibling's token instead of ours. The link
+        # refusing to overwrite is the point — it is what makes the first
+        # writer's value the one every worker converges on.
+        with contextlib.suppress(FileExistsError):
+            token_path.hardlink_to(tmp_path)
+    except OSError:
+        return None
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    # Exactly one re-read, not a retry loop: whoever won, the token is now
+    # published, so a second publish attempt could only overwrite nothing and
+    # confuse the next reader.
+    return _read() or None
+
+
+def _claim_broadcast_slot(slot_dir: Path, max_slots: int) -> str | None:
+    """Claim a broadcast identity for this process, or None if none is free.
+
+    Returns ``"{instance_token}-{slot}"``. The identity has to satisfy three
+    properties at once, and the reason this is a lock rather than a computation
+    is that no two of them are satisfiable by the same simpler thing:
+
+    1. **Stable** across respawns of the same slot. uvicorn SIGKILLs a worker
+       that misses its healthcheck and spawns a replacement; the replacement
+       must land on its predecessor's subscription and take the ``AlreadyExists``
+       path. Otherwise every worker death orphans a subscription for the full
+       ``BROADCAST_SUBSCRIPTION_TTL_SECONDS``.
+    2. **Distinct** between workers of one instance that are live AT THE SAME
+       TIME. Two live consumers on one subscription do not both get every
+       message — Pub/Sub load-balances between them — so a broadcast silently
+       degrades to "roughly half the events each". For ``org.settings-changed``
+       that is a process serving stale org settings with nothing red anywhere.
+    3. **Distinct** across instances, via the instance token.
+
+    ``flock`` gives 1 and 2 together and gives them as a kernel guarantee, not a
+    probability. The kernel releases the lock when the holder dies *however* it
+    dies, so a SIGKILLed worker frees its slot with no cooperation from a
+    shutdown path that never ran — which is the property that makes this
+    independent of whether shutdown runs at all. And it cannot hand a slot to a
+    newcomer while the incumbent is alive, which is what keeps property 2 from
+    being traded away for property 1.
+
+    Slots are probed lowest-first so the population self-compacts after a
+    transient overlap instead of drifting upward.
+
+    The obvious alternative — have the supervisor hand each child its index —
+    is not available and is worth ruling out explicitly, because it is the
+    first thing anyone proposes. ``common/serve.py`` only calls
+    ``uvicorn.run(workers=N)``; uvicorn's own ``Multiprocess`` spawns the
+    children and passes them ``(config, sockets)``, keeping the index purely
+    in the parent's list. Reaching it would mean subclassing uvicorn
+    internals. Claiming a slot is supervisor-agnostic and survives a uvicorn
+    upgrade.
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - no flock on this platform
+        # Not Windows-specific speculation: ``None`` is this function's
+        # already-required degradation path, shared with an unwritable
+        # directory, an unreadable token and slot exhaustion below. Any
+        # environment where the claim cannot be made degrades identically.
+        return None
+    try:
+        slot_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    token = _instance_token(slot_dir)
+    if token is None:
+        return None
+    for slot in range(max_slots):
+        try:
+            fd = os.open(slot_dir / f"slot-{slot}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            # Degrade per slot, not globally: one unopenable lock file must not
+            # abandon the usable slots after it. If every slot is unopenable the
+            # loop falls through to the same ``None`` anyway.
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Held by a live sibling. Never fall through to "use it anyway":
+            # sharing a slot is the silent-delivery bug, and leaking a
+            # subscription is merely expensive.
+            os.close(fd)
+            continue
+        # ``fd`` is deliberately never closed, and there is deliberately no
+        # release path. The flock lasts exactly as long as the open file
+        # description, so holding the fd for the process's lifetime is what
+        # keeps a sibling worker off this slot while we are still consuming
+        # from its subscription; the kernel drops it at exit, however we exit.
+        # Do not "fix" the apparent leak — closing it hands a live slot away.
+        return f"{token}-{slot}"
+    return None
+
+
+def _process_broadcast_slot_id() -> str:
+    """This process's broadcast identity: a claimed slot, or a random fallback.
+
+    Always returns an id, and always the SAME id for the life of the process —
+    including on the fallback path. That matters: two buses in one process that
+    disagreed about their identity would create two subscriptions where one is
+    wanted, and the ``start()`` comment about start/stop/start reusing the same
+    names silently would not hold.
+
+    The fallback direction is the load-bearing decision here and must not be
+    inverted. When no slot can be proven ours, take a random id and accept the
+    leak; never reuse a slot we could not claim. A leak is bounded, visible in
+    quota, and reaped in a day. Two live workers on one subscription is a
+    silent halving of broadcast delivery that nothing alerts on.
+    """
+    global _slot_id
+    with _slot_lock:
+        if _slot_id is None:
+            try:
+                _slot_id = _claim_broadcast_slot(
+                    BROADCAST_SLOT_DIR, BROADCAST_MAX_SLOTS
+                )
+            except Exception:
+                # The guard belongs HERE, not at the call site in ``start()``.
+                # This function is the one that promises "always returns an
+                # id"; enforcing that where it is promised makes it true for
+                # every caller, present and future, instead of for the one
+                # call site that remembered to wrap it.
+                #
+                # Not a substitute for the specific handling in the callees —
+                # each expected failure is still caught where it happens and
+                # named there. This is the backstop for the unforeseen one, on
+                # a path where the alternative is a service that will not boot.
+                # ``Exception``, not ``BaseException``: a cancellation or a
+                # KeyboardInterrupt during startup must still propagate.
+                logger.exception(
+                    "pubsub: broadcast slot claim raised; falling back to a "
+                    "random per-process id"
+                )
+                _slot_id = None
+        if _slot_id is None:
+            logger.warning(
+                "pubsub: no broadcast slot could be claimed under %s; falling "
+                "back to a random per-process id. Delivery is unaffected, but "
+                "each unclean restart will orphan a subscription for %ds "
+                "instead of reusing this slot's.",
+                BROADCAST_SLOT_DIR,
+                BROADCAST_SUBSCRIPTION_TTL_SECONDS,
+            )
+            # Memoised like any other outcome, so the warning fires once per
+            # process rather than once per bus, and so the id stays stable.
+            _slot_id = uuid.uuid4().hex[:12]
+        return _slot_id
+
+
+class PubSubEventBus(EventBus):
+    """Pub/Sub-backed bus.
+
+    Construction args:
+        project_id: GCP project that owns the topics/subscriptions.
+        subscription_prefix: Applied to the *handler side* when we call
+            `subscribe(topic, handler)`. Subscriptions are named
+            ``f"{subscription_prefix}--{topic}"`` so a single topic can
+            have multiple distinct consumers (each service gets its own
+            subscription_prefix).
+
+    The handler side spawns one async pull task per subscription when
+    `start()` is called. Each pull task receives a message, runs the
+    handler, and ack/nacks based on the outcome. Pub/Sub handles redelivery
+    on nack, after a delay that grows with the delivery attempt (see
+    ``_nack_delay_seconds``).
+
+    **At-least-once delivery**: handlers registered against this bus
+    *must* be idempotent. Pub/Sub redelivers on ack failure and on
+    handler exceptions; a handler that already ran can be invoked again
+    for the same event. Use `event.event_id` as a natural dedup key.
+    """
+
+    def __init__(
+        self,
+        project_id: str,
+        subscription_prefix: str,
+        *,
+        # Identity of the publishing environment ("production" /
+        # "sandbox" / ...). Stamped onto every published message as the
+        # ``SOURCE_ENV_ATTRIBUTE`` Pub/Sub attribute and used by
+        # ``_pull_loop`` to drop foreign-env messages that fanned out
+        # from a sibling environment sharing this project's topics. When
+        # None the cross-env guard is disabled (no stamping, no
+        # filtering) — preserves the pre-guard behaviour for single-env
+        # deployments and in-process tests.
+        env: str | None = None,
+        # Batch size per pull — how many messages one ``pull`` may return.
+        # NOT a concurrency cap, despite what an earlier version of this
+        # comment claimed: ``_pull_loop`` awaits ``_dispatch_all`` once per
+        # message inside a ``for``, so a batch drains SEQUENTIALLY and only
+        # ONE EVENT's handlers are in flight per pull loop at a time
+        # (``_dispatch_all`` does gather that event's handlers, so a topic
+        # with several handlers runs those concurrently). Handler
+        # concurrency is therefore ``subscriptions x handlers-per-subscription
+        # x instances`` and is independent of this number, which bounds only
+        # how much work one wedged dispatch cycle holds.
+        #
+        # Worth stating rather than leaving implicit: that serialisation is
+        # a property of this loop's shape, not a limit anyone chose. Raising
+        # drain throughput by parallelising it reads as a pure win while
+        # removing the only thing holding per-instance handler concurrency
+        # near one, so anything that lifts it needs a real bound of its own
+        # — see ``common.embedding.call_embedding_gated`` for the embed path.
+        max_messages: int = 25,
+        pull_timeout: float = 20.0,
+        error_backoff: float = 5.0,
+        publish_concurrency: int = 32,
+        topic_prefix: str = "",
+        # Bind each subscribed topic under its renamed twin as well as its
+        # current name, so a publisher flip later cannot land a message on a
+        # name nothing is pulling. Defaults OFF, and the default is the whole
+        # safety argument: with it off this bus's subscription set is
+        # byte-identical to what it was, so the code can be merged, vendored
+        # and deployed everywhere before any environment has the twin
+        # subscriptions. Turning it ON in an environment whose Terraform has
+        # not been applied is NOT a soft failure — the twin subscription is
+        # absent, the pull loop takes a permanent NotFound and halts, and
+        # ``is_healthy`` turns the readiness endpoint red. Set
+        # EVENT_BUS_DUAL_SUBSCRIBE per environment only after the expand apply
+        # has landed there, and verify it per service.
+        dual_subscribe: bool = False,
+        # How long ``stop()`` waits for handlers already running to finish before
+        # cancelling them. Sized to fit Cloud Run's 10s SIGTERM budget alongside
+        # the rest of shutdown; 0 restores cancel-immediately.
+        stop_grace_seconds: float = 5.0,
+    ) -> None:
+        # No SDK import at construction: the factory can return this
+        # instance even in environments where google-cloud-pubsub isn't
+        # installed. The ImportError surfaces on first `publish` /
+        # `start` — see `_ensure_pubsub_sdk` below.
+        self._project_id = project_id
+        self._subscription_prefix = subscription_prefix
+        # Normalise so a stray trailing space in the env var can't make a
+        # publisher's stamp mismatch a subscriber's comparison. Empty
+        # string collapses to None so it behaves identically to "unset".
+        self._env = env.strip() if env and env.strip() else None
+        # Env-scoped TOPIC prefix, mirroring subscription_prefix. Empty ("") ⇒ raw
+        # topic names — byte-identical to today. Set EVENT_BUS_TOPIC_PREFIX per-env
+        # (via the factory) to isolate topics across environments that share one GCP
+        # project, eliminating cross-env message fan-out. See _topic_name().
+        self._topic_prefix = topic_prefix
+        self._dual_subscribe = dual_subscribe
+        # Refuse to exist in the one combination that fails silently: publishing
+        # a flipped family under its renamed name while binding only the current
+        # one. See ``unbound_publish_topics`` for why the check compares the two
+        # names instead of asking whether ``FLIPPED_FAMILIES`` is empty.
+        #
+        # At construction, not at ``start()``: publishing does not require
+        # ``start()`` (a publish-only process never calls it), so a check there
+        # would leave exactly the write side of the hazard unguarded. Raising
+        # here also means a misconfigured process dies before it can report
+        # itself ready. This is the loud direction of a fault that otherwise has
+        # no signal, so a hard failure is the point rather than a side effect.
+        if unbound := unbound_publish_topics(dual=dual_subscribe):
+            raise ValueError(
+                f"dual_subscribe is off, but {len(unbound)} topic(s) would be "
+                f"published under a name this bus does not bind: {sorted(unbound)}. "
+                "Nothing would be delivered and nothing would raise. Either those "
+                "families were flipped before this environment could bind their "
+                "twins, or this environment's twin subscriptions exist and its "
+                "configuration has not caught up — the two halves are set "
+                "independently, which is what lets them disagree. Resolve which "
+                "one is wrong; do not start a publisher in this state."
+            )
+        self._max_messages = max_messages
+        self._pull_timeout = pull_timeout
+        self._error_backoff = error_backoff
+        self._handlers: dict[str, list[EventHandler]] = defaultdict(list)
+        self._publisher: Any = None
+        self._subscriber: Any = None
+        self._pull_tasks: list[asyncio.Task[None]] = []
+        # Pull tasks currently holding a batch (dispatching or acking it), as
+        # opposed to blocked in ``pull``. ``stop()`` gives exactly these a grace
+        # period: an idle one has nothing to finish.
+        self._dispatching: set[asyncio.Task[Any]] = set()
+        self._stop_grace_seconds = stop_grace_seconds
+        self._stopping = False
+        # Set by ``stop_consuming()``: the pull loops take nothing new, while
+        # publishing, which ``_stopping`` would refuse, carries on.
+        self._draining = False
+        self._publish_concurrency = publish_concurrency
+        # One-shot flag so the "subscribe without start()" warning fires
+        # on the first publish only — otherwise we'd spam the log under
+        # sustained traffic. Reset in stop() so restarts reuse the same
+        # one-shot.
+        self._warned_missing_start = False
+        # Bounded executors for blocking SDK calls — lazy-init so stop()
+        # can shut them down and a subsequent start()/publish() gets a
+        # fresh one. asyncio's default executor is effectively unbounded
+        # per event loop; capping keeps a publish burst's blast radius
+        # predictable. Separate pools per role (publish vs pull) so a
+        # publish saturation can't starve message consumption and vice
+        # versa, and so stop() can close the subscriber first (waking
+        # blocked pull threads immediately via the gRPC channel error)
+        # then drain the pool, without the publish pool stalling that
+        # teardown sequence.
+        self._publish_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._pull_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        # Subscriptions whose pull loop halted on a permanent error
+        # (NotFound/PermissionDenied/InvalidArgument). Exposed via
+        # `is_healthy` so a health endpoint can mark the service unhealthy
+        # when consumption has stopped without crashing the process.
+        self._failed_subscriptions: set[str] = set()
+        # Set at the top of stop() before any executor teardown begins,
+        # so a concurrent publish() that raced through can't lazy-init
+        # a fresh executor that stop() never joins. Reset at the end of
+        # stop() so the bus can be restarted cleanly.
+        self._stopped: bool = False
+        # Monotonic counter incremented at the top of every ``stop()``.
+        # Lets ``start()`` detect a stop() that ran to FULL completion
+        # while it was suspended on an executor await — a clean teardown
+        # resets both ``_stopped`` and ``_stopping`` to False in stop()'s
+        # finally, so a flag-only check would miss the race. ``start()``
+        # captures this counter before the shielded await and bails if
+        # it changed afterwards.
+        self._stop_generation: int = 0
+        # Tracks whether start() has been awaited. Used by publish() to
+        # warn when subscribers are registered but start() was never
+        # called. Cleaner than inferring from `_pull_tasks`, which can
+        # also be empty after permanent pull errors or a clean stop().
+        self._started: bool = False
+        # Strong references for fire-and-forget background tasks
+        # (TOCTOU loser-close, post-stop candidate-close, cancelled-
+        # construction close). Without this set, ``asyncio.create_task``
+        # only stores its task in ``asyncio._all_tasks`` (a WeakSet)
+        # and the GC can collect it mid-await — Python docs explicitly
+        # warn against bare ``create_task(coro)``. The done-callback
+        # auto-discards on completion so the set stays bounded.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        # Topics registered with ``broadcast=True`` get a PER-PROCESS
+        # subscription so every process receives every message (fan-out),
+        # instead of the shared per-service subscription that delivers each
+        # message to a single consumer. ``_broadcast_slot_id`` makes this
+        # process's subscription name unique; ``_broadcast_sub_paths`` records
+        # the ones this process created so ``stop()`` can delete them.
+        self._broadcast_topics: set[str] = set()
+        self._broadcast_sub_paths: list[str] = []
+        # Short names of subscriptions THIS bus deliberately deleted, so a pull
+        # loop that is still running when the delete lands can tell "I released
+        # this myself" from "this was never provisioned". Both surface as
+        # NotFound on the next pull; only the second is an error worth the loud
+        # halting-the-loop log. Short names because that is what ``_pull_loop``
+        # is given — ``_broadcast_sub_paths`` holds full resource paths.
+        self._released_subscriptions: set[str] = set()
+        # Resolved lazily in ``start()``, and only when a broadcast topic is
+        # actually registered — claiming a slot touches the filesystem, and a
+        # publisher-only bus would pay for an identity it never puts in a name.
+        # ``_process_broadcast_slot_id`` memoises per process, so resolving it
+        # late costs nothing and keeps the id stable across a restart.
+        self._broadcast_slot_id: str | None = None
+
+    def _spawn_background_task(self, coro: Any) -> asyncio.Task[Any]:
+        """Schedule a fire-and-forget task; see ``_background_tasks`` for why."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    # ── publisher ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _ensure_pubsub_sdk() -> Any:
+        try:
+            # ``attr-defined``, not ``import-untyped``: ``google.cloud`` is a
+            # namespace package, so with google-cloud-pubsub installed (as CI
+            # has it, via the storage-api ``pubsub`` extra) mypy resolves the
+            # parent and rejects the submodule as a missing attribute. The
+            # absent case is already covered by ignore_missing_imports.
+            from google.cloud import pubsub_v1  # type: ignore[attr-defined]
+
+            return pubsub_v1
+        except ImportError as exc:
+            raise RuntimeError(
+                "PubSubEventBus requires `google-cloud-pubsub`. "
+                "Install with: pip install 'google-cloud-pubsub>=2.23,<3'"
+            ) from exc
+
+    async def _ensure_publisher(self) -> Any:
+        # Off-loop construction so a Workload Identity credential
+        # refresh inside the SDK doesn't pin the event loop on the
+        # first publish. TOCTOU-safe: if a concurrent caller
+        # populates ``_publisher`` while this one is awaiting the
+        # executor, the losing candidate is explicitly closed —
+        # ``PublisherClient`` wraps a gRPC channel and a background
+        # batch-flush thread, so leaving it for GC is non-deterministic
+        # (no documented ``__del__`` contract).
+        # Fast-path stop guard — symmetric with ``_get_publish_executor``.
+        # Refuse to even start construction work when the bus is
+        # already stopped (or stopping); the post-await guard below
+        # catches the same conditions when ``stop()`` races during
+        # the shielded await, but a synchronous bail-out before the
+        # SDK import avoids unnecessary executor + gRPC churn.
+        if self._stopped or self._stopping:
+            raise RuntimeError("PubSubEventBus is stopped")
+        if self._publisher is not None:
+            return self._publisher
+        pubsub_v1 = self._ensure_pubsub_sdk()
+        loop = asyncio.get_running_loop()
+        # Generation snapshot so we can detect a ``stop()`` that ran to
+        # full completion during the executor await — clean teardown
+        # resets ``_stopped`` to False, so a flag-only check would miss
+        # the race. Without this, a fresh client gets installed into a
+        # bus that ``stop()`` already walked past, orphaning both the
+        # publisher and the executor it triggers in ``_get_publish_executor``.
+        stop_generation_before = self._stop_generation
+        # ``asyncio.shield`` so a task cancellation here doesn't strand
+        # the in-flight ``PublisherClient()`` inside the executor — the
+        # SDK call doesn't honour cancellation, so without the shield
+        # the future completes anyway but the caller never captures it,
+        # leaking the gRPC channel + flush thread.
+        ctor_fut = loop.run_in_executor(None, pubsub_v1.PublisherClient)
+        try:
+            candidate = await asyncio.shield(ctor_fut)
+        except asyncio.CancelledError:
+            # Cancelled mid-construction. Spawn a background closer for
+            # the still-pending future so the leaked client gets
+            # released; re-raise so the caller's cancellation
+            # propagates.
+            async def _close_pending() -> None:
+                try:
+                    client = await ctor_fut
+                    # stop(), not close(): PublisherClient has no close()
+                    # (same nonexistent-method bug as the stop() teardown
+                    # below — here it only leaked the SDK's commit thread
+                    # since an uninstalled candidate has no batches).
+                    await loop.run_in_executor(None, client.stop)
+                except BaseException:
+                    # ``BaseException`` (not ``Exception``) — this is a
+                    # fire-and-forget background task; if the event loop
+                    # cancels it during shutdown, the resulting
+                    # ``CancelledError`` would otherwise surface as
+                    # "Task exception was never retrieved" log noise.
+                    logger.debug(
+                        "pubsub: cancelled-publisher stop failed", exc_info=True
+                    )
+
+            self._spawn_background_task(_close_pending())
+            raise
+        # Post-stop guard: if a concurrent ``stop()`` ran to completion
+        # during the await, installing the candidate would leak — the
+        # bus is "stopped" again only because stop()'s finally reset
+        # the flags after its cleanup. Close the candidate in the
+        # background and bail; ``publish()`` will get a RuntimeError
+        # which is the right shape for "bus was stopped".
+        if (
+            self._stopped
+            or self._stopping
+            or self._stop_generation != stop_generation_before
+        ):
+
+            async def _close_post_stop() -> None:
+                try:
+                    await loop.run_in_executor(None, candidate.stop)
+                except BaseException:
+                    logger.debug(
+                        "pubsub: post-stop candidate stop failed", exc_info=True
+                    )
+
+            self._spawn_background_task(_close_post_stop())
+            raise RuntimeError(
+                "PubSubEventBus was stopped during publisher construction"
+            )
+        if self._publisher is None:
+            self._publisher = candidate
+            return self._publisher
+        if candidate is not self._publisher:
+            # Fire-and-forget close of the TOCTOU loser. Awaiting here
+            # would let an outer ``task.cancel()`` bleed into a pure
+            # cleanup branch; catching ``CancelledError`` to suppress
+            # it would clear the task's cancel-request (Py 3.9+) and
+            # let ``publish()`` continue to send the message even
+            # though the caller cancelled — a real bug. Schedule the
+            # close, return the cached publisher, and let any outer
+            # cancel propagate normally. (No interleaving risk between
+            # the create_task and the return: ``asyncio.create_task``
+            # is synchronous and doesn't yield.)
+            async def _close_loser() -> None:
+                try:
+                    await loop.run_in_executor(None, candidate.stop)
+                except BaseException:
+                    # ``BaseException`` so a shutdown-time cancellation
+                    # of this background task doesn't surface as "Task
+                    # exception was never retrieved".
+                    logger.debug(
+                        "pubsub: discarded duplicate PublisherClient.close() failed",
+                        exc_info=True,
+                    )
+
+            self._spawn_background_task(_close_loser())
+        return self._publisher
+
+    @property
+    def is_healthy(self) -> bool:
+        """True when the bus is in a state where it can still CONSUME events.
+
+        Not end-to-end, and this docstring used to say end-to-end. Every
+        condition below is about the pull side; a publisher-only bus whose
+        every publish is failing with a 403 on the topic reports healthy
+        here, because nothing in this function looks at publishing.
+
+        That is deliberate rather than an oversight to fix by widening the
+        flag. This drives readiness, and draining a pod from the load
+        balancer on a transient publish failure trades a lost event for an
+        outage, and flaps. Publish failures are surfaced instead by
+        ``_report_publish_result``, which logs them with ``dropped=True``
+        for the same log-based alerting the rest of ``common/events`` uses.
+
+        False in three cases:
+
+        1. ``stop()`` is in progress. The ``_stopped`` flag flips True
+           at the top of ``stop()`` (before any await point) and resets
+           False only at the very end — while True the bus has already
+           cancelled its pull tasks and is actively tearing down.
+           Checking this first means the graceful-shutdown window
+           starts when ``stop()`` is *called*, not when it *completes*.
+           ``stop_consuming()``, which a shutdown can run before ``stop()``,
+           counts the same from when it is called.
+        2. Handlers were registered via ``subscribe()`` but ``start()``
+           was never awaited — the pull loops don't exist, so every
+           inbound event is silently dropped. ``_failed_subscriptions``
+           is empty in this case (the loops never ran) so we rely on
+           ``_started`` to distinguish "deliberately publisher-only"
+           (no handlers, healthy) from "forgot to call start()" (has
+           handlers but unstarted, unhealthy). This case also carries
+           the post-``stop()`` state: once ``_stopped`` resets to
+           False, a bus with handlers still reports unhealthy until
+           ``start()`` is (re-)called.
+        3. Any pull loop has halted on a permanent error (subscription
+           missing, SA permission revoked) — recorded in
+           ``_failed_subscriptions`` by ``_pull_loop``.
+
+        All three windows report unhealthy intentionally — the pod is
+        not consuming events during them, so it should not claim it is.
+
+        Surface this on the service's `/health` endpoint so a
+        misconfigured pod is marked unhealthy instead of silently
+        dropping events while the HTTP surface stays green.
+        """
+        if self._stopped or self._draining:
+            return False
+        if self._handlers and not self._started:
+            return False
+        return not self._failed_subscriptions
+
+    def _topic_name(self, topic: str) -> str:
+        """Apply the env-scoped topic prefix, if configured. Empty prefix returns
+        the raw topic name (today's behaviour) — so this is a strict no-op until
+        EVENT_BUS_TOPIC_PREFIX is set. Used at BOTH the publish and subscribe sites
+        so an env's publishers and subscribers always agree on the topic id."""
+        return f"{self._topic_prefix}--{topic}" if self._topic_prefix else topic
+
+    def _get_publish_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        # Refuse to spin up a fresh executor during stop()'s teardown
+        # window — otherwise a concurrent publish() could create a pool
+        # that stop() has already walked past and will never join.
+        if self._stopped:
+            raise RuntimeError("PubSubEventBus is stopped")
+        if self._publish_executor is None:
+            self._publish_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._publish_concurrency,
+                thread_name_prefix="pubsub-publish",
+            )
+        return self._publish_executor
+
+    async def publish(self, topic: str, event: Event) -> None:
+        # Misconfiguration signal: handlers were registered but start()
+        # was never called, so no pull loop exists. Publishing still
+        # works (separate publisher/subscriber role) but a single-process
+        # deploy that forgot start() will silently drop inbound events.
+        # Warn once so the first publish logs it.
+        #
+        # Thread-safety of the one-shot flag: asyncio is single-threaded
+        # on the event loop, but ``run_in_executor`` below yields control.
+        # Two concurrent publish() calls could both evaluate the guard
+        # before either wrote True — flip the flag BEFORE logging so the
+        # second call observes the set flag and skips the log.
+        if self._handlers and not self._started and not self._warned_missing_start:
+            self._warned_missing_start = True
+            logger.warning(
+                "PubSubEventBus.publish() called with subscribers registered "
+                "but start() was never awaited — this bus will never receive "
+                "events. Call `await bus.start()` at service startup."
+            )
+        publisher = await self._ensure_publisher()
+        # ``publish_name`` resolves the ONE name this topic's family currently
+        # publishes under — the old one until that family is flipped. Resolved
+        # here rather than at each publisher call site so the flip is a single
+        # decision per family in one file, instead of a sweep across every
+        # publisher at the riskiest moment of the cutover.
+        topic_path = publisher.topic_path(
+            self._project_id, self._topic_name(publish_name(topic))
+        )
+        payload = event.model_dump_json().encode("utf-8")
+        # Fire the publish into the client's internal batch queue and
+        # return — do NOT block on the returned Future. .result(timeout=30)
+        # would tie up one of the `publish_concurrency` executor threads
+        # for up to 30 s on a slow / unavailable Pub/Sub, letting a
+        # sustained outage wedge every caller of publish_audit_event
+        # (admin-API request handlers await this, so queued publish
+        # threads translate directly to queued requests).
+        #
+        # At-least-once is preserved ONLY if stop() runs before process
+        # exit: the executor shutdown drains the enqueue calls, and
+        # stop()'s publisher.stop() commits the client's outstanding
+        # batches (the actual transmission happens on the SDK's
+        # background commit thread, NOT in the executor). Short-lived
+        # processes that publish and exit without awaiting stop() lose
+        # whatever is still batched. The tradeoff is that we no longer
+        # surface per-message publish errors to the caller —
+        # publisher-side failures (e.g. a 403 on the topic) land in the
+        # SDK's background-thread log instead.
+        # For a fire-and-forget audit path that is the right shape.
+        #
+        # What the SDK-log-only arrangement lacked was an APP-level signal.
+        # A sustained publisher-side failure — a 403 on the topic, an
+        # exhausted quota — produced log lines from a google.cloud logger
+        # and nothing this platform watches, while ``is_healthy`` stayed
+        # true because it tracks pull-loop state only. The done-callback
+        # below closes that without reintroducing the blocking this comment
+        # exists to prevent: it fires on the SDK's own commit thread when
+        # the batch settles, so publish() still returns as soon as the
+        # message is queued.
+        # Stamp the publishing environment so sibling environments that
+        # share this project's topics can drop our fan-out copies (see
+        # ``_pull_loop`` and the module docstring). Passed as a Pub/Sub
+        # *attribute* (kwarg to ``publish``) rather than folded into the
+        # JSON body so a subscription ``filter`` can later match it
+        # server-side. Omitted entirely when ``env`` is unset so the wire
+        # format is unchanged for single-env deployments.
+        attributes = {SOURCE_ENV_ATTRIBUTE: self._env} if self._env else {}
+        loop = asyncio.get_running_loop()
+        future = await loop.run_in_executor(
+            self._get_publish_executor(),
+            functools.partial(publisher.publish, topic_path, payload, **attributes),
+        )
+        future.add_done_callback(
+            functools.partial(self._report_publish_result, topic, event.event_id)
+        )
+
+    @staticmethod
+    def _report_publish_result(topic: str, event_id: uuid.UUID, future: Any) -> None:
+        """Turn a failed publish into a signal this platform can alert on.
+
+        Runs on the SDK's publish-callback thread once the batch settles, not
+        on the event loop, so it must do nothing but log — and must not
+        raise, since an exception here is swallowed by the SDK and would
+        make the failure MORE invisible rather than less.
+
+        ``dropped=True`` deliberately, matching the five other places in
+        ``common/events`` that mark an event lost. A publish that failed is
+        an event nothing will retry: there is no queue to return it to,
+        because it never reached one. Reusing the field means existing
+        log-based alerting on it covers this path with no new rule.
+
+        Not flipped into ``is_healthy``. That drives readiness, and draining
+        a service from the load balancer on one transient publish failure
+        trades a lost event for an outage — and would flap. The distinction
+        this restores is between "the SDK logged something under its own
+        logger name" and "the platform knows an event was lost".
+        """
+        try:
+            future.result()
+        except Exception:
+            logger.exception(
+                "pubsub publish failed — event dropped, nothing will retry it",
+                extra={
+                    "topic": topic,
+                    "event_id": str(event_id),
+                    "dropped": True,
+                },
+            )
+
+    # ── subscriber ─────────────────────────────────────────────────
+
+    def subscribe(
+        self, topic: str, handler: EventHandler, *, broadcast: bool = False
+    ) -> None:
+        # Late subscribes silently orphan the handler — pull tasks are
+        # only spawned during start(). Fail loudly so the bug surfaces
+        # at wire-up rather than appearing as "events aren't arriving".
+        # Check ``_started`` (same authoritative signal start() uses) —
+        # ``_pull_tasks`` is empty for publisher-only buses, which would
+        # let a late subscribe() on a started publisher silently orphan.
+        if self._started:
+            raise RuntimeError(
+                "PubSubEventBus.subscribe() must be called before start(); "
+                "the pull loop for this topic won't be created otherwise."
+            )
+        # Brand rename: with dual-subscribe on, one subscribe() binds the
+        # handler to both the current topic and its renamed twin, so a
+        # publisher can be flipped later without a message landing on a name
+        # nothing is listening to. Applied here rather than at each call site
+        # on purpose — the failure this guards against is ONE consumer that
+        # nobody remembered to update, and a bus-level expansion cannot miss
+        # one. It also means a subscribe() added next week inherits it.
+        for name in subscribe_names(topic, dual=self._dual_subscribe):
+            self._handlers[name].append(handler)
+            # ``broadcast`` topics get a per-process subscription at start() so
+            # every process receives every message (fan-out), not just one.
+            #
+            # The flag MUST carry to the twin. A broadcast topic has no durable
+            # subscription by design, so a twin left out of this set is treated
+            # as an ordinary work queue at start(): the pull loop looks for a
+            # ``<prefix>--<twin>`` subscription that was never provisioned and
+            # never will be, gets NotFound, and halts — turning the health
+            # endpoint red on a topic whose whole point is that it degrades
+            # quietly.
+            if broadcast:
+                self._broadcast_topics.add(name)
+
+    async def start(self) -> None:
+        # Idempotent guard — a second call would leak the old
+        # SubscriberClient's gRPC channel and spawn duplicate pull tasks
+        # that double-process every message. Check ``_started`` rather
+        # than ``_pull_tasks``: a publisher-only bus (no subscribers)
+        # has empty ``_pull_tasks`` even after a successful start(), so
+        # the old check silently re-ran the sequence instead of warning.
+        if self._started:
+            logger.warning("PubSubEventBus.start() called more than once; ignoring")
+            return
+        # Clear the released-subscription record. Names are deterministic in
+        # ``_broadcast_slot_id``, which is per-PROCESS, so a start/stop/start
+        # cycle recreates the SAME names — a leftover entry here would silence
+        # a genuine NotFound on the second run, turning this suppression into
+        # the blind spot it was written to avoid.
+        self._released_subscriptions.clear()
+        pubsub_v1 = self._ensure_pubsub_sdk()
+        topic_count = len(self._handlers)
+        # SubscriberClient construction can block the event loop for
+        # hundreds of ms when the Pub/Sub SDK triggers Workload Identity
+        # credential refresh (metadata-server round trip) on its first
+        # auth-backed call. Offload to the default executor so the loop
+        # stays responsive during service boot.
+        #
+        # PublisherClient is NOT constructed here: a subscriber-only
+        # service that never calls publish() shouldn't hold an unused
+        # gRPC channel. publish() handles the off-loop construction
+        # lazily on the first call (see ``_ensure_publisher``).
+        if topic_count > 0:
+            # Inside this branch, not at the top of start(): the spans this
+            # corrects come from the pull loop, so a publisher-only bus can
+            # never produce one and shouldn't pay for the filter — and
+            # registering it calls tracer.configure(), which recreates the
+            # trace writer.
+            #
+            # Registered here rather than at import for the same reason.
+            # Idempotent, never raises, and a no-op when ddtrace isn't
+            # installed. See trace_filters for the measurement that motivated
+            # it. Logged either way so "pull spans are still showing as errors"
+            # is one grep from the answer instead of a guess about whether the
+            # filter ever loaded. The negative branch doesn't name a cause:
+            # False means ddtrace is absent OR registration failed, and
+            # install() warns about the latter itself.
+            if trace_filters.install():
+                logger.debug("Pub/Sub pull-timeout span filter registered")
+            else:
+                logger.debug("Pub/Sub pull-timeout span filter not registered")
+            loop = asyncio.get_running_loop()
+            # Snapshot the stop generation BEFORE the shielded await.
+            # A clean ``stop()`` resets both ``_stopped`` and
+            # ``_stopping`` to False in its finally, so a flag-only
+            # check after the await would miss the race when a complete
+            # stop() ran while we were suspended. Comparing the
+            # generation catches it.
+            stop_generation_before = self._stop_generation
+            # ``asyncio.shield`` so a task cancellation during the
+            # SubscriberClient construction (e.g. uvicorn lifespan
+            # cancelling start()) doesn't strand the in-flight client
+            # inside the executor without a close().
+            ctor_fut = loop.run_in_executor(None, pubsub_v1.SubscriberClient)
+            try:
+                self._subscriber = await asyncio.shield(ctor_fut)
+            except asyncio.CancelledError:
+
+                async def _close_pending() -> None:
+                    try:
+                        client = await ctor_fut
+                        await loop.run_in_executor(None, client.close)
+                    except BaseException:
+                        # ``BaseException`` (not ``Exception``) — fire-
+                        # and-forget background task; a shutdown-time
+                        # cancel would otherwise show up as a "Task
+                        # exception was never retrieved" warning.
+                        logger.debug(
+                            "pubsub: cancelled-subscriber close failed",
+                            exc_info=True,
+                        )
+
+                self._spawn_background_task(_close_pending())
+                raise
+            # The shielded await above is the first yield ever introduced
+            # into ``start()`` — a concurrent ``stop()`` (e.g. SIGTERM
+            # during boot under Cloud Run's 10s startup-probe window)
+            # can run to completion while we're suspended. The flag
+            # check catches an in-progress stop(); the generation check
+            # catches a stop() that fully completed (and reset both
+            # flags) during the await. Either signal aborts so we don't
+            # install pull tasks into a bus that stop() already walked
+            # past.
+            if (
+                self._stopping
+                or self._stopped
+                or self._stop_generation != stop_generation_before
+            ):
+                sub = self._subscriber
+                self._subscriber = None
+                try:
+                    await loop.run_in_executor(None, sub.close)
+                except Exception:
+                    logger.debug(
+                        "pubsub: start() aborted by concurrent stop(); "
+                        "subscriber.close() failed",
+                        exc_info=True,
+                    )
+                # Raise rather than silently return — a lifespan handler
+                # awaiting ``bus.start()`` would otherwise see a normal
+                # return and assume the bus is operational. ``is_healthy``
+                # eventually flips False once the first probe runs (the
+                # ``handlers and not _started`` branch), but the gap
+                # between this return and that probe is a silently
+                # degraded window. Make the failure visible at startup.
+                raise RuntimeError(
+                    "PubSubEventBus.start() aborted: stop() ran "
+                    "concurrently during SubscriberClient construction"
+                )
+            self._pull_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(4, 2 * topic_count),
+                thread_name_prefix="pubsub-pull",
+            )
+            for topic, handlers in self._handlers.items():
+                sub_name = f"{self._subscription_prefix}--{self._topic_name(topic)}"
+                if topic in self._broadcast_topics:
+                    # Per-process subscription (unique suffix) for fan-out; skip
+                    # the pull loop if it can't be created (see the helper — it
+                    # degrades to TTL rather than crashing startup).
+                    if self._broadcast_slot_id is None:
+                        self._broadcast_slot_id = _process_broadcast_slot_id()
+                    sub_name = f"{sub_name}--{self._broadcast_slot_id}"
+                    if not await self._ensure_broadcast_subscription(topic, sub_name):
+                        continue
+                task = asyncio.create_task(self._pull_loop(sub_name, handlers))
+                self._pull_tasks.append(task)
+        self._started = True
+
+    async def _ensure_broadcast_subscription(self, topic: str, sub_name: str) -> bool:
+        """Create this process's ephemeral subscription for a broadcast topic.
+
+        Returns True if the subscription exists (so a pull loop should be
+        spawned), False if creation failed — the caller then degrades to no
+        fan-out for this topic (cross-process invalidation falls back to the
+        cache TTL) rather than crashing startup. Sets ``expiration_policy`` so a
+        subscription orphaned by an unclean shutdown self-deletes after
+        ``BROADCAST_SUBSCRIPTION_TTL_SECONDS``.
+        """
+        from google.api_core import exceptions as gexc
+
+        loop = asyncio.get_running_loop()
+        sub_path = self._subscriber.subscription_path(self._project_id, sub_name)
+        topic_path = f"projects/{self._project_id}/topics/{self._topic_name(topic)}"
+
+        def _create() -> None:
+            self._subscriber.create_subscription(
+                request={
+                    "name": sub_path,
+                    "topic": topic_path,
+                    "ack_deadline_seconds": 30,
+                    "expiration_policy": {
+                        "ttl": {"seconds": BROADCAST_SUBSCRIPTION_TTL_SECONDS}
+                    },
+                }
+            )
+
+        try:
+            await loop.run_in_executor(self._pull_executor, _create)
+        except gexc.AlreadyExists:
+            # The predecessor in this slot left its subscription behind — reuse
+            # it. Since ``_broadcast_slot_id`` is slot-stable this is the
+            # EXPECTED path after a SIGKILLed worker is respawned, not a rare
+            # one, and it is what bounds the subscription population by live
+            # slots instead of by cumulative worker deaths.
+            #
+            # Three things it deliberately does NOT do:
+            #
+            # - **It does not reset the expiration_policy TTL.** The create
+            #   failed, so nothing was written. That is fine: the TTL measures
+            #   subscriber inactivity, and the pull loop this returns True for
+            #   is about to start pulling. Activity, not the create call, is
+            #   what keeps Pub/Sub from expiring it.
+            # - **It does not seek past the predecessor's backlog.** A reused
+            #   subscription may carry messages the dead worker never acked.
+            #   Draining them is right, not merely tolerable: handlers here are
+            #   required to be idempotent, a fresh process has an empty cache so
+            #   replayed invalidations are no-ops, and a seek would discard
+            #   exactly the ``org.settings-changed`` events whose loss is the
+            #   stale-settings bug. Under the old random naming nobody drained
+            #   that backlog at all — it sat on the orphan until the TTL.
+            # - **It does not reconcile configuration.** A reused subscription
+            #   keeps whatever ``ack_deadline_seconds`` it was created with.
+            #   Worth knowing before changing that value, and worth knowing that
+            #   a subscription ``filter`` — which the module docstring floats
+            #   for server-side ``source_env`` dropping — is IMMUTABLE in
+            #   Pub/Sub. Adding one means changing this name, not updating the
+            #   subscription in place.
+            pass
+        except Exception:
+            logger.error(
+                "pubsub: failed to create broadcast subscription %s; this "
+                "process will NOT receive %s events (cross-process cache "
+                "invalidation falls back to the TTL). Check the service account "
+                "has pubsub.subscriptions.create on the project.",
+                sub_name,
+                topic,
+                exc_info=True,
+            )
+            return False
+        self._broadcast_sub_paths.append(sub_path)
+        return True
+
+    def _foreign_source_env(self, message: Any) -> str | None:
+        """Return the message's ``source_env`` when it was published by a
+        *different* environment than this bus — i.e. the message should be
+        dropped — otherwise ``None`` (process it normally).
+
+        Returns ``None`` (= process) in every backward-compatible case:
+
+        - this bus has no ``env`` configured, so the guard is disabled;
+        - the message carries no ``source_env`` attribute (the publisher
+          predates the attribute, or it came from outside this bus —
+          e.g. a Google-originated push), so we can't prove it's foreign;
+        - the attribute equals this bus's ``env``.
+
+        Only a *present* attribute that *differs* from ``self._env`` is
+        treated as foreign. This keeps the guard safe to deploy in any
+        order: until every publisher stamps the attribute, unstamped
+        messages keep their pre-guard fan-out behaviour rather than being
+        silently dropped.
+        """
+        if self._env is None:
+            return None
+        attributes = getattr(message, "attributes", None) or {}
+        source_env = attributes.get(SOURCE_ENV_ATTRIBUTE)
+        if not source_env or source_env == self._env:
+            return None
+        return source_env
+
+    async def _hold_leases(
+        self,
+        subscriber: Any,
+        pull_executor: Any,
+        sub_path: str,
+        ack_ids: list[str],
+        subscription_name: str,
+        stop: asyncio.Event,
+    ) -> None:
+        """Keep one pulled batch leased until ``stop`` is set.
+
+        ``_pull_loop`` dispatches a batch of up to ``max_messages``
+        sequentially and acks only once the whole batch is done, so the message
+        dispatched FIRST stays unacked for the entire drain. Nothing extended
+        the ack deadline, so a batch whose aggregate drain passed 30s had its
+        completed work redelivered — and the redelivered copy takes just as
+        long, so a subscription that falls behind this way stays behind.
+
+        The per-message case matters as much as the aggregate one, which is why
+        this refreshes on a timer rather than between messages: a single
+        handler that pages through a whole org (the embed-backfill sweep) can
+        outlast the deadline on its own, and a between-messages refresh would
+        never run during it.
+
+        Handlers are required to be idempotent, so the cost of the lapse was
+        duplicated work and duplicated provider spend rather than corruption —
+        but two instances running the same sweep concurrently is not a cost
+        anyone chose.
+
+        Deliberately unbounded in total: a handler that hangs forever keeps its
+        message leased forever. Capping the extensions would hand that message
+        to another instance while this one is still inside the handler, which
+        is the duplicate-sweep outcome this exists to prevent. A hung handler
+        also stalls this loop outright — the dispatch is sequential — so it
+        surfaces as a stopped subscription rather than as a lost message.
+        """
+        loop = asyncio.get_running_loop()
+        # Short before the first refresh, then the steady cadence: see
+        # ``LEASE_FIRST_REFRESH_SECONDS`` for why the initial deadline cannot be
+        # assumed. Reassigned after the wait rather than before the refresh, so
+        # a stop during the first interval still leaves without an RPC.
+        delay = LEASE_FIRST_REFRESH_SECONDS
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+            except TimeoutError:
+                pass  # the interval elapsed with no stop: refresh below
+            else:
+                # Asked to stop, and we are between refreshes rather than
+                # inside one — the only point at which leaving is free.
+                return
+            delay = LEASE_REFRESH_INTERVAL_SECONDS
+            try:
+                await loop.run_in_executor(
+                    pull_executor,
+                    functools.partial(
+                        subscriber.modify_ack_deadline,
+                        request={
+                            "subscription": sub_path,
+                            "ack_ids": ack_ids,
+                            "ack_deadline_seconds": LEASE_EXTENSION_SECONDS,
+                        },
+                    ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Never take the pull loop down over a failed extension. Losing
+                # the lease means redelivery, which is exactly the behaviour
+                # this guards against and which handlers already tolerate —
+                # strictly better than halting consumption.
+                if stop.is_set():
+                    # This refresh was already in flight when the caller asked
+                    # us to stop, so it landed beside the ``acknowledge`` and
+                    # named ids that ack was retiring. Expected, harmless, and
+                    # NOT the operator's problem — at warning it would fire on
+                    # ordinary batches and teach on-call to ignore the level.
+                    logger.debug(
+                        "event-bus: ack-deadline extension lost a race with "
+                        "the batch ack; nothing to do",
+                        extra={"subscription": subscription_name},
+                    )
+                else:
+                    # A genuine failure: the lease is lapsing and this batch
+                    # will redeliver. Logged rather than swallowed so it shows
+                    # up as a warning instead of as unexplained slowness.
+                    logger.warning(
+                        "event-bus: ack-deadline extension failed; messages "
+                        "may redeliver while this batch drains",
+                        extra={"subscription": subscription_name},
+                        exc_info=True,
+                    )
+
+    async def _pull_loop(
+        self, subscription_name: str, handlers: list[EventHandler]
+    ) -> None:
+        from google.api_core import exceptions as gexc  # type: ignore[import-untyped]
+
+        # Stopped check goes first — symmetric with `_get_publish_executor`.
+        # A pull loop that got scheduled right before stop() flipped the
+        # flag shouldn't start a new pull cycle.
+        if self._stopped:
+            raise RuntimeError("PubSubEventBus is stopped")
+        # Capture the subscriber reference once so stop() setting it to
+        # None can't race with the in-flight pull/ack calls below.
+        subscriber = self._subscriber
+        if subscriber is None:
+            # `start()` should always set `_subscriber` before spawning
+            # pull tasks — an explicit raise documents the invariant and
+            # survives `-O` (bare `assert` gets stripped there).
+            raise RuntimeError(
+                "PubSubEventBus._pull_loop invoked without a subscriber — "
+                "this is a programming error in start()."
+            )
+        sub_path = subscriber.subscription_path(self._project_id, subscription_name)
+        loop = asyncio.get_running_loop()
+        # Dedicated executor (not asyncio's default None) so stop() can
+        # drain pull/ack threads before closing `subscriber` — otherwise
+        # a thread still blocked in subscriber.pull(timeout=...) wakes
+        # up holding a reference to a closed gRPC channel. start()
+        # creates this before spawning pull tasks, so it must be set
+        # by the time we run here.
+        pull_executor = self._pull_executor
+        if pull_executor is None:
+            raise RuntimeError(
+                "_pull_loop invoked with no pull executor — this is a "
+                "programming error in start()."
+            )
+
+        current = asyncio.current_task()
+        while not (self._stopping or self._draining):
+            # Declared out here so the ``finally`` can always see them,
+            # including when the pull itself raises before a batch exists.
+            lease_keeper: asyncio.Task[Any] | None = None
+            stop_extending = asyncio.Event()
+            try:
+                response = await loop.run_in_executor(
+                    pull_executor,
+                    functools.partial(
+                        subscriber.pull,
+                        request={
+                            "subscription": sub_path,
+                            "max_messages": self._max_messages,
+                        },
+                        timeout=self._pull_timeout,
+                    ),
+                )
+                ack_ids: list[str] = []
+                # Keyed by the redelivery delay each one asks for — see
+                # ``_nack_delay_seconds``. ``modify_ack_deadline`` takes one
+                # deadline per request, so each delay is its own request.
+                nack_ids: dict[int, list[str]] = {}
+                # Every id this pull returned, whatever its eventual outcome.
+                # The keeper holds ALL of them until the acks go out, because
+                # the point is precisely that a message which finished first
+                # stays unacked for the rest of the drain.
+                leased_ids = [r.ack_id for r in response.received_messages]
+                if leased_ids and current is not None:
+                    self._dispatching.add(current)
+                if leased_ids:
+                    lease_keeper = self._spawn_background_task(
+                        self._hold_leases(
+                            subscriber,
+                            pull_executor,
+                            sub_path,
+                            leased_ids,
+                            subscription_name,
+                            stop_extending,
+                        )
+                    )
+                for received in response.received_messages:
+                    if self._stopped or self._draining:
+                        # ``stop()`` or ``stop_consuming()`` has begun: hand the
+                        # rest of the batch straight back (deadline 0) for
+                        # another instance, rather than starting handlers the
+                        # stop grace would only cancel.
+                        nack_ids.setdefault(0, []).append(received.ack_id)
+                        continue
+                    # Hoisted: proto-plus re-wraps the nested message on every
+                    # ``.message`` access, so reading it three times costs
+                    # three wrapper allocations per message on the hot path.
+                    msg = received.message
+                    foreign_env = self._foreign_source_env(msg)
+                    if foreign_env is not None:
+                        # Fan-out copy from a sibling environment sharing
+                        # this project's topics. Ack-drop *before* decode
+                        # and dispatch — running the handler would re-run a
+                        # provider (embed/enrich) call on the payload and
+                        # then no-op against a tenant row that doesn't exist
+                        # in this env's DB, wasting spend and emitting
+                        # `target row missing` noise. Ack (not nack) so it
+                        # isn't redelivered; the owning env has its own
+                        # subscription and processes its own copy.
+                        ack_ids.append(received.ack_id)
+                        logger.info(
+                            "event-bus: dropping foreign-env message",
+                            extra={
+                                "subscription": subscription_name,
+                                "source_env": foreign_env,
+                                "env": self._env,
+                            },
+                        )
+                        continue
+                    event = self._decode(
+                        msg.data,
+                        subscription=subscription_name,
+                        message_id=msg.message_id,
+                    )
+                    if event is None:
+                        # Malformed message — ack so we don't redeliver
+                        # forever, log for alerting. The log is ``_decode``'s,
+                        # not this branch's: adding one here would double-count
+                        # the drop in any alert that counts occurrences.
+                        ack_ids.append(received.ack_id)
+                        continue
+                    success = await self._dispatch_all(handlers, event)
+                    if success:
+                        ack_ids.append(received.ack_id)
+                    else:
+                        delay = _nack_delay_seconds(
+                            getattr(received, "delivery_attempt", 0)
+                        )
+                        nack_ids.setdefault(delay, []).append(received.ack_id)
+
+                # DRAIN the keeper before the acks, and above all before the
+                # nack. Signalled and AWAITED, not cancelled: ``cancel()`` only
+                # interrupts the keeper while it is WAITING, so a refresh
+                # already inside ``run_in_executor`` runs to completion on its
+                # thread regardless and can land after whatever follows here.
+                #
+                # On the ack path that leftover is harmless — it names ids the
+                # ack is retiring. On the nack path it is not. A nack is a
+                # ``modify_ack_deadline`` of a short, chosen delay (see
+                # ``_nack_delay_seconds``), so an extension arriving behind it
+                # overwrites that with ``LEASE_EXTENSION_SECONDS`` and silently
+                # replaces the backoff the nack asked for. The original reasoning was sound for the
+                # case it considered and simply did not reach this one.
+                #
+                # Awaiting is what closes it. ``stop`` is already set, so the
+                # keeper finishes at most the one refresh it is inside, sees the
+                # event on the next pass and returns; and because the keeper
+                # AWAITS its own ``run_in_executor``, the task completing means
+                # that RPC has already RETURNED. A lock would not have done it:
+                # mutual exclusion orders nothing, so a nack and a refresh
+                # queued onto this multi-worker executor together could still
+                # take it in either order.
+                #
+                # Caught, not suppressed. A keeper that escaped its own
+                # handler must not take the acks below down with it -- but it
+                # must not vanish either, and suppressing is how it would.
+                # Ordinary RPC failures never reach here: ``_hold_leases``
+                # catches and logs those itself. What reaches here is a BUG in
+                # the keeper, the one thing worth waking someone for.
+                #
+                # Awaiting is what makes the log necessary. While the task was
+                # only cancelled and never awaited, an exception it had already
+                # raised stayed unretrieved and asyncio reported it at GC as
+                # "Task exception was never retrieved" -- late, untargeted, and
+                # only in that one ordering, but not nothing. Retrieving it
+                # here ends that, so this takes over the job and does it
+                # properly, naming the subscription.
+                #
+                # ``except Exception``, not ``BaseException``: ``CancelledError``
+                # is a ``BaseException``, so an outer ``stop()`` cancelling this
+                # pull task still propagates. The ``finally`` stays the backstop
+                # for every path that never reaches this line.
+                stop_extending.set()
+                if lease_keeper is not None:
+                    try:
+                        await lease_keeper
+                    except Exception:
+                        logger.exception(
+                            "event-bus: lease keeper raised unexpectedly while "
+                            "draining before ack/nack",
+                            extra={"subscription": subscription_name},
+                        )
+
+                # Ack/nack must stay inside this try: a transient network
+                # error during acknowledge would otherwise escape, kill
+                # the task, and silently stop consumption forever. On
+                # failure Pub/Sub redelivers via ack-deadline expiry.
+                if ack_ids:
+                    ack_request = {"subscription": sub_path, "ack_ids": ack_ids}
+                    await loop.run_in_executor(
+                        pull_executor,
+                        functools.partial(subscriber.acknowledge, request=ack_request),
+                    )
+                for delay, ids in nack_ids.items():
+                    nack_request = {
+                        "subscription": sub_path,
+                        "ack_ids": ids,
+                        "ack_deadline_seconds": delay,
+                    }
+                    await loop.run_in_executor(
+                        pull_executor,
+                        functools.partial(
+                            subscriber.modify_ack_deadline, request=nack_request
+                        ),
+                    )
+            except gexc.DeadlineExceeded:
+                # No messages in the pull window; loop back and try again.
+                continue
+            except (
+                gexc.NotFound,
+                gexc.PermissionDenied,
+                gexc.InvalidArgument,
+            ) as exc:
+                # We deleted this one ourselves. ``release_broadcast_subscriptions()``
+                # runs ahead of the rest of teardown so it fits inside the
+                # SIGTERM budget, which means this loop can still be mid-pull
+                # when the subscription disappears. That is an orderly exit, not
+                # a configuration fault: staying on the loud path below would
+                # log an ERROR and flip ``is_healthy`` false on every graceful
+                # shutdown, which is how a real alert gets tuned out.
+                #
+                # NotFound ONLY, deliberately. "We deleted it" explains a
+                # subsequent NotFound and nothing else. PermissionDenied means an
+                # IAM grant changed and InvalidArgument means we built a bad
+                # request — neither becomes benign because this process happened
+                # to release that name, and both are exactly what the loud path
+                # below exists to surface. Widening this back to the whole
+                # exception group would let a real IAM regression exit silently
+                # with ``is_healthy`` still true.
+                if isinstance(exc, gexc.NotFound) and (
+                    subscription_name in self._released_subscriptions
+                ):
+                    return
+                # Permanent configuration errors: subscription doesn't
+                # exist, service account lacks permission, or the
+                # request shape is wrong. Retrying spins the log forever
+                # without ever succeeding — halt the loop and let ops
+                # see the error once, loud. Record the subscription so
+                # `is_healthy` can surface it to a health endpoint.
+                logger.error(
+                    "pubsub permanent error; halting pull loop — check "
+                    "subscription provisioning and service-account permissions",
+                    extra={"subscription": subscription_name},
+                    exc_info=True,
+                )
+                self._failed_subscriptions.add(subscription_name)
+                return
+            except asyncio.CancelledError:
+                # ``except Exception:`` below would miss ``CancelledError``
+                # (BaseException subclass on Py 3.8+). The graceful
+                # shutdown path lands here when ``stop()`` cancels the
+                # pull task — re-raise so the task unwinds cleanly and
+                # ``stop()``'s ``gather(return_exceptions=True)`` captures
+                # it.
+                #
+                # Non-shutdown ``CancelledError`` (a handler awaiting a
+                # separately-cancelled task / future — a programming
+                # bug) is treated as a permanent halt rather than a
+                # nack-and-continue: marking ``_failed_subscriptions``
+                # flips ``is_healthy`` False so the load balancer drains
+                # this pod, the event re-delivers via Pub/Sub
+                # ack-deadline expiry to a healthy replica, and the
+                # buggy code path can be diagnosed via the readiness
+                # probe failure rather than as silent message loss.
+                # Recovery requires a service restart — same shape as
+                # the ``NotFound``/``PermissionDenied``/``InvalidArgument``
+                # branch above, since both classes of error are unsafe
+                # to retry without operator intervention.
+                if not (self._stopping or self._draining):
+                    self._failed_subscriptions.add(subscription_name)
+                raise
+            except Exception:
+                # During shutdown we deliberately close the subscriber
+                # first so pull threads wake immediately; the resulting
+                # gRPC error is expected, not something to log or sleep
+                # on. Short-circuit so `stop()` doesn't wait 5s per
+                # subscription for nothing.
+                if self._stopping:
+                    return
+                logger.exception(
+                    "pubsub pull/ack error; backing off",
+                    extra={"subscription": subscription_name},
+                )
+                await asyncio.sleep(self._error_backoff)
+                continue
+            finally:
+                # Every exit that skips the cancel above — a permanent halt, a
+                # cancellation, a transient error looping back for another pull
+                # — would otherwise leave a keeper extending messages nothing
+                # is processing any more. ``cancel()`` on a task that has
+                # already been cancelled is a no-op, so this and the cancel
+                # above are not in conflict.
+                stop_extending.set()
+                if lease_keeper is not None:
+                    lease_keeper.cancel()
+                if current is not None:
+                    self._dispatching.discard(current)
+
+    @staticmethod
+    def _decode(data: bytes, *, subscription: str, message_id: str) -> Event | None:
+        # Pydantic shifted `ValidationError`'s base across v2 minors
+        # (v1 + current ≥2.4 inherit from ValueError, 2.0-2.3 did not),
+        # so we catch both explicitly rather than assume either. A
+        # schema-invalid-but-valid-JSON message must drop here; if it
+        # escaped to `_pull_loop`'s outer handler the loop would back
+        # off without acking and Pub/Sub would redeliver forever.
+        # `json.JSONDecodeError` already inherits from ValueError since
+        # Python 3.5, so ValueError covers it — listed explicitly would
+        # be redundant.
+        #
+        # ``subscription`` / ``message_id`` are required keyword args: they
+        # exist only to be logged, so a default would let a caller drop the
+        # context and leave the log as unusable as it was before. They go in
+        # ``extra=`` rather than ``bind_contextvars`` (which this repo does
+        # configure, via ``merge_contextvars`` in ``structlog_config``) because
+        # contextvars are merged at emit time inside ``ProcessorFormatter`` and
+        # never reach the ``LogRecord`` — so ``caplog`` cannot see them, and
+        # every other drop site in the estate is asserted through the record.
+        #
+        # The two failure modes are caught SEPARATELY, and not for tidiness:
+        # only one of them can be logged with a traceback.
+        try:
+            parsed: dict[str, Any] = json.loads(data.decode("utf-8"))
+            return Event.model_validate(parsed)
+        except ValidationError as exc:
+            # MUST precede the ValueError arm: pydantic ≥2.4 makes
+            # ValidationError a ValueError subclass, so the order is what
+            # selects this branch at all.
+            #
+            # No ``exc_info`` here, deliberately. Pydantic renders the
+            # offending input into ``str(exc)`` as ``input_value=...`` — the
+            # whole decoded document when a required field is missing — and
+            # ``structlog_config``'s ``format_exc_info`` ships the rendered
+            # traceback to Cloud Logging and Datadog. That payload is tenant-
+            # or attacker-supplied and may carry personal data, so a
+            # ``logger.exception`` here silently exfiltrates it on every
+            # malformed message. ``errors(include_input=False)`` keeps the
+            # part that aids triage — which field failed and why — and drops
+            # the value. Verified against pydantic 2.13.4; the
+            # ``include_input`` kwarg is what the guarantee rests on.
+            logger.error(
+                "failed to decode pubsub message; acking to drop",
+                extra={
+                    "subscription": subscription,
+                    "message_id": message_id,
+                    "dropped": True,
+                    "validation_errors": exc.errors(
+                        include_input=False, include_url=False
+                    ),
+                },
+            )
+            return None
+        except ValueError:
+            # Malformed bytes/JSON. ``json.JSONDecodeError.__str__`` carries
+            # only a position ("Expecting value: line 1 column 1"), never the
+            # document — it hangs off ``.doc``, which is never rendered — so
+            # this arm keeps its traceback safely.
+            #
+            # Context matters most here: the traceback names the syntax fault
+            # but not WHICH message or subscription produced it, and a payload
+            # this broken yields no event_type or tenant_id to identify it by.
+            # ``message_id`` is what makes the dropped message findable after
+            # the fact, across ~60 prod subscriptions spanning two topic
+            # families mid-rename.
+            logger.exception(
+                "failed to decode pubsub message; acking to drop",
+                extra={
+                    "subscription": subscription,
+                    "message_id": message_id,
+                    "dropped": True,
+                },
+            )
+            return None
+
+    async def _dispatch_all(self, handlers: list[EventHandler], event: Event) -> bool:
+        """Run every handler concurrently and ack/nack on aggregate outcome.
+
+        Concurrent (via `asyncio.gather`) matches `InProcessEventBus`,
+        which spawns each handler as its own task — code validated
+        against the in-process bus keeps identical semantics here, and
+        a slow handler can't serialise the rest. Nack (return False)
+        when any handler raised, so Pub/Sub redelivers. Handlers must
+        be idempotent — a handler that already succeeded will see the
+        redelivered event again.
+        """
+        results = await asyncio.gather(
+            *(handler(event) for handler in handlers),
+            return_exceptions=True,
+        )
+        # CancelledError inherits from BaseException (not Exception)
+        # and ``return_exceptions=True`` above converts it to a
+        # returned value rather than re-raising — so an unchecked
+        # cancellation slips past the ``isinstance(result, Exception)``
+        # branch below and silently acks the message. Defer the raise
+        # until the loop has logged every Exception result; raising
+        # eagerly on the first cancellation would silently drop later
+        # handler-failure logs from a mixed batch.
+        cancelled: asyncio.CancelledError | None = None
+        all_ok = True
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                # Preserve the first cancellation rather than overwriting
+                # — a mixed batch's later cancellations would otherwise
+                # silently drop. Functionally either re-raise unwinds the
+                # loop correctly, but the first carries the most context.
+                if cancelled is None:
+                    cancelled = result
+                continue
+            if isinstance(result, Exception):
+                logger.exception(
+                    "pubsub handler raised; nacking for redelivery",
+                    exc_info=result,
+                    extra={
+                        "event_type": event.event_type,
+                        "event_id": str(event.event_id),
+                    },
+                )
+                all_ok = False
+        if cancelled is not None:
+            raise cancelled
+        return all_ok
+
+    async def _drain_in_flight(self) -> None:
+        """Wait, bounded by ``stop_grace_seconds``, for pull tasks holding a
+        batch to finish it.
+
+        Called by ``stop_consuming()`` after ``_draining`` is set and BEFORE the
+        subscriber is closed: a task finishing its batch still needs the client to ack
+        it, and then exits on its own because the loop condition is false. Cancelling
+        straight away, as ``stop()`` used to, raised ``CancelledError`` inside whatever
+        handler was running -- a lifecycle run, for one, left its audit row claimed
+        ``in_progress`` until the claim lease expired, and its message neither acked nor
+        nacked.
+        """
+        busy = {t for t in self._dispatching if not t.done()}
+        if not busy or self._stop_grace_seconds <= 0:
+            return
+        _done, pending = await asyncio.wait(busy, timeout=self._stop_grace_seconds)
+        if pending:
+            logger.warning(
+                "pubsub stop(): %d in-flight handler batch(es) still running after "
+                "%.1fs grace; cancelling",
+                len(pending),
+                self._stop_grace_seconds,
+            )
+
+    async def stop_consuming(self) -> None:
+        """Take no new deliveries, and settle the ones in flight (M-09).
+
+        Split out of ``stop()`` for the reason ``release_broadcast_subscriptions``
+        is: a shutdown path runs it FIRST. core-api reached ``stop()`` only after
+        its flushes, and until then its pull loops kept taking lifecycle runs. A
+        SIGKILL landing first cancels nothing, so such a run left its audit row
+        claimed for the lease.
+
+        Each pull loop ends after its current batch, handing back what it has not
+        started. A batch still running after ``stop_grace_seconds`` is cancelled
+        and awaited, so a lifecycle handler releases its claim on the way out.
+        The subscriber stays open for ``stop()``, and publishing is untouched, so
+        work that drains after this can still publish. Idempotent.
+        """
+        self._draining = True
+        await self._drain_in_flight()
+        busy = [t for t in self._dispatching if not t.done()]
+        for t in busy:
+            t.cancel()
+        await asyncio.gather(*busy, return_exceptions=True)
+
+    async def release_broadcast_subscriptions(self) -> None:
+        """Delete this process's ephemeral broadcast subscriptions.
+
+        Split out of ``stop()`` so a shutdown path can run it FIRST, ahead of
+        anything slow. That ordering is the whole point, and it is worth stating
+        why rather than leaving it to be rediscovered.
+
+        Each process creates its own ephemeral subscription per broadcast topic
+        — a broadcast needs one subscription per consumer, or the messages
+        load-balance and only one process sees each. The ``expiration_policy``
+        set at creation is the backstop, but its floor is
+        ``BROADCAST_SUBSCRIPTION_TTL_SECONDS`` (1 day, the Pub/Sub minimum), so
+        a subscription this misses occupies project quota for a full day.
+
+        That quota is **per project**, not per topic, and it is shared with
+        every other environment. A service that leaks these steadily will
+        eventually refuse subscription creation somewhere else entirely —
+        which is not a hypothetical: staging's leak exhausted the project cap
+        and the failure surfaced in prod, on a different topic, in a different
+        service.
+
+        So this must run inside the platform's SIGTERM budget (10s on Cloud
+        Run) even when the rest of teardown cannot. It needs only the subscriber
+        client and the recorded paths — no pull loops stopped, no queues
+        flushed, no storage open. Idempotent: the paths are cleared, so calling
+        it again, or calling ``stop()`` afterwards, is a no-op.
+
+        **Still worth doing now that names are slot-stable.** Slot stability
+        means a subscription survives a worker's death to be reused by that
+        slot's next occupant — but only on the SAME instance, because the
+        instance token in the name does not outlive the instance. A clean
+        shutdown is overwhelmingly an instance going away (Cloud Run scaling
+        down, a revision cutover), and that instance's token never returns, so
+        anything left behind is a pure orphan with nobody to inherit it.
+
+        So the two mechanisms cover disjoint exits and neither subsumes the
+        other: slot-stable naming handles the death where shutdown CANNOT run
+        (SIGKILL, where the process is simply gone), and this handles the exit
+        where it can and where reuse is impossible anyway. Deleting also drops
+        the backlog on a subscription no successor will ever drain.
+
+        One case sits between the two and is deliberately accepted: a single
+        worker shut down cleanly while its INSTANCE survives (uvicorn's SIGHUP
+        restart, SIGTTOU). There the delete is churn — the replacement claims
+        the freed slot and recreates the same name — and it discards a backlog
+        the successor could have drained. Cloud Run sends neither signal, so
+        this costs a pair of RPCs in a case that does not arise in the
+        deployment this is written for; special-casing it would add a branch
+        nothing exercises.
+        """
+        if self._subscriber is None or not self._broadcast_sub_paths:
+            return
+        loop = asyncio.get_running_loop()
+        # Record before deleting, not after. The pull loop for a subscription
+        # can hit NotFound the instant the delete lands, and if it reaches the
+        # error branch before this set is updated it takes the loud path for a
+        # deletion we performed on purpose.
+        self._released_subscriptions.update(
+            path.rsplit("/", 1)[-1] for path in self._broadcast_sub_paths
+        )
+
+        async def _release_one(sub_path: str) -> None:
+            try:
+                await loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        self._subscriber.delete_subscription,
+                        request={"subscription": sub_path},
+                        timeout=BROADCAST_RELEASE_TIMEOUT_SECONDS,
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "pubsub: failed to delete ephemeral broadcast "
+                    "subscription %s; expiration_policy will reap it in up to "
+                    "%ds, during which it holds project subscription quota",
+                    sub_path,
+                    BROADCAST_SUBSCRIPTION_TTL_SECONDS,
+                    exc_info=True,
+                )
+
+        # Concurrently, not sequentially. Under dual-subscribe every broadcast
+        # topic has two names, so even one topic is two deletes — and a
+        # sequential loop multiplies the per-call ceiling by the subscription
+        # count, which is how a bounded call still overruns an unbounded
+        # budget. Fanning out keeps the wall-clock at roughly one timeout no
+        # matter how many there are.
+        #
+        # ``return_exceptions=True`` because ``_release_one`` already logs and
+        # swallows; this is belt-and-braces so an unexpected escape cannot
+        # abort the remaining deletes or propagate out of a shutdown path.
+        await asyncio.gather(
+            *(_release_one(p) for p in self._broadcast_sub_paths),
+            return_exceptions=True,
+        )
+        self._broadcast_sub_paths.clear()
+
+    async def stop(self) -> None:
+        # Flip `_stopped` first so `_get_publish_executor` / `_pull_loop`
+        # refuse to spin up new resources after this point — closes the
+        # race where a concurrent publish() would create an executor
+        # that stop() has already walked past and will never join.
+        self._stopped = True
+        self._stopping = True
+        # Bump generation BEFORE the teardown body so a concurrent
+        # ``start()`` suspended on its shielded SubscriberClient await
+        # sees a non-zero delta even when this stop() runs to clean
+        # completion (the finally below resets both flags to False).
+        self._stop_generation += 1
+        loop = asyncio.get_running_loop()
+        # `teardown_complete` gates the lifecycle-flag reset in the
+        # finally. It flips True only at the very end of the try body,
+        # after every close/shutdown has run to completion. Per-step
+        # Exception guards below catch ordinary close failures and
+        # continue, so those still let us reach the end — the gate
+        # matters for BaseException escapes (CancelledError from a
+        # uvicorn shutdown-deadline, KeyboardInterrupt, etc.). In that
+        # case some `_pull_executor` / `_publish_executor` / `_publisher`
+        # attributes may still reference live SDK threads whose join
+        # never ran, and leaving `_started=True` blocks a re-entry from
+        # overwriting those references and orphaning the threads
+        # permanently.
+        # `close_failure_count` tallies per-step failures within this
+        # invocation. A non-zero count on a successful teardown still
+        # means gRPC channels / threads leaked SDK-side — we log a
+        # warning so repeated start/stop cycles with close failures
+        # surface as a visible pattern rather than silently accumulating
+        # file descriptors or thread-pool entries. Local (not instance)
+        # so a concurrent stop() can't clobber the other's count, and
+        # nothing outside stop() has a legitimate read interest.
+        teardown_complete = False
+        close_failure_count = 0
+        # `_pull_tasks.clear()` is deliberately deferred until every
+        # blocking cleanup step below finishes. ``_started`` is flipped
+        # to False only at the end of stop() for the same reason — a
+        # concurrent ``start()`` must not pass its ``if self._started:``
+        # idempotency guard and create a fresh SubscriberClient that
+        # the in-flight stop() would then close out from under the caller.
+        try:
+            # Delete this process's ephemeral broadcast subscriptions BEFORE
+            # closing the subscriber (the delete needs the client). The close
+            # below then wakes the pull threads via the gRPC channel error, so
+            # they exit through the ``if self._stopping: return`` path rather
+            # than logging NotFound.
+            await self.release_broadcast_subscriptions()
+            # Let handlers already running finish (bounded) while the subscriber
+            # can still ack for them, then cancel the rest; see
+            # ``stop_consuming``, a no-op here if a shutdown already ran it.
+            # ``_stopping`` is already set, so nothing new is started meanwhile.
+            await self.stop_consuming()
+            # Close the subscriber BEFORE cancelling/awaiting the pull
+            # tasks. Pull threads are blocked inside a synchronous
+            # `subscriber.pull(timeout=pull_timeout)` — asyncio
+            # cancellation removes the task reference but can't interrupt
+            # the thread, so `gather()` below waits up to ``pull_timeout``
+            # per task for the SDK call to return on its own. Closing the
+            # subscriber first errors the gRPC channel, wakes every
+            # blocked thread immediately, and lets the pull tasks finish
+            # near-instantly — critical under Cloud Run's 10 s SIGTERM
+            # window or `stop()` gets SIGKILL'd and in-flight ack calls
+            # never complete.
+            # Offloaded to a thread because SDK .close() waits on
+            # background gRPC channels to drain — keeps the event loop
+            # responsive for other tasks' cancellations during lifespan
+            # shutdown.
+            if self._subscriber is not None:
+                sub = self._subscriber
+                self._subscriber = None
+                try:
+                    await loop.run_in_executor(None, sub.close)
+                except Exception:
+                    close_failure_count += 1
+                    logger.exception(
+                        "pubsub subscriber.close() failed; continuing teardown"
+                    )
+            for t in self._pull_tasks:
+                t.cancel()
+            # `return_exceptions=True` captures task-level exceptions
+            # (including CancelledError from the t.cancel() above) as
+            # result values rather than raising — so this await is
+            # already safe against handler/loop failures. The only
+            # remaining way it raises is external cancellation of
+            # stop() itself (e.g. uvicorn's shutdown deadline firing),
+            # and that *should* propagate so the caller learns the
+            # deadline was missed.
+            await asyncio.gather(*self._pull_tasks, return_exceptions=True)
+            if self._pull_executor is not None:
+                pull_exec = self._pull_executor
+                self._pull_executor = None
+                try:
+                    await loop.run_in_executor(None, pull_exec.shutdown, True)
+                except Exception:
+                    close_failure_count += 1
+                    logger.exception(
+                        "pubsub pull executor shutdown failed; continuing teardown"
+                    )
+            if self._publish_executor is not None:
+                pub_exec = self._publish_executor
+                self._publish_executor = None
+                try:
+                    await loop.run_in_executor(None, pub_exec.shutdown, True)
+                except Exception:
+                    close_failure_count += 1
+                    logger.exception(
+                        "pubsub publish executor shutdown failed; continuing teardown"
+                    )
+            if self._publisher is not None:
+                pub = self._publisher
+                self._publisher = None
+                try:
+                    # PublisherClient has no close(); its shutdown API is
+                    # stop(): commits every outstanding batch and joins
+                    # the background commit thread. This is the ONLY real
+                    # flush in the pipeline — publish() is fire-and-forget
+                    # into the client's batch queue, so the old code here
+                    # (calling the nonexistent close() and swallowing the
+                    # AttributeError) silently lost any batch still queued
+                    # at shutdown. Long-running services rarely noticed
+                    # (the commit thread transmits within ~10 ms of wall
+                    # clock), but a short-lived process lost its entire
+                    # final batch — verified in prod 2026-06-11 when a
+                    # backfill CLI run lost all 16 published events.
+                    await loop.run_in_executor(None, pub.stop)
+                except Exception:
+                    close_failure_count += 1
+                    logger.exception(
+                        "pubsub publisher.stop() failed; continuing teardown"
+                    )
+            teardown_complete = True
+        finally:
+            # Defense-in-depth cancel + drain: if an unexpected
+            # BaseException escaped the per-step guards above
+            # (CancelledError, KeyboardInterrupt, ...) the try body
+            # may have bailed before the cancel/gather in the try
+            # body ran. Cancel here (cancel() is idempotent, so
+            # double-cancel in the happy path is a no-op) and drain
+            # so we don't drop pending task references on the next
+            # `_pull_tasks.clear()` — asyncio emits "Task was
+            # destroyed but it is pending" for orphaned references,
+            # and in-flight ack/nack work inside handlers must still
+            # get a chance to finish. Awaiting inside a finally during
+            # external cancellation is legal on Python 3.9+: the outer
+            # BaseException resumes propagating once the finally exits.
+            for t in self._pull_tasks:
+                t.cancel()
+            if self._pull_tasks:
+                await asyncio.gather(*self._pull_tasks, return_exceptions=True)
+            self._pull_tasks.clear()
+            # Drain background close() tasks before clearing strong refs.
+            # These coroutines are awaiting non-cancellable
+            # ``run_in_executor`` futures that finish the SDK-level
+            # close() — cancelling them would be a no-op on the actual
+            # close work, but if the event loop tears down right after
+            # ``stop()`` returns, any still-running task gets dropped
+            # mid-await and the gRPC channel leaks.
+            #
+            # ``list()`` snapshots the set: each task's done-callback
+            # calls ``self._background_tasks.discard(task)`` on
+            # completion, which would otherwise mutate the set while
+            # ``gather`` is iterating its argument. ``return_exceptions``
+            # so a single failing close() can't escape this finally.
+            #
+            # Ordering note: a concurrent ``_ensure_publisher`` whose
+            # shielded await resumes AFTER our finally runs can still
+            # spawn a ``_close_post_stop`` task into the now-empty
+            # set — that task is drained by the next ``stop()`` (or
+            # by the executor thread's own ref chain if no second
+            # stop ever happens, since the executor holds the close
+            # function across the await).
+            if self._background_tasks:
+                await asyncio.gather(
+                    *list(self._background_tasks), return_exceptions=True
+                )
+            self._background_tasks.clear()
+            self._failed_subscriptions.clear()
+            self._stopping = False
+            self._draining = False
+            self._warned_missing_start = False
+            if teardown_complete:
+                # Per-step Exception guards above log-and-continue, so
+                # reaching here means every attribute got nulled out
+                # (possibly leaking SDK-side threads / gRPC channels
+                # from the failing close, which show up in the log).
+                # Safe to reset lifecycle flags so a subsequent start()
+                # can re-acquire fresh clients.
+                self._stopped = False
+                self._started = False
+                if close_failure_count > 0:
+                    # Each failed close leaked its SDK resources (the
+                    # attribute was nulled BEFORE the close attempt, so
+                    # the object is unrecoverable). A single occurrence
+                    # is annoying; repeated stop/start cycles with the
+                    # same signature will silently exhaust file
+                    # descriptors or thread-pool capacity. Warn loudly
+                    # so the accumulation is visible in structured logs.
+                    logger.warning(
+                        "pubsub stop() had %d close failure(s); "
+                        "leaked gRPC resources will accumulate if "
+                        "start/stop is called repeatedly with the "
+                        "same error signature",
+                        close_failure_count,
+                    )
+            # else: BaseException escaped — leave `_stopped=True` and
+            # `_started=True` so `is_healthy` reports False and a
+            # concurrent start() bails via its `if self._started:`
+            # guard. Without this, start() would overwrite live
+            # `_pull_executor` / `_publish_executor` / `_publisher`
+            # references whose `shutdown()`/`close()` never ran,
+            # permanently orphaning those threads.

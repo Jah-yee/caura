@@ -1,0 +1,239 @@
+"""Audit log endpoints."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, Query, Request
+
+from common import permanent_failure
+from core_storage_api.schemas import AUDIT_LOG_FIELDS, orm_to_dict
+from core_storage_api.services.audit_chain import PIIInAuditError
+from core_storage_api.services.postgres_service import PostgresService
+
+router = APIRouter(prefix="/audit-logs", tags=["Audit"])
+_svc = PostgresService()
+
+# Required keys on every audit event. Missing any of these used to
+# raise ``KeyError`` deep in ``audit_add_batch`` (and silently lose
+# every other event in the same drained batch); validating at the
+# boundary turns a 500 into a 422 with an actionable index + field
+# list, and protects already-drained valid events from collateral
+# loss.
+_REQUIRED_AUDIT_FIELDS = frozenset({"tenant_id", "action", "resource_type"})
+
+# Hard ceiling on the bulk endpoint so a buggy or malicious caller
+# can't bypass core-api's ``audit_queue_flush_threshold`` (50 default)
+# and submit millions of rows in one INSERT. 500 is a generous
+# multiple of the default flush_threshold and keeps any single INSERT
+# bounded for predictable AlloyDB transaction time.
+_MAX_BATCH_SIZE = 500
+
+
+def _pii_refusal(exc: PIIInAuditError) -> HTTPException:
+    """422, marked not retryable, for a ``detail`` the chain refused.
+
+    Unreachable by construction — the writer scrubs card/SSN-shaped spans with
+    the same patterns the assertion checks (``audit_chain.scrub_pii``) — and
+    mapped anyway: the failure is deterministic, so the bare 500 it used to be
+    told core-api's flusher to retry an identical batch and then drop it.
+    """
+    return HTTPException(
+        status_code=422,
+        detail=permanent_failure.permanent_detail(cause="pii_in_audit_detail", message=str(exc)),
+    )
+
+
+def _parse_resource_id(rid: object) -> UUID | None:
+    """``UUID(rid)`` with a 422 on a malformed input.
+
+    Pre-422 a malformed ``resource_id`` raised ``ValueError`` and
+    propagated as a 500. On the bulk path that meant one bad event
+    crashed the whole batch — every other valid event drained from
+    the queue alongside it was lost.
+    """
+    if rid is None:
+        return None
+    try:
+        return UUID(rid)  # type: ignore[arg-type]
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid resource_id UUID: {rid!r}",
+        ) from exc
+
+
+@router.post("")
+async def create_audit_log(request: Request) -> dict:
+    body: dict = await request.json()
+    try:
+        await _svc.audit_add(
+            tenant_id=body["tenant_id"],
+            agent_id=body.get("agent_id"),
+            action=body["action"],
+            resource_type=body["resource_type"],
+            resource_id=_parse_resource_id(body.get("resource_id")),
+            detail=body.get("detail"),
+        )
+    except PIIInAuditError as exc:
+        raise _pii_refusal(exc) from exc
+    return {"ok": True}
+
+
+@router.post("/bulk")
+async def create_audit_logs_bulk(request: Request) -> dict:
+    """Batched audit insert (CAURA-628).
+
+    Accepts ``{"events": [<event>, ...]}`` and persists them in a
+    single multi-row INSERT — one table-lock acquisition + one
+    AlloyDB round-trip regardless of batch size. The legacy per-event
+    endpoint (``POST /audit-logs``) kept for the synchronous-fallback
+    path in core-api's ``log_action``; once core-api is on the queue
+    path everywhere, the legacy endpoint can be retired in a separate
+    cycle.
+
+    Validation happens at the boundary so malformed events surface as
+    422 before the database session opens — protects valid events in
+    the same batch from being rolled back. Order:
+
+      1. Reject non-list payloads.
+      2. Reject batch sizes above ``_MAX_BATCH_SIZE``.
+      3. Walk every event: collect required-field-missing AND
+         malformed-``resource_id`` errors, then raise once with the
+         full list. Caller fixes the whole bad set in one round-trip
+         instead of having to play whack-a-mole one event at a time.
+    """
+    body: dict = await request.json()
+    events = body.get("events") or []
+    # Guard the type explicitly — without this, ``len(events)`` would
+    # raise ``TypeError`` on a non-list (e.g. a caller mis-shaping the
+    # payload as ``{"events": {"0": {...}}}``) and propagate as a 500.
+    if not isinstance(events, list):
+        raise HTTPException(
+            status_code=422,
+            detail=f"'events' must be a list, got {type(events).__name__!r}",
+        )
+    if len(events) > _MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=422,
+            detail=(f"Batch too large: {len(events)} events (max {_MAX_BATCH_SIZE})"),
+        )
+    # Pass 1: collect all validation errors. Doing this in two passes
+    # (validate, then normalise) means a caller submitting 50 events
+    # with 3 bad fields gets all 3 errors back in one 422 — no
+    # round-trip-per-fix.
+    errors: list[dict] = []
+    for i, event in enumerate(events):
+        # Per-element type guard: the outer ``isinstance(events, list)``
+        # check above only confirms the container is a list; JSON
+        # arrays can hold arbitrary types, so a payload like
+        # ``{"events": [null, "oops", 123]}`` would crash with
+        # ``AttributeError`` on ``event.keys()`` below and propagate
+        # as a 500. Surface as 422 with a typed error so the caller
+        # can self-diagnose.
+        if not isinstance(event, dict):
+            errors.append(
+                {
+                    "index": i,
+                    "error": (f"event must be an object, got {type(event).__name__!r}"),
+                }
+            )
+            continue
+        missing = _REQUIRED_AUDIT_FIELDS - event.keys()
+        if missing:
+            errors.append({"index": i, "missing_fields": sorted(missing)})
+        rid = event.get("resource_id")
+        if rid is not None:
+            try:
+                UUID(str(rid))
+            except (ValueError, TypeError):
+                errors.append({"index": i, "invalid_resource_id": repr(rid)})
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+    # Pass 2: normalise. ``resource_id`` already validated above so
+    # ``UUID(rid)`` here is just the type conversion — no error path.
+    normalised: list[dict] = []
+    for event in events:
+        normalised_event = dict(event)
+        rid = normalised_event.get("resource_id")
+        if rid is not None:
+            normalised_event["resource_id"] = UUID(rid)
+        normalised.append(normalised_event)
+    try:
+        await _svc.audit_add_batch(normalised)
+    except PIIInAuditError as exc:
+        # Other tenants' groups in the batch were still committed.
+        raise _pii_refusal(exc) from exc
+    return {"ok": True, "count": len(normalised)}
+
+
+@router.get("/verify")
+async def verify_audit_chain(
+    tenant_id: str,
+    # Bounded so an authenticated caller can't pass ?limit=1e9 and force the
+    # service to load hundreds of millions of rows into memory (OOM).
+    limit: int = Query(default=100_000, ge=1, le=500_000),
+    # Resume point. A chain longer than ``limit`` comes back ``truncated`` with
+    # a ``next_seq``; pass it here to verify the following window. Without this
+    # the tail of any chain past the 500k cap was unverifiable — the result
+    # announced truncation and offered no way to continue.
+    start_seq: int = Query(default=1, ge=1),
+) -> dict:
+    """Verify a tenant's tamper-evident audit hash chain.
+
+    Walks the chain in ``seq`` order, recomputes each ``event_hash``, and
+    checks linkage + genesis + tail-against-head. Returns
+    ``{valid: true, verified_count, head_seq, truncated}`` when intact — plus
+    ``next_seq`` when ``truncated`` — else
+    ``{valid: false, verified_count, first_broken: {seq, id, reason}}``
+    where ``reason`` ∈ {seq_gap, prev_hash_mismatch, event_hash_mismatch,
+    tail_truncated, missing_predecessor}. Declared before the ``GET ""`` list
+    route so ``/audit-logs/verify`` matches here, not the list handler.
+
+    A ``truncated`` result verifies only the window it covers, and each window
+    is read in its own snapshot — so walking every contiguous window from seq 1
+    is a WEAKER statement than one un-truncated pass, not an equal one. It
+    shows each window was intact when it was read, which leaves a tamper behind
+    the cursor undetected until a later run covers that region. Prefer a single
+    un-truncated pass where the chain fits inside one; see
+    ``audit_verify_chain`` for the full argument.
+
+    ``missing_predecessor`` carries only ``{seq, reason}`` — there is no row to
+    report an ``id`` for, which is the point of the refusal.
+    """
+    return await _svc.audit_verify_chain(tenant_id, limit=limit, start_seq=start_seq)
+
+
+@router.get("")
+async def list_audit_logs(
+    tenant_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    action: str | None = None,
+    resource_type: str | None = None,
+    agent_id: str | None = None,
+    resource_id: UUID | None = None,
+    since: datetime | None = None,
+    cursor_ts: datetime | None = None,
+    cursor_id: UUID | None = None,
+) -> list[dict]:
+    # EVERY parameter filters in SQL. ``since`` already did (OSS 08/14 M-11);
+    # ``action`` / ``resource_type`` / ``offset`` were applied here, in Python,
+    # to rows the query had already truncated with LIMIT — so a filter searched
+    # only the newest ``limit`` rows and returned [] when the matches were older
+    # than that, and ``offset`` sliced a list that was itself capped at
+    # ``limit``, which made page 2 empty for every tenant, always.
+    logs = await _svc.audit_list_by_tenant(
+        tenant_id,
+        limit=limit,
+        offset=offset,
+        action=action,
+        resource_type=resource_type,
+        agent_id=agent_id,
+        resource_id=resource_id,
+        since=since,
+        cursor_ts=cursor_ts,
+        cursor_id=cursor_id,
+    )
+    return [orm_to_dict(log, AUDIT_LOG_FIELDS) for log in logs]

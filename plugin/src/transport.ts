@@ -1,0 +1,162 @@
+/**
+ * HTTP transport layer for Caura API communication.
+ *
+ * Security fixes:
+ * - Default 15s timeout on all requests via AbortController
+ * - Signal forwarding from callers
+ * - API key refused over plain HTTP to a non-loopback host
+ */
+
+import { CAURA_API_PREFIX, CAURA_API_URL, CAURA_API_KEY, assertKeyTransportAllowed } from "./env.js";
+import { resolveAgentKey, evictAgentKey } from "./agent-auth.js";
+import { withUserAgent } from "./user-agent.js";
+
+const DEFAULT_TIMEOUT_MS = 15_000;
+
+export async function apiCall(
+  method: string,
+  path: string,
+  body?: Record<string, unknown>,
+  query?: Record<string, string>,
+  signal?: AbortSignal,
+  agentId?: string,
+  extraHeaders?: Record<string, string>,
+  onResponseHeaders?: (headers: Headers) => void,
+): Promise<unknown> {
+  const start = Date.now();
+
+  // Contract: callers pass RESOURCE paths ("/memories", "/evolve/report").
+  // Reject prefixed paths early so accidental full-path regressions are loud
+  // during tsc/tests rather than silently 404'ing at runtime.
+  const normalized = path.startsWith("/") ? path : `/${path}`;
+  if (normalized.startsWith(CAURA_API_PREFIX + "/") || normalized === CAURA_API_PREFIX) {
+    throw new Error(
+      `[caura] apiCall path must be a resource path (e.g. "/evolve/report"); ` +
+      `got "${path}". CAURA_API_PREFIX ("${CAURA_API_PREFIX}") is applied automatically.`,
+    );
+  }
+  const url = new URL(`${CAURA_API_PREFIX}${normalized}`, CAURA_API_URL);
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      url.searchParams.set(k, v);
+    }
+  }
+
+  // Refuse before resolving (and possibly provisioning) any credential when
+  // it would cross the network in cleartext.
+  if (CAURA_API_KEY) assertKeyTransportAllowed();
+
+  // Resolve agent-scoped credential, or fall back to the tenant-scoped key
+  const effectiveAgentId = agentId || (body?.agent_id as string) || (query?.agent_id as string);
+  let effectiveKey = CAURA_API_KEY;
+  if (effectiveAgentId) {
+    const agentKey = await resolveAgentKey(effectiveAgentId);
+    if (agentKey) effectiveKey = agentKey;
+  }
+
+  const headers: Record<string, string> = withUserAgent();
+  if (body) headers["Content-Type"] = "application/json";
+  if (effectiveKey) {
+    assertKeyTransportAllowed();
+    headers["X-API-Key"] = effectiveKey;
+  }
+  // Caller-supplied headers (e.g. the per-attempt `X-Bulk-Attempt-Id`
+  // required by POST /memories/bulk). Applied after the defaults so a
+  // caller can override them deliberately if ever needed.
+  if (extraHeaders) Object.assign(headers, extraHeaders);
+
+  // Use caller's signal if provided, otherwise create a default timeout
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let effectiveSignal = signal;
+
+  if (!effectiveSignal) {
+    const controller = new AbortController();
+    effectiveSignal = controller.signal;
+    timeoutId = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+  }
+
+  try {
+    const requestInit: RequestInit = {
+      method,
+      // X-API-Key is not stripped on cross-origin redirects by fetch.
+      // Require the configured API URL to be the final destination.
+      redirect: "error",
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      signal: effectiveSignal,
+    };
+    let res = await fetch(url.toString(), requestInit);
+
+    // A rejected agent credential gets exactly one fallback attempt with the
+    // tenant key. Retrying in this frame avoids re-deriving ``agent_id`` from
+    // the body/query and recursively provisioning the same rejected key.
+    if (res.status === 401 && effectiveKey !== CAURA_API_KEY && effectiveAgentId) {
+      evictAgentKey(effectiveAgentId);
+      console.warn(`[caura] Agent key rejected for '${effectiveAgentId}', retrying with tenant key`);
+      const retryHeaders = { ...headers };
+      if (CAURA_API_KEY) retryHeaders["X-API-Key"] = CAURA_API_KEY;
+      else delete retryHeaders["X-API-Key"];
+      res = await fetch(url.toString(), { ...requestInit, headers: retryHeaders });
+    }
+
+    if (!res.ok) {
+      const text = await res.text();
+      // Truncate server error body to avoid leaking internal details
+      const safeText = text.length > 200 ? text.slice(0, 200) + "..." : text;
+      throw new Error(`Caura API ${res.status}: ${safeText}`);
+    }
+
+    // Expose metadata from the final successful response without changing
+    // the JSON payload contract for existing callers (including arrays).
+    onResponseHeaders?.(res.headers);
+
+    // 204 No Content (e.g. DELETE)
+    if (res.status === 204) {
+      return { ok: true, _latency_ms: Date.now() - start };
+    }
+
+    const data = await res.json();
+    const latency_ms = Date.now() - start;
+    const serverTime = res.headers.get("X-Response-Time");
+    if (typeof data === "object" && data !== null && !Array.isArray(data)) {
+      (data as Record<string, unknown>)._latency_ms = latency_ms;
+      if (serverTime)
+        (data as Record<string, unknown>)._server_ms = parseInt(serverTime, 10);
+    }
+    return data;
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Extract the memory array from a ``POST /search`` response.
+ *
+ * The REST search endpoint returns ``{ items: [...] }`` (core-api
+ * ``SearchResponse(items=...)``), while the MCP ``caura_recall`` path
+ * returns ``{ results: [...] }`` and some legacy/test shims return a bare
+ * array. Reading only ``.results`` (as we did pre-fix) silently yielded
+ * ``[]`` against the REST backend — breaking context-engine auto-recall
+ * and the bootstrap smoke test. Prefer ``items`` (the live REST contract),
+ * fall back to ``results``, and accept a bare array. Never throws.
+ */
+export function parseSearchItems(sr: unknown): Record<string, unknown>[] {
+  if (Array.isArray(sr)) return sr as Record<string, unknown>[];
+  const o = sr as Record<string, unknown> | null | undefined;
+  // Guard with Array.isArray: a malformed response like ``{ items: {} }``
+  // or ``{ items: "..." }`` would otherwise slip through the cast and make
+  // callers' ``.map`` / ``.length`` throw — breaking the "never throws"
+  // contract above. Non-array → ``[]``.
+  const arr = o?.items ?? o?.results;
+  return Array.isArray(arr) ? (arr as Record<string, unknown>[]) : [];
+}
+
+export function textResult(text: string): {
+  content: Array<{ type: string; text: string }>;
+  details: Record<string, unknown>;
+} {
+  return {
+    content: [{ type: "text", text }],
+    details: {},
+  };
+}

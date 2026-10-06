@@ -1,0 +1,367 @@
+"""ScheduleBackgroundTasks — fire-and-forget entity extraction, contradiction detection, re-embed."""
+
+from __future__ import annotations
+
+import logging
+
+from core_api.clients.storage_client import get_storage_client
+from core_api.config import settings
+from core_api.pipeline.context import PipelineContext
+from core_api.pipeline.step import StepResult
+from core_api.services.entity_extraction_worker import process_entity_extraction
+from core_api.services.task_tracker import tracked_task
+from core_api.tasks import track_task
+
+logger = logging.getLogger(__name__)
+
+
+async def _merge_near_duplicate(new_id: str, candidate_id: str, tenant_id: str) -> None:
+    """Retire the near-duplicate this write supersedes (A71).
+
+    Two writes, and the ORDER is the safety property:
+
+      1. point the NEW row at the candidate (``supersedes_id``), leaving both
+         live for an instant;
+      2. mark the CANDIDATE ``outdated``.
+
+    Done the other way round, a failure between them leaves a row retired with
+    nothing standing in its place — the claim disappears from recall with no
+    successor to find. In this order the same failure leaves both rows live and
+    linked, which is exactly what an in-flight contradiction chain looks like
+    and which the existing lineage already tolerates.
+
+    ``update_memory_status`` guards the link with a CAS against NULL, so if a
+    contradiction verdict claimed this row between the write and here, that
+    verdict wins and this becomes a no-op rather than a second opinion.
+
+    Never raises: the memory is already committed and the caller returned 201.
+    A merge that fails leaves an ordinary near-duplicate pair — the state every
+    tenant without this flag is in — so degrading is strictly better than
+    failing a write that succeeded.
+    """
+    sc = get_storage_client()
+    try:
+        await sc.update_memory_status(new_id, "active", supersedes_id=candidate_id, tenant_id=tenant_id)
+    except Exception:
+        logger.warning(
+            "near-duplicate merge: could not link %s -> %s; leaving both rows live",
+            new_id,
+            candidate_id,
+            exc_info=True,
+        )
+        return
+    try:
+        await sc.update_memory_status(candidate_id, "outdated", tenant_id=tenant_id)
+    except Exception:
+        # The link landed, so the pair is discoverable and a later contradiction
+        # pass can finish the job. Logged at WARNING rather than swallowed
+        # because until then the superseded row still ranks as current.
+        logger.warning(
+            "near-duplicate merge: linked %s -> %s but could not retire the "
+            "candidate; it still reads as current",
+            new_id,
+            candidate_id,
+            exc_info=True,
+        )
+        return
+    logger.info("near_duplicate_merged new=%s superseded=%s tenant_id=%s", new_id, candidate_id, tenant_id)
+
+
+class ScheduleBackgroundTasks:
+    @property
+    def name(self) -> str:
+        return "schedule_background_tasks"
+
+    async def execute(self, ctx: PipelineContext) -> StepResult | None:
+        data = ctx.data["input"]
+        tenant_config = ctx.tenant_config
+        memory = ctx.data["memory"]
+        embedding = ctx.data["embedding"]
+        enrichment = ctx.data.get("enrichment")
+        resolved_write_mode = ctx.data.get("resolved_write_mode")
+        memory_id = memory["id"] if isinstance(memory, dict) else memory.id
+
+        # A71 — perform the merge ``DetectNearDuplicate`` decided on. It runs
+        # before the row exists, so it can only record the intent; this is the
+        # first point at which there is an id to link.
+        merge_target = ctx.data.get("merge_supersedes_id")
+        if merge_target:
+            await _merge_near_duplicate(str(memory_id), str(merge_target), data.tenant_id)
+
+        # Fast mode fan-out. The fast branch returns BEFORE the strong-mode
+        # entity-extraction + Path A blocks below, so historically each had
+        # to be wired through ``_enrich_memory_background`` indirectly —
+        # which left coverage holes (Gap 01: Enterprise+fast lost entity
+        # extraction; Gap 04: OSS+fast lost Path A) because the indirect
+        # chain didn't actually fire in every flag profile. Closes both
+        # gaps by mirroring the strong branch's direct fan-out below for
+        # extraction and Path A.
+        if resolved_write_mode == "fast":
+            # OSS 09/02 M-18 — ``enrichment_provider != "none"`` belongs here
+            # too. Every other enrichment gate in the write path carries it
+            # (the strong branch below, ``ParallelEmbedEnrich``, and the bulk
+            # path); this one did not, and "none" is not a no-op provider:
+            # ``enrich_memory`` answers it with a bare ``EnrichmentResult()``
+            # (common/enrichment/service.py) whose Pydantic defaults are real
+            # values — ``weight=0.7``, ``status="active"``, ``memory_type=fact``,
+            # empty title/summary/tags. Those survive
+            # ``model_dump(exclude_none=True)`` and are PATCHed onto the row, so
+            # a tenant with enrichment explicitly provider-less had every fast
+            # write silently reweighted 0.5 -> 0.7 and its ``enrichment_pending``
+            # marker cleared as though an LLM had looked at it.
+            if tenant_config.enrichment_enabled and tenant_config.enrichment_provider != "none":
+                from core_api.services.memory_service import (
+                    _agent_provided_enrichment_fields,
+                    _caller_owned_enrichment_metadata_keys,
+                    _schedule_enrich_or_inline,
+                )
+
+                track_task(
+                    tracked_task(
+                        _schedule_enrich_or_inline(
+                            memory_id,
+                            data.content,
+                            data.tenant_id,
+                            data.fleet_id,
+                            data.agent_id,
+                            tenant_config,
+                            agent_provided_fields=_agent_provided_enrichment_fields(data),
+                            caller_owned_metadata_keys=_caller_owned_enrichment_metadata_keys(data),
+                            reference_datetime=getattr(data, "reference_datetime", None),
+                            # H-18: nothing applies the LLM governance verdict on
+                            # an inline deployment — see ``_schedule_enrich_or_inline``.
+                            run_governance_remediation=True,
+                        ),
+                        "background_enrichment",
+                        memory_id,
+                        data.tenant_id,
+                    )
+                )
+
+            # Entity extraction (Gap 01). Extraction reads only ``content`` —
+            # no dependency on the embedding being available — so it fires
+            # regardless of embed deferral.
+            #
+            # OSS 09/02 L-20 — this is now the SOLE trigger on this path. It
+            # used to be one of two: ``_enrich_memory_background`` fired
+            # extraction as well, so a fast+inline write paid for two LLM
+            # extraction passes. The redundant one was removed there rather
+            # than here, because this fire is the one that does not depend on
+            # enrichment succeeding — the other sat past an ``enrich_memory``
+            # call whose failure returns early, so on that path a failed
+            # enrichment silently cost the row its extraction too.
+            if tenant_config.entity_extraction_enabled:
+                track_task(
+                    tracked_task(
+                        process_entity_extraction(
+                            memory_id,
+                            data.tenant_id,
+                            data.fleet_id,
+                            data.agent_id,
+                            data.content,
+                            data.memory_type,
+                        ),
+                        "entity_extraction",
+                        memory_id,
+                        data.tenant_id,
+                    )
+                )
+
+            # Path A contradiction detection (Gap 04). Only fires when an
+            # inline embedding is available (OSS local + fast under
+            # ``settings.inline_embedding``, or strong's PR-2 force-inline).
+            # When ``embedding is None`` (Enterprise+fast deferred), Path A
+            # fires via the ``EMBEDDED`` back-channel after ``core-worker``
+            # PATCHes the embedding into the row — see the
+            # ``_enrich_memory_background`` gate gated on
+            # ``not settings.inline_embedding``. Each cell of the matrix
+            # gets exactly one Path A trigger that way.
+            if embedding is not None:
+                from core_api.services.contradiction import (
+                    Trigger,
+                    run_contradiction_detection,
+                )
+
+                track_task(
+                    tracked_task(
+                        run_contradiction_detection(
+                            memory_id,
+                            data.tenant_id,
+                            data.fleet_id,
+                            trigger=Trigger.WRITE,
+                            content=data.content,
+                            embedding=embedding,
+                        ),
+                        "contradiction_detection",
+                        memory_id,
+                        data.tenant_id,
+                    )
+                )
+
+            # CAURA-594: deferred-path or inline-failure backfill — the
+            # shim publishes EMBED_REQUESTED in deferred mode, retries
+            # in-process when ``settings.inline_embedding`` is True.
+            if embedding is None:
+                from core_api.services.memory_service import (
+                    _schedule_embed_or_reembed,
+                )
+
+                track_task(
+                    tracked_task(
+                        _schedule_embed_or_reembed(
+                            memory_id,
+                            data.content,
+                            data.tenant_id,
+                            content_hash=ctx.data.get("content_hash"),
+                        ),
+                        "embed_or_publish",
+                        memory_id,
+                        data.tenant_id,
+                    )
+                )
+            return None
+
+        # Strong mode (or no mode set): today's behavior
+
+        # CAURA-595: when ``settings.inline_enrichment`` is False the
+        # parallel embed/enrich step skipped the LLM call by design and
+        # ``enrichment`` is None. Publish ``ENRICH_REQUESTED`` so the
+        # worker fills the row in the background. Inline-enrichment mode
+        # already ran enrichment upstream; nothing to schedule.
+        if (
+            enrichment is None
+            and not settings.inline_enrichment
+            and tenant_config.enrichment_enabled
+            and tenant_config.enrichment_provider != "none"
+        ):
+            from core_api.services.memory_service import (
+                _agent_provided_enrichment_fields,
+                _caller_owned_enrichment_metadata_keys,
+                _schedule_enrich_or_inline,
+            )
+
+            track_task(
+                tracked_task(
+                    _schedule_enrich_or_inline(
+                        memory_id,
+                        data.content,
+                        data.tenant_id,
+                        data.fleet_id,
+                        data.agent_id,
+                        tenant_config,
+                        agent_provided_fields=_agent_provided_enrichment_fields(data),
+                        caller_owned_metadata_keys=_caller_owned_enrichment_metadata_keys(data),
+                        reference_datetime=getattr(data, "reference_datetime", None),
+                    ),
+                    "enrich_or_publish",
+                    memory_id,
+                    data.tenant_id,
+                )
+            )
+
+        # L-117: the atomic facts an enrichment run on the request path found.
+        # Fast mode turns them into child rows after its background enrichment,
+        # a deferred deployment through the ENRICHED consumer; nothing here read
+        # them, so the same content gave a fast write a child per fact and a
+        # strong write none. Fanned out after the commit, as fast mode does, and
+        # from the row as written, as the consumer does: governance gave its
+        # verdict before the write, so the row's visibility is the one the
+        # children must inherit (#808).
+        atomic_facts = getattr(enrichment, "atomic_facts", None) or []
+        if atomic_facts:
+            from core_api.services.memory_service import _resolve_parent_weight, fan_out_atomic_facts
+
+            track_task(
+                tracked_task(
+                    fan_out_atomic_facts(
+                        get_storage_client(),
+                        atomic_facts=atomic_facts,
+                        memory_id=memory_id,
+                        tenant_id=data.tenant_id,
+                        fleet_id=data.fleet_id,
+                        agent_id=data.agent_id,
+                        parent_metadata=memory.get("metadata_") or {},
+                        parent_visibility=memory.get("visibility") or "scope_team",
+                        parent_weight=_resolve_parent_weight(memory.get("weight")),
+                        parent_ts_start=memory.get("ts_valid_start"),
+                        tenant_config=tenant_config,
+                        parent_expires_at=memory.get("expires_at"),
+                        parent_run_id=memory.get("run_id"),
+                        parent_source_uri=memory.get("source_uri"),
+                    ),
+                    "atomic_fact_fanout",
+                    memory_id,
+                    data.tenant_id,
+                )
+            )
+
+        # Entity extraction (fire-and-forget).
+        #
+        # CAURA-595 (shortcut form): entity extraction is "off the hot
+        # path" in the sense that the request doesn't await it, but the
+        # coroutine still runs in core-api's event loop. Under burst
+        # write load, extraction LLM calls compete with live traffic
+        # (scaling doc §10 bottleneck #7). Full worker-fleet migration
+        # waits on CAURA-593 (Pub/Sub publisher/subscriber wiring) +
+        # a new worker service and a deliberately provisioned topic contract.
+        if tenant_config.entity_extraction_enabled:
+            track_task(
+                tracked_task(
+                    process_entity_extraction(
+                        memory_id,
+                        data.tenant_id,
+                        data.fleet_id,
+                        data.agent_id,
+                        data.content,
+                        data.memory_type,
+                    ),
+                    "entity_extraction",
+                    memory_id,
+                    data.tenant_id,
+                )
+            )
+
+        # CAURA-594: deferred-path or inline-failure backfill — the shim
+        # publishes EMBED_REQUESTED in deferred mode, retries in-process
+        # when ``settings.inline_embedding`` is True.
+        if embedding is None:
+            from core_api.services.memory_service import (
+                _schedule_embed_or_reembed,
+            )
+
+            track_task(
+                tracked_task(
+                    _schedule_embed_or_reembed(
+                        memory_id,
+                        data.content,
+                        data.tenant_id,
+                        content_hash=ctx.data.get("content_hash"),
+                    ),
+                    "embed_or_publish",
+                    memory_id,
+                    data.tenant_id,
+                )
+            )
+        else:
+            # Contradiction detection (post-commit async)
+            from core_api.services.contradiction import (
+                Trigger,
+                run_contradiction_detection,
+            )
+
+            track_task(
+                tracked_task(
+                    run_contradiction_detection(
+                        memory_id,
+                        data.tenant_id,
+                        data.fleet_id,
+                        trigger=Trigger.WRITE,
+                        content=data.content,
+                        embedding=embedding,
+                    ),
+                    "contradiction_detection",
+                    memory_id,
+                    data.tenant_id,
+                )
+            )
+        return None

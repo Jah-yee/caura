@@ -1,0 +1,134 @@
+name: Publish the caura metapackage to PyPI
+
+# Publishes `clients/caura-meta` — the bare `caura` name, a metapackage that
+# installs and re-exports `caura-client`. Trusted publishing (OIDC), no token.
+#
+# WHY THIS WORKFLOW EXISTS. `caura` 1.0.0 was published by hand on 2026-08-17
+# and had no workflow, so the one package whose whole job is to make
+# `pip install caura` resolve was also the one nobody could ship a fix to
+# without remembering a manual twine invocation. Every other client artifact in
+# this repo publishes from CI; this closes the gap.
+#
+# NAMED FOR WHAT IT PUBLISHES — see the same note in `publish-python-sdk.yml`.
+#
+# One-time setup by a maintainer:
+#   1. `caura` ALREADY EXISTS on PyPI, so this is not a pending publisher. Add
+#      it under Manage → the `caura` project → Publishing → Add a new publisher:
+#      repo `caura-ai/caura`, workflow `publish-python-metapackage.yml`,
+#      environment `pypi`.
+#   2. The GitHub environment `pypi` already exists for
+#      `publish-python-client.yml`; this workflow reuses it.
+#
+# Release: bump the version in clients/caura-meta/pyproject.toml, then push a
+# tag `caura-meta-v<version>` (or run this workflow manually). The tag prefix is
+# `caura-meta-` rather than `caura-` so it cannot collide with a future bare
+# `caura-v*` release tag for the repo itself.
+
+on:
+  push:
+    tags:
+      - "caura-meta-v*"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # required for PyPI trusted publishing
+    steps:
+      # Trusted publishing has no stored token to check. GitHub exposes both
+      # request variables only when this job can obtain an OIDC credential.
+      # Check the context without minting a live token in this step.
+      - name: The publish credential must be obtainable
+        run: |
+          if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" ]]; then
+            echo "::error::No OIDC token-request context, so PyPI trusted publishing cannot authenticate. This job needs 'permissions: id-token: write'; there is no stored token to fall back on."
+            exit 1
+          fi
+          echo "OIDC token-request context is present"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      # This package was created under the Caura name and has no legacy tag
+      # history, so tag-triggered releases accept only caura-meta-v*.
+      - name: The tag must agree with pyproject.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          if [[ "${GITHUB_REF_NAME}" != caura-meta-v* ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} must start with caura-meta-v"
+            exit 1
+          fi
+          TAG_VERSION="${GITHUB_REF_NAME#caura-meta-v}"
+          PKG_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [[ "$TAG_VERSION" != "$PKG_VERSION" ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} says ${TAG_VERSION} but pyproject.toml says ${PKG_VERSION}"
+            exit 1
+          fi
+          echo "publishing $(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['name'])")==${PKG_VERSION}"
+        working-directory: clients/caura-meta
+      # The README source carries legacy-name lint markers as HTML comments so
+      # the rename ratchet can account for each mention of the former name. They
+      # are not for readers: PyPI's JSON API serves the long description raw, so
+      # they would leak into every page an AI answer engine reads. Strip them
+      # before building, and refuse to publish if any HTML comment survives.
+      - name: Strip lint markers from the README
+        run: |
+          sed -E -i 's/ *<!-- legacy-name-[a-z]+:[^>]*-->//g' README.md
+          if grep -q '<!--' README.md; then
+            echo "::error::README.md still contains an HTML comment; it would be published verbatim"
+            exit 1
+          fi
+        working-directory: clients/caura-meta
+      - name: Build
+        run: |
+          pip install build packaging
+          python -m build
+        working-directory: clients/caura-meta
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: clients/caura-meta/dist/
+
+      - name: PyPI must actually serve it
+        run: |
+          PKG_NAME=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['name'])")
+          PKG_VERSION=$(python -c "import tomllib; from packaging.version import Version; print(Version(tomllib.load(open('pyproject.toml','rb'))['project']['version']))")
+          # Ask for the project and test version membership. PyPI's missing-
+          # version endpoint can make curl report exit 56, which cannot be
+          # distinguished from a genuine network failure.
+          ATTEMPTS=10
+          LAST_STATE="never ran"
+          for attempt in $(seq 1 "${ATTEMPTS}"); do
+            if ! HTTP_STATUS=$(curl -sSL --connect-timeout 5 --max-time 15 "https://pypi.org/pypi/${PKG_NAME}/json" -o /tmp/pypi.json -w "%{http_code}"); then
+              LAST_STATE="could not reach the PyPI index"
+              echo "attempt ${attempt}/${ATTEMPTS}: ${LAST_STATE}, retrying"
+            elif [ "${HTTP_STATUS}" = "404" ]; then
+              LAST_STATE="index reachable but project ${PKG_NAME} is not in it"
+              echo "attempt ${attempt}/${ATTEMPTS}: ${LAST_STATE}, waiting"
+            elif [[ "${HTTP_STATUS}" != 2?? ]]; then
+              LAST_STATE="index reachable but returned HTTP ${HTTP_STATUS}"
+              echo "attempt ${attempt}/${ATTEMPTS}: ${LAST_STATE}, retrying"
+            elif python -c "import json,sys; releases=json.load(open('/tmp/pypi.json'))['releases']; sys.exit(2 if not isinstance(releases,dict) else (0 if sys.argv[1] in releases else 3))" "${PKG_VERSION}"; then
+              echo "PyPI serves ${PKG_NAME}==${PKG_VERSION}"
+              exit 0
+            else
+              CHECK_STATUS=$?
+              if [ "${CHECK_STATUS}" -eq 3 ]; then
+                LAST_STATE="index reachable but ${PKG_VERSION} is not in it"
+                echo "attempt ${attempt}/${ATTEMPTS}: ${LAST_STATE}, waiting"
+              else
+                LAST_STATE="index reachable but its response could not be checked"
+                echo "attempt ${attempt}/${ATTEMPTS}: ${LAST_STATE}, retrying"
+              fi
+            fi
+            if [ "${attempt}" -lt "${ATTEMPTS}" ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          echo "::error::published without error, but after ${ATTEMPTS} attempts: ${LAST_STATE} (${PKG_NAME}==${PKG_VERSION})"
+          exit 1
+        working-directory: clients/caura-meta

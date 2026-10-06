@@ -1,0 +1,57 @@
+# Shared SQLAlchemy models — used by core-api and core-storage-api.
+from common.models.agent import Agent
+from common.models.agent_activity_digest import AgentActivityDigest
+from common.models.analysis_report import CrystallizationReport
+from common.models.audit import AuditChainHead, AuditLog
+from common.models.background_task import BackgroundTaskLog
+from common.models.base import Base
+from common.models.capability_usage import CapabilityUsage
+from common.models.dedup_review import DedupReview
+from common.models.document import Document
+from common.models.entity import Entity, MemoryEntityLink, Relation, RelationEvidence
+from common.models.fleet import FleetCommand, FleetNode
+from common.models.idempotency import IdempotencyResponse
+from common.models.keystone_version import KeystoneVersion
+from common.models.lifecycle_audit import LifecycleAudit
+from common.models.memory import Memory
+from common.models.memory_conflict import MemoryConflict
+from common.models.memory_derivation import MemoryDerivation
+from common.models.organization_settings import (
+    OrganizationSettings,
+    OrganizationSettingsAudit,
+)
+from common.models.recall_log import RecallCandidate, RecallEvent
+from common.models.skill_factory import ForgeRejectedFingerprint, SessionTrace
+from common.models.tenant_usage_counter import TenantUsageCounter
+
+__all__ = [
+    "Agent",
+    "AgentActivityDigest",
+    "AuditChainHead",
+    "AuditLog",
+    "BackgroundTaskLog",
+    "Base",
+    "CapabilityUsage",
+    "CrystallizationReport",
+    "DedupReview",
+    "Document",
+    "Entity",
+    "FleetCommand",
+    "FleetNode",
+    "ForgeRejectedFingerprint",
+    "IdempotencyResponse",
+    "KeystoneVersion",
+    "LifecycleAudit",
+    "Memory",
+    "MemoryConflict",
+    "MemoryDerivation",
+    "MemoryEntityLink",
+    "OrganizationSettings",
+    "OrganizationSettingsAudit",
+    "RecallCandidate",
+    "RecallEvent",
+    "Relation",
+    "RelationEvidence",
+    "SessionTrace",
+    "TenantUsageCounter",
+]

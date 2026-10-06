@@ -1,0 +1,59 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.DS_Store
+
+# Environment files (secrets)
+.env
+.env.*
+!.env.test
+!.env.example
+env.*
+!env.dev
+!**/migrations/env.py
+!plugin/src/env.ts
+!plugin/src/env.test.ts
+
+# Python virtual environments
+.venv/
+venv/
+
+# Node / Frontend build
+node_modules/
+frontend/out/
+frontend/.next/
+frontend/site/.next/
+frontend/site/out/
+frontend/next-env.d.ts
+frontend/site/next-env.d.ts
+*.tsbuildinfo
+
+# Media
+Screenshot*.png
+*.jpg
+
+# GCP service account keys
+*-service-account.json
+*-credentials.json
+
+# IDE / tools
+.claude/settings.local.json
+.idea/
+reports/
+
+# Python package manager lockfiles. The deployable core-* services commit their
+# locks (CAURA-000): their Dockerfiles install FROZEN + hash-verified from uv.lock
+# so the deployed images can't silently float to a new release (a lock-less pip
+# install floated to FastAPI 0.137 and crashed prod 2026-06-14). Any other uv.lock
+# (none today) stays ignored.
+**/uv.lock
+!core-api/uv.lock
+!core-storage-api/uv.lock
+!core-worker/uv.lock
+!core-operations/uv.lock
+
+# Coverage data files. Untracked-but-present artefacts kept getting swept
+# into commits by `git add -A` (twice during the 2026-08 embedding work).
+.coverage
+.coverage.*

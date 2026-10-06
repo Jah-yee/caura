@@ -1,0 +1,764 @@
+# Caura — OpenClaw Integration Guide
+
+---
+
+> **For server setup, configuration, endpoints, deployment, and smoke tests, see the [README](../../README.md).**
+> This guide covers only MCP client setup, OpenClaw plugin installation, agent trust levels, agent prompts, and usage examples.
+
+## 1. Overview
+
+Caura is a shared memory layer for OpenClaw agents. It runs as a separate API service that agents access through an OpenClaw plugin or any MCP client.
+
+### Architecture
+
+```
+MCP Client      → Streamable HTTP  → Caura API (/mcp) → Postgres + pgvector
+OpenClaw Agent  → tool call        → Caura Plugin → HTTP → Caura API → Postgres + pgvector
+Plugin          → heartbeat (60s)  → Caura API ← commands (response)
+```
+
+### Components
+
+| Component | Where it runs | What it does |
+|---|---|---|
+| Caura API | Any host (Docker, VM, cloud run, local) | FastAPI service — memories, entities, search, enrichment |
+| MCP Server | Same process (`/mcp`) | Streamable HTTP endpoint for any MCP client |
+| Postgres + pgvector | Anywhere (Docker, VM, managed) | Vector + relational store |
+| Caura Plugin | OpenClaw gateway VM | Thin adapter forwarding tool calls to the API |
+
+### Tools available to agents
+
+Tool descriptions are derived from the tool registry (`core-api/src/core_api/tools/_registry.py`) and served at `GET /api/v1/tool-descriptions`. Both MCP and OpenClaw plugin read from this canonical source.
+
+| Tool | MCP | OpenClaw | Purpose |
+|---|---|---|---|
+| `caura_write` | Yes | Yes | Single or batch write. Send `content` for one memory, or `items` (≤100) for a batch — the batch path batches embeddings and parallelizes enrichment. LLM auto-infers type, weight, status, title, summary, tags, temporal dates, PII flags. Contradiction detection auto-marks conflicting memories. `visibility` = `scope_agent` / `scope_team` (default) / `scope_org`. Content >2,000 chars is auto-chunked |
+| `caura_recall` | Yes | Yes | Hybrid semantic + keyword search with graph-enhanced retrieval (expands through entity relations up to 2 hops). `include_brief=true` adds a `brief` alongside the raw results, whose `summary` is the LLM's answer to your query — it reasons step by step internally and only the final answer is surfaced. Supports `fleet_ids` for multi-fleet queries. Respects visibility. Default `top_k=5`, max 200 |
+| `caura_manage` | Yes | Yes | Per-memory lifecycle, op-dispatched. `op=read` returns the memory; `op=update` patches fields (re-embeds if content changes); `op=transition` sets status; `op=delete` soft-deletes. Trust-enforced |
+| `caura_list` | Yes | Yes | Non-semantic enumeration — filter by type/status/agent/weight/date, sort by `created_at`/`weight`/`recall_count`, cursor-paginate. `scope=agent` (default) and `scope=fleet` for your own fleet need trust ≥ 1; a different fleet or `scope=all` needs trust ≥ 2. Trust 3 unlocks `include_deleted` |
+| `caura_doc` | Yes | Yes | Document CRUD, op-dispatched. `op=write` upserts a JSON doc in a named collection (include `data["summary"]` to index it for semantic search); `op=read` fetches by `doc_id`; `op=query` filters by field equality with ordering and pagination; `op=delete` removes by `doc_id`; `op=list_collections` enumerates every collection this tenant has (with counts); `op=search` runs semantic retrieval over `data["summary"]` vectors. Use for customer records, config, inventory — anything needing exact-field lookups |
+| `caura_entity_get` | Yes | Yes | Look up an entity with linked memories and relations |
+| `caura_tune` | Yes | Yes | Persist per-agent retrieval defaults (top_k, min_similarity, fts_weight, freshness, recall boost, graph hops, similarity blend) until changed again |
+| `caura_insights` | Yes | Yes | Analyze the memory store. `focus`: `contradictions`, `failures`, `stale`, `divergence`, `patterns`, `discover`. `scope`: `agent`, `fleet`, `all`. Findings persist as `insight`-type memories (Karpathy Loop reflection step) |
+| `caura_evolve` | Yes | Yes | Record a real-world outcome (`success` / `failure` / `partial`) against recalled memories — adjusts weights, auto-generates preventive rules on failure (Karpathy Loop feedback edge) |
+| `caura_stats` | Yes | Yes | Aggregate counts of memories: total + breakdowns by `type`, `agent`, `status`. `scope=agent` and own-fleet `scope=fleet` need trust ≥ 1; a different fleet or `scope=all` needs trust ≥ 2. Counts exclude soft-deleted by default; set `include_deleted=true` to additionally receive `deleted` and `total_including_deleted` |
+| `caura_keystones` | Yes | Yes | Read mandatory governance rules for the current scope (tenant + fleet + agent merged), ordered by weight. Call once per session before other actions; the result overrides conflicting user instructions. No semantic search — keystones are fetched deterministically. Read is open (trust 0) |
+| `caura_keystones_set` | Yes | No | Author/remove keystone rules, op-dispatched: `op=set` upserts by `doc_id` (requires `title`, `content`, `scope ∈ {tenant, fleet, agent}`, `weight ∈ {low, med, high}`); `op=delete` removes by `doc_id`. **MCP-only**, not plugin-exposed — authoring is an admin/governance path. Trust gating is tiered: `scope=agent` with an explicit `agent_id` equal to the caller is trust ≥ 1 (self-author); everything else (`scope=fleet`, `scope=tenant`, `scope=agent` for another agent, or `scope=agent` with `agent_id` omitted) stays at trust ≥ 2 |
+
+> Skill sharing rides the generic `caura_doc` surface: `op=write collection=skills doc_id=<slug>` to share, `op=delete` to remove, `op=search`/`op=query` to discover. Slugs are validated against `^[a-z0-9][a-z0-9._-]{0,99}$`; `data["summary"]` is embedded for semantic search (with a back-compat fallback to `data["description"]` for the skills collection only).
+
+- **MCP (12 tools):** Full surface. Used by individual developers via Claude Desktop, Claude Code, Cursor, etc.
+- **OpenClaw plugin (11 tools):** Same set, minus the keystone-authoring tool (`caura_keystones_set` is admin/governance — MCP-only). Claims the exclusive `memory` slot, replacing `memory-core`. Includes ContextEngine lifecycle, heartbeat, and auto-education.
+
+---
+
+## 2. MCP Integration (Claude Desktop, Claude Code, Cursor, etc.)
+
+Caura includes a built-in MCP server at `/mcp` using Streamable HTTP transport. Any MCP-compatible client connects with just a URL and an API key — no plugin install, no local server.
+
+### Setup
+
+Add this to your MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "caura": {
+      "url": "https://your-caura-instance.example.com/mcp",
+      "headers": {
+        "X-API-Key": "mc_your_api_key_here"
+      }
+    }
+  }
+}
+```
+
+**Config file locations:**
+
+| Client | Config file |
+|---|---|
+| Claude Desktop (macOS) | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Claude Desktop (Windows) | `%APPDATA%\Claude\claude_desktop_config.json` |
+| Claude Code | `~/.claude.json` (user scope) — preferred; register via `claude mcp add --scope user --transport http caura https://your-caura-instance.example.com/mcp --header "X-API-Key: mc_your_key"` |
+| Cursor | Settings -> MCP Servers -> Add Server (type: `sse`, URL: `https://your-caura-instance.example.com/mcp`) |
+
+> The Claude Code MCP-server registry lives in `~/.claude.json` — NOT `~/.claude/settings.json`. The latter's schema rejects an `mcpServers` block. Prefer the `claude mcp add` CLI over hand-editing so the correct file is written.
+
+### Install the usage skill (Claude Code, Codex)
+
+The MCP connection only exposes the raw tool surface. The *usage skill* —
+the teachable guide that explains when to reach for memory vs doc, how
+the two search strategies differ, how to write a good `data["summary"]`, the trust
+table, and the "recall-before-you-start / write-when-something-matters
+/ supersede-don't-delete" rules — ships as a separate file that your
+agent reads on-demand. Install it after the MCP config above:
+
+```bash
+# Installs SKILL.md into ~/.claude/skills/memclaw/ (Claude Code). legacy-name-floor: installed default-skill path
+# And/or ~/.agents/skills/memclaw/ (Codex). legacy-name-floor: installed default-skill path
+curl -s "https://your-caura-instance.example.com/api/v1/install-skill" \
+  -H "X-API-Key: mc_your_key" | bash
+```
+
+Options:
+
+| Query param | Effect |
+|---|---|
+| (none) | Install for both Claude Code and Codex |
+| `?agent=claude-code` | Only Claude Code |
+| `?agent=codex` | Only Codex |
+
+Restart your agent after installing — skills are loaded at startup.
+
+Why this matters: without the skill, an agent can discover the 12 tool
+names and their arg schemas via MCP `tools/list`, but it has no
+mental model for the two-store design (memory vs doc), the trust
+levels, or which op to reach for in an ambiguous situation. With the
+skill installed, all of that is in the agent's context on-demand. A
+brand-new agent that connected via `claude mcp add` without also
+running this installer will still work, but will hit the same
+"tools present, guidance missing" gap that made us write the skill
+in the first place.
+
+### Available tools
+
+The MCP server exposes 12 tools that clients discover automatically. Descriptions are canonical — served from `GET /api/v1/tool-descriptions`, derived from the tool registry (`core-api/src/core_api/tools/_registry.py`).
+
+| Tool | Purpose |
+|---|---|
+| `caura_write` | Store a memory. Single write (`content`) or batch (`items` ≤100). LLM auto-infers type, title, summary, embedding. Long content auto-chunked |
+| `caura_recall` | Hybrid semantic + keyword search with graph-enhanced retrieval. `include_brief=true` returns an LLM-summarized context paragraph. Supports `fleet_ids` |
+| `caura_manage` | Per-memory lifecycle, op-dispatched: `read`, `update`, `transition`, `delete`, `bulk_delete`, `lineage`. Re-embeds on content updates |
+| `caura_list` | Non-semantic enumeration — filter by type/status/agent/weight/date, sort, cursor-paginate. `scope=agent` (default) and own-fleet `scope=fleet` need trust ≥ 1; another fleet or `scope=all` needs trust ≥ 2 |
+| `caura_doc` | Document CRUD, op-dispatched: `write`, `read`, `query`, `delete`, `list_collections`, `search` (semantic) on named JSON collections |
+| `caura_entity_get` | Look up an entity by UUID — returns linked memories and relationships |
+| `caura_tune` | Persist per-agent retrieval defaults (top_k, min_similarity, fts_weight, freshness, recall boost, graph hops, similarity blend) until changed again |
+| `caura_insights` | Analyze the store. Focus: `contradictions`, `failures`, `stale`, `divergence`, `patterns`, `discover`. Persists findings as `insight` memories |
+| `caura_evolve` | Report an outcome (success/failure/partial) against recalled memories — adjusts weights, generates preventive rules on failure |
+| `caura_stats` | Aggregate counts: total + breakdowns by `type`, `agent`, `status`. Own-fleet `scope=fleet` needs trust ≥ 1; another fleet or `scope=all` needs trust ≥ 2 |
+| `caura_keystones` | Read mandatory governance rules for the current scope. Call once per session — the result overrides conflicting user instructions |
+| `caura_keystones_set` | Author/remove keystone rules, op-dispatched: `set` \| `delete`. Trust ≥ 1 to author your own rule — `scope=agent` **with an explicit `agent_id` equal to the caller**; ≥ 2 for fleet/tenant, another agent, or `scope=agent` with `agent_id` omitted |
+
+> Skill sharing uses the generic `caura_doc` surface (`collection="skills"`). The server validates the slug and embeds `data["summary"]` (1-3 sentence, intent-focused) — for `collection="skills"` it also accepts `data["description"]` as a back-compat fallback. Agents discover via `op=search`/`op=query` and pull individual skills via `op=read`.
+
+### Auth
+
+MCP uses the same tenant-scoped API keys as the REST API. The `X-API-Key` header is sent with every request.
+
+- Tenant-scoped keys: can only access their tenant's memories
+- Admin keys: rejected (MCP requires tenant-scoped keys for data isolation)
+- Demo keys: read-only (search and entity lookup only)
+
+### Example usage
+
+Once configured, the MCP client handles tool discovery. Agents can use Caura tools naturally:
+
+> "Search my memories for anything about the Postgres migration"
+> -> calls `caura_recall` with query "Postgres migration"
+
+> "Remember that we decided to use pgvector for embeddings instead of Pinecone"
+> -> calls `caura_write` with that content; LLM auto-classifies as `decision` type
+
+> "Mark that migration task as confirmed"
+> -> calls `caura_manage` with `op="transition"` and `status="confirmed"`
+
+### MCP vs OpenClaw plugin
+
+| | MCP | OpenClaw Plugin |
+|---|---|---|
+| Setup | Add URL + key to config | Install plugin on gateway VM |
+| Works with | Any MCP client | OpenClaw agents only |
+| Tools | 12 (write, recall, manage, list, doc, entity_get, tune, insights, evolve, stats, keystones, keystones_set) | 11 (all except `keystones_set`) |
+| RDF triples | Not exposed (contradiction detection via semantic similarity only) | Yes — `subject_entity_id`, `predicate`, `object_value` on write |
+| Temporal filter | Yes — `valid_at` on `caura_recall` | Yes — `valid_at` on search |
+| Visibility | Passed per-call (`scope_agent` / `scope_team` / `scope_org`) | Passed per-call (`scope_agent` / `scope_team` / `scope_org`) |
+| Multi-fleet search | Yes — `fleet_ids` parameter | Yes — `fleet_ids` parameter |
+| Fleet ID | Passed per-call (optional) | Auto-stamped from gateway env |
+| Best for | Individual developers, Claude Desktop/Code users | OpenClaw fleet deployments |
+
+---
+
+## 3. OpenClaw Plugin Installation
+
+The plugin is a TypeScript package in the `plugin/` directory of this repo. It claims the exclusive `memory` slot on an OpenClaw gateway, replacing the built-in `memory-core`, and provides 11 agent-facing tools (the 12-tool MCP surface minus `caura_keystones_set`, which is MCP-only), a ContextEngine with auto-read/write lifecycle, a heartbeat loop, and agent auto-education.
+
+### Compatibility
+
+| Component | Minimum | Notes |
+|---|---|---|
+| OpenClaw runtime | **`v2026.3.22`** | First release with `registerContextEngine` + `assemble({prompt, …})`. Older runtimes fall back to the legacy `before_prompt_build` path with reduced functionality. |
+| Node.js | `v18+` | Required to build and run the plugin. |
+| Caura backend (this repo's `core-api`) | `v2.4.0` | Backend exposes `/plugin-manifest` for upgrade-path resilience. Plugins on `< v2.4.0` fall back to a hardcoded file list (still works against current backends). |
+
+The plugin's install script does a soft preflight on `openclaw --version` and prints a warning when the local runtime is older than the recommended minimum. It does NOT hard-fail — operators sometimes run patched older builds, and the plugin still loads partially below the minimum. Upgrade OpenClaw when convenient.
+
+### Build from source
+
+On a machine with `node` (v18+) and `npm`:
+
+```bash
+git clone https://github.com/caura-ai/caura.git
+cd caura/plugin
+npm install
+npm run build            # emits plugin/dist/
+```
+
+### Install on an OpenClaw gateway
+
+```bash
+# On the gateway machine
+mkdir -p ~/.openclaw/plugins/memclaw # legacy-name-floor: frozen plugin install path
+# Copy the built plugin from your build machine (or rebuild here):
+scp -r plugin/dist plugin/package.json plugin/openclaw.plugin.json \
+    user@gateway:~/.openclaw/plugins/memclaw/ # legacy-name-floor: frozen plugin install path
+```
+
+### Environment variables
+
+Add to `~/.openclaw/plugins/memclaw/.env`: <!-- legacy-name-floor: frozen plugin install path -->
+
+```bash
+CAURA_API_URL=https://your-caura-instance.example.com   # your Caura API
+CAURA_API_KEY=mc_your_key_here                          # tenant-scoped API key
+CAURA_FLEET_ID=fleet-001                                # identifies this fleet
+CAURA_NODE_NAME=my-gateway                              # friendly name shown in Fleet page
+# CAURA_TENANT_ID=                                      # auto-resolved from API key
+# CAURA_AUTO_WRITE_TURNS=true                           # false disables automatic conversation writes
+# CAURA_AUTO_FIX_CONFIG=false                           # set true to auto-fix openclaw.json on startup
+```
+
+The plugin loads this `.env` file automatically. Both `CAURA_*` and `MEMCLAW_*` keys are read — and only those, so a `.env` cannot set `PATH` or `NODE_OPTIONS`. The pre-rename `MEMCLAW_*` spelling of every name above keeps working; where both are set the first **non-empty** one wins, so a half-filled template cannot blank out a working value. If you use systemd, also add the vars to a drop-in file (`.env` values don't override existing process env). <!-- legacy-name-floor: rule 3 dual-read alias -->
+
+Automatic conversation writes include user messages from `ingest`, assistant
+turn summaries, compaction summaries, and the session summary that OpenClaw's
+pre-compaction memory-flush turn asks the agent to write, all stored as episode
+memories with the server's default `scope_team` visibility. Set
+`CAURA_AUTO_WRITE_TURNS=false` and restart the plugin to disable all four;
+OpenClaw then runs no memory-flush turn. Local message buffering, recall,
+explicit memory tools and runtime compaction continue to work. This does not
+delete existing memories or disable the separately enabled Interviewer
+(`CAURA_INTERVIEWER`).
+
+**Configure OpenClaw** — edit `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "plugins": {
+    "allow": ["memclaw"],
+    "entries": {
+      "memclaw": { "enabled": true, "config": {} },
+      "memory-core": { "enabled": false }
+    },
+    "slots": {
+      "memory": "memclaw"
+    },
+    "load": { "paths": ["/home/openclaw/.openclaw/plugins/memclaw"] }
+  },
+  "tools": {
+    "alsoAllow": [
+      "caura_write", "caura_recall", "caura_manage",
+      "caura_list", "caura_doc", "caura_entity_get",
+      "caura_tune", "caura_insights", "caura_evolve",
+      "caura_stats", "caura_keystones"
+    ]
+  }
+}
+```
+
+**Critical:** The `plugins.slots.memory` and `memory-core` disablement are required. OpenClaw only loads one `kind: "memory"` plugin at a time — without switching the slot, the gateway sees the plugin but never calls `register()`. The automated installer handles this automatically.
+
+> Alternatively, use the Plugin Manager's **Fix Configuration** button or the OpenClaw CLI:
+> ```bash
+> openclaw plugins disable memory-core
+> openclaw plugins enable memclaw # legacy-name-floor: CLI requires the frozen plugin id
+> ```
+
+**Optional — enable ContextEngine (Tier 2):** For full auto read/write loop, also set the contextEngine slot:
+
+```json
+{
+  "plugins": {
+    "slots": {
+      "memory": "memclaw",
+      "contextEngine": "memclaw"
+    }
+  }
+}
+```
+
+Without the `contextEngine` slot, you still get all 11 agent-facing tools, prompt education, flush plan, and memory runtime — but no automatic read/write loop.
+
+**Verify** — restart OpenClaw and check startup logs:
+
+```
+[caura] Auto-educated workspaces (TOOLS.md: 20, AGENTS.md: 20)
+[caura] Smoke test passed (score: 0.953)
+```
+
+You will also see `ContextEngine 'memclaw' registered` in the same log — the context engine keeps the original plugin id. <!-- legacy-name-floor: frozen engine id shown in a log sample -->
+
+The node will appear in `GET /api/v1/fleet/nodes?tenant_id=<tenant>&fleet_id=<fleet>` within 60 seconds.
+
+### Plugin internals
+
+The plugin registers 11 tools (the MCP surface minus the MCP-only `caura_keystones_set`) and runs several lifecycle systems:
+
+- **ContextEngine** — 7 lifecycle hooks: `bootstrap` (smoke test), `ingest` (message buffering + persistence), `assemble` (token-budget-aware recall injection), `compact` (persist summaries), `afterTurn` (auto-write turn summaries), `prepareSubagentSpawn`, `onSubagentEnded`
+- **Memory runtime** — API-backed `search()` and `get()` replacing file-based `memory-core`
+- **Heartbeat** — every 60 seconds, POSTs node status (agents, tools, OS, IP, plugin version, setup_status) to `/api/v1/fleet/heartbeat`. Caura responds with any pending commands
+- **Request identity** — every HTTP request to the Caura server carries `User-Agent: openclaw-plugin/<plugin version> (node/<Node major>)` alongside `X-API-Key`. The server's heartbeat counts connected SDK families from this prefix; nothing else is sent
+- **Commands** — the plugin processes HMAC-verified commands from the heartbeat response:
+  - `deploy` — fetch all source files to memory, backup originals, write + build, rollback on failure
+  - `educate` — write prompts to agent HEARTBEAT.md files + write SKILL.md, TOOLS.md, AGENTS.md to workspaces
+  - `ping` — health check round-trip
+  - `restart` — gateway restart
+- **Auto-education** — on first load, writes SKILL.md, TOOLS.md, AGENTS.md to all agent workspaces. New workspaces are auto-educated on heartbeat
+- **Auto-resolve** — `tenant_id` is resolved from the API key at startup, so agents never need to specify it
+- **Gateway RPC** — exposes `memclaw.status`, `memclaw.deploy`, `memclaw.deploy.status`, `memclaw.educate`, `memclaw.allowlist.check`, `memclaw.allowlist.fix` methods <!-- legacy-name-floor: live gateway RPC method names -->
+
+### Educating agents
+
+On first plugin load, agents are **auto-educated** — the plugin writes SKILL.md, TOOLS.md, and AGENTS.md to all agent workspaces automatically. The `.educated` flag at `~/.openclaw/plugins/memclaw/.educated` prevents re-running on subsequent restarts. <!-- legacy-name-floor: frozen install path -->
+
+For manual or targeted education via the Fleet page:
+
+1. Click a node → expand an agent → **Educate** (targets one agent) or use the **Educate Agents** button (targets all or selected)
+2. Review/edit the education prompt (pre-filled with default instructions)
+3. Click **Queue Educate Command** — delivered on the next heartbeat (≤60 seconds)
+4. The plugin writes the prompt to each agent's `HEARTBEAT.md` and updates SKILL.md, TOOLS.md, AGENTS.md in their workspace
+5. Each write is verified by read-back — the command result reports `verified` count and any per-workspace failures
+6. Agents process the prompt on their next heartbeat and update their own TOOLS.md, AGENTS.md, SOUL.md, IDENTITY.md
+
+The **Agent Education Status** section in Plugin Manager shows green checkmarks for agents that have been educated.
+
+---
+
+## 4. Agent Trust Levels
+
+Caura enforces a 4-tier trust system for agents. Agents are auto-registered on their first `caura_write` call at trust level 1.
+
+| Level | Name | Permissions |
+|---|---|---|
+| 0 | `restricted` | No read or write access. Use to temporarily disable an agent |
+| 1 | `standard` | Read and write within own fleet only (default for new agents) |
+| 2 | `cross_fleet` | Read across all fleets in the tenant; write within own fleet only |
+| 3 | `admin` | Read and write across all fleets; can delete memories |
+
+### How it works
+
+- On first write, the agent is auto-registered with trust level 1 and the `fleet_id` from that write becomes its "home fleet"
+- When the tenant setting `agents.require_agent_approval` is on, a new agent is registered at trust level 0 instead — on whichever call first names it (a write, a search or recall, a fleet heartbeat, `caura_tune`, a document write) — and stays there until an admin raises it
+- Trust level is enforced on every API call — an agent at level 1 attempting a cross-fleet search gets a 403
+- Documents follow the delete bar: an agent below level 3 may create documents and update the ones it wrote or that another agent of its own fleet wrote, but replacing a document an agent of another fleet authored (or `force=true` on `POST /documents`) needs level 3. Documents with no recorded author stay writable. Graph writes (`POST /entities/upsert`, `POST /relations/upsert`) and document writes into a fleet other than the agent's own need level 3, as memory writes do
+- Soft-deleted rows (`include_deleted=true` on `GET /memories`, `GET /memories/stats`, `caura_list`, `caura_stats`) and `POST /ingest/undo/{run_id}` need level 3 for an agent credential
+- Trust and home-fleet changes (`PATCH /agents/{id}/trust`, `PATCH /agents/{id}/fleet`) are recorded in the tenant audit log as `agent_trust_update` / `agent_fleet_update`
+- The admin API key bypasses all trust enforcement
+
+### Managing trust levels
+
+Use the API to inspect agents and adjust trust:
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/v1/agents?tenant_id=` | GET | List all registered agents with trust levels |
+| `/api/v1/agents/{agent_id}?tenant_id=` | GET | Single agent detail (trust level, home fleet, stats) |
+| `/api/v1/agents/{agent_id}/trust?tenant_id=` | PATCH | Update trust level (body: `{"trust_level": 2}`) |
+
+The OSS server does not bundle a `/ui` application. Use these REST endpoints,
+the MCP/OpenClaw tools, or a separately deployed management client.
+
+---
+
+## 5. Agent Prompts and Examples
+
+### Agent system prompt
+
+Add this to your agent's system prompt (or use Agent Education to let agents self-configure):
+
+```
+You have access to Caura, a shared memory system used by all agents.
+
+BEFORE starting any task:
+- Use caura_recall for semantic + keyword search with graph expansion
+- Set include_brief=true when you want the LLM's answer to your query
+  alongside the raw results (brief.summary is the answer itself, not the
+  model's working)
+- Include fleet_id to scope to this fleet, omit for tenant-wide search
+- Filter by status="active" to skip deleted/archived memories
+- Use `valid_at` for point-in-time queries (REST `/search`, MCP `caura_recall`, and the OpenClaw plugin all accept it)
+
+AFTER completing work:
+- Store findings with caura_write — just provide content
+- For batch writes, pass items=[...] (up to 100) to the same tool — batches
+  embeddings and enrichment for much lower latency than looped single writes
+- Type, weight, title, summary are auto-inferred by LLM (status defaults to
+  `active`; tags are caller-supplied)
+- Dates auto-extracted: "deadline March 30" → ts_valid_end
+- Contradictions auto-detected: conflicting older memories marked outdated
+- Long content (>2000 chars) is auto-chunked into atomic facts
+- Set visibility: "scope_agent" (you only), "scope_team" (default), "scope_org" (all fleets)
+- Optionally override `memory_type` with a caller-writeable type (`fact`,
+  `episode`, `decision`, `preference`, `task`, `plan`, or `action`), plus
+  `weight` and `status`. `outcome`, `rule`, and `insight` are server-reserved.
+- RDF triples (subject_entity_id, predicate, object_value) available via OpenClaw plugin and REST API
+
+MANAGING EXISTING MEMORIES:
+- Use caura_manage with op="update" to correct content or metadata
+- Use caura_manage with op="transition" to change status
+- Use caura_manage with op="delete" to soft-delete
+- Use caura_manage with op="read" to inspect a single memory by id
+- Only provide fields you want to change — others are preserved
+- If content changes, embedding and entities are re-extracted automatically
+- You can only modify your own memories unless you have admin trust level
+
+STATUS LIFECYCLE:
+- Use caura_manage op="transition" when things change
+- confirmed (done), cancelled (abandoned), outdated (superseded)
+- Search status="pending" for unresolved items
+
+VISIBILITY & CROSS-FLEET:
+- Default visibility is "scope_team" — shared within your fleet
+- Set visibility: "scope_org" to share across all fleets in the organization
+- Set visibility: "scope_agent" for agent-only notes
+- Use fleet_ids in recall to query multiple fleets at once
+
+ENTITIES & GRAPH:
+- Auto-extracted from every write — no manual creation needed
+- Same name, one entity: case and spacing are ignored, and a leading
+  the/a/an/new/old/current/existing/legacy is treated as descriptive, so
+  "the new analytics service" and "analytics service" are one node
+  (never below two words, so "new york" stays distinct from "york")
+- Fuzzy entity matching after that: "OpenAI" and "Open AI" are auto-merged (cosine similarity ≥ 0.85)
+- Every surface form seen is kept as an alias on the entity
+- Recall automatically expands through entity relations (up to 2 hops)
+  Example: searching "Project Atlas" also finds memories about people who work on Atlas
+- Use caura_entity_get for direct relationship and linked memory inspection
+
+OUTCOME REPORTING (Karpathy Loop):
+- After acting on recalled memories, report what happened with caura_evolve
+- outcome_type: "success" / "failure" / "partial"; pass related_ids=[...]
+- Successful recalls get reinforced; failures generate preventive rules
+- Use caura_insights periodically to surface contradictions, stale
+  knowledge, cross-agent divergence, and emerging patterns
+```
+
+### Example: Multi-agent workflow
+
+> **Note:** `tenant_id` is resolved from your API key (MCP) or auto-filled from the plugin env — agents never need to pass it. `agent_id` is also auto-filled (defaults to `"mcp-agent"` for MCP or the plugin env value for OpenClaw).
+
+**Scenario:** Researcher discovers info, Planner uses it, Support benefits later.
+
+**Step 1 — Researcher stores a finding (visible to all fleets):**
+
+```json
+{
+  "tool": "caura_write",
+  "parameters": {
+    "content": "Customer X uses PostgreSQL 16 in production on GKE. They process 2M transactions/day.",
+    "source_uri": "crm://customer-x/infrastructure",
+    "visibility": "scope_org"
+  }
+}
+```
+
+LLM enrichment auto-classifies as `fact`, weight `0.9`, title "Customer X: PostgreSQL 16 on GKE", tags `["customer-x", "postgresql", "gke"]`. Entity extraction identifies "Customer X" (org), "PostgreSQL 16" (technology), "GKE" (technology). Visibility `scope_org` means all fleets can see this.
+
+**Step 2 — Planner recalls:**
+
+```json
+{
+  "tool": "caura_recall",
+  "parameters": {
+    "query": "which customers use PostgreSQL and what is their scale?",
+    "memory_type": "fact"
+  }
+}
+```
+
+Returns the researcher's finding. Graph-enhanced retrieval expands through entity relations — memories linked to matching entities get a 1.3x boost, 1-hop neighbors 1.2x, and 2-hop neighbors 1.1x.
+
+**Step 3 — Planner stores a decision:**
+
+```json
+{
+  "tool": "caura_write",
+  "parameters": {
+    "content": "Customer X should be migrated to managed Postgres in Phase 2 due to high transaction volume."
+  }
+}
+```
+
+**Step 4 — Support agent picks it up:**
+
+```json
+{
+  "tool": "caura_recall",
+  "parameters": {
+    "query": "Customer X database setup and migration plans"
+  }
+}
+```
+
+Returns both the fact and the decision — full context without agents needing to talk to each other.
+
+### Example: Batch write (after processing a document)
+
+**Scenario:** Agent has extracted several findings and stores them all at once via the batch form of `caura_write`.
+
+```json
+{
+  "tool": "caura_write",
+  "parameters": {
+    "items": [
+      {"content": "Customer A uses PostgreSQL 16 in production on GKE"},
+      {"content": "Customer A processes 2M transactions per day"},
+      {"content": "Customer A's DBA team prefers managed database services"},
+      {"content": "Customer A contract renewal is scheduled for Q3 2026"}
+    ]
+  }
+}
+```
+
+Returns per-item results with `created`, `duplicate_attempt`,
+`duplicate_content`, or `error` status, plus overall counts. Much faster than 4
+individual single-`content` calls — embeddings are batched into a single API
+call and enrichment runs in parallel. Pass the batch form (`items`) exactly
+when you have more than one memory; `items` is mutually exclusive with
+`content`.
+
+### Example: Entity lookup
+
+```json
+{
+  "tool": "caura_entity_get",
+  "parameters": {
+    "entity_id": "c5d5ee20-78a4-4dd0-b9ca-6a41809a6ca5"
+  }
+}
+```
+
+Returns entity attributes, all linked memories, and outgoing relations (e.g., Customer A -> uses -> PostgreSQL 16).
+
+### Example: Contradiction resolution (OpenClaw plugin / REST API)
+
+> RDF triple fields (`subject_entity_id`, `predicate`, `object_value`) are available via the OpenClaw plugin and REST API. MCP clients trigger contradiction detection through semantic similarity only (no explicit RDF triples).
+
+**Original memory exists:**
+```json
+{
+  "id": "aaa-111",
+  "content": "Sarah Chen lives in Tel Aviv, Israel",
+  "subject_entity_id": "e663...",
+  "predicate": "lives_in",
+  "object_value": "Tel Aviv, Israel",
+  "status": "active"
+}
+```
+
+**Agent writes contradicting memory:**
+```json
+{
+  "tool": "caura_write",
+  "parameters": {
+    "content": "Sarah Chen moved to Berlin, Germany",
+    "subject_entity_id": "e663...",
+    "predicate": "lives_in",
+    "object_value": "Berlin, Germany"
+  }
+}
+```
+
+**Response includes:**
+```json
+{
+  "id": "bbb-222",
+  "status": "active",
+  "superseded_by": [
+    {
+      "old_memory_id": "aaa-111",
+      "old_status": "outdated",
+      "reason": "rdf_conflict",
+      "old_content_preview": "Sarah Chen lives in Tel Aviv, Israel"
+    }
+  ]
+}
+```
+
+The old memory is automatically marked `outdated` with `supersedes_id` pointing to the new one.
+
+---
+
+## 6. Reference
+
+### Memory types
+
+Auto-classified by LLM on every write. Callers may override `memory_type` with
+`fact`, `episode`, `decision`, `preference`, `task`, `plan`, or `action`.
+`outcome`, `rule`, and `insight` are server-reserved; use `caura_evolve`,
+`caura_keystones_set`, and `caura_insights` respectively. `semantic`,
+`intention`, `commitment`, and `cancellation` remain readable for historical
+rows but are deprecated on new writes.
+
+| Type | Use for | Default status | Example |
+|---|---|---|---|
+| `fact` | Durable knowledge | `active` | "Customer A uses Postgres 16" |
+| `episode` | Events that happened | `active` | "Deployed v2.3 on March 10" |
+| `decision` | Choices made | `active` | "Chose managed Postgres over self-hosted" |
+| `preference` | User/org preferences | `active` | "Customer B prefers email over Slack" |
+| `task` | Work items | `pending` | "Migrate Customer X by Q3" |
+| `semantic` | Conceptual knowledge | `active` | "pgvector supports HNSW and IVFFlat" |
+| `intention` | Goals not yet acted on | `active` | "Planning to evaluate FalkorDB" |
+| `plan` | Step sequences | `pending` | "Phase 1: schema, Phase 2: data, Phase 3: cutover" |
+| `commitment` | Promises to others | `pending` | "Promised timeline by Friday" |
+| `action` | Steps in progress | `active` | "Started the migration script" |
+| `outcome` | Results of work | `confirmed` | "Migration: 2M rows in 47 min, zero errors" |
+| `cancellation` | Cancelled items | `active` | "Cancelled FalkorDB eval" |
+| `rule` | Preventive guardrails | `active` | "Never deploy schema changes on Fridays" (often auto-generated by `caura_evolve` after a failure) |
+| `insight` | Analytical findings | `active` | "5 memories contradict each other about customer X's region" (auto-generated by `caura_insights`) |
+
+### Memory status lifecycle
+
+| Status | Meaning | How it gets set |
+|---|---|---|
+| `active` | Current and valid (default) | LLM default for most types |
+| `pending` | Not yet confirmed | LLM default for tasks, plans, commitments |
+| `confirmed` | Verified or completed | Agent via `caura_manage` op=`transition` or LLM for outcomes |
+| `cancelled` | Explicitly cancelled | Agent via `caura_manage` op=`transition` |
+| `outdated` | Superseded by newer info | Auto-set by contradiction detection (RDF conflict) or lifecycle automation (past `ts_valid_end`) |
+| `conflicted` | Contradicts another memory | Auto-set by contradiction detection (semantic); needs review |
+| `archived` | Preserved but no longer current | Agent via `caura_manage` op=`transition` or lifecycle automation (stale, low-weight, never-recalled) |
+| `deleted` | Soft-deleted | Set on `caura_manage` op=`delete` or DELETE API call |
+
+### RDF triples
+
+Attach structured subject-predicate-object triples to memories for graph-friendly retrieval:
+
+```json
+{
+  "subject_entity_id": "c5d5ee20-...",
+  "predicate": "uses",
+  "object_value": "PostgreSQL 16"
+}
+```
+
+Enables contradiction detection (same subject+predicate, different object -> old memory marked `outdated`).
+
+### Memory visibility
+
+Controls who can see a memory. Set on write via `visibility` field.
+
+| Level | Who can see | Use for |
+|---|---|---|
+| `scope_agent` | Only the creating agent | Personal notes, drafts, scratch work |
+| `scope_team` | All agents in the same fleet (default) | Team-scoped knowledge |
+| `scope_org` | All agents across all fleets | Company-wide facts, cross-team decisions |
+
+Search respects visibility automatically. Agents see: all `scope_org` memories + `scope_team` memories in their fleet + their own `scope_agent` memories. Admin API key sees all except `scope_agent`.
+
+### Auto-chunking
+
+Content exceeding 2,000 characters is automatically split into atomic facts via LLM:
+
+- Creates a **parent memory** with the full content (tagged `auto_chunked: true`)
+- Creates **child memories** for each extracted fact (tagged `source: "auto_chunk"`, linked to parent)
+- Both parent and children inherit type, weight, status, visibility
+- Togglable per tenant via `auto_chunk_enabled` setting
+- Falls back to single-memory write if chunking fails
+
+> **Note:** This is a behavior change — integrations sending long content will now get multiple memories instead of one. Disable per tenant if needed.
+
+### Lifecycle automation
+
+The `core-operations` scheduler, which the stock `docker compose` stack runs, fires these ticks nightly (02:00 UTC by default, each movable in its settings):
+
+1. **Expires** — active memories past `ts_valid_end` or `expires_at` → status `outdated`, which default search excludes
+2. **Archives** — active memories older than 90 days with weight below 0.3 and no recalls → status `archived`
+3. **Purges** — soft-deleted memories past the tenant's retention window are removed
+4. **Crystallizes** — merges near-duplicate clusters for tenants with `crystallizer.auto_crystallize` on and more than 1,000 active memories, when something was written since the last run
+5. **Links entities** and **discovers insights** — for tenants that enable `entity_linking.auto_entity_linking_enabled` and `insights.auto_insights_enabled`
+
+Expiry and archival are togglable per tenant via the `lifecycle.lifecycle_automation_enabled` setting. A deployment that does not run `core-operations` runs none of these.
+
+### Temporal validity
+
+- `ts_valid_start` / `ts_valid_end` — auto-extracted from content by LLM, or set explicitly
+- Search with `valid_at` to return only memories valid at a point in time; relative dates in the query ("last month") resolve against it
+- For backfilled corpora whose `ts_valid_start` is the time the event happened, set `search.default_profile.freshness_reference` to `1` in tenant settings — freshness and the temporal window are then measured from `valid_at` against event time instead of from now against ingest time. Off by default; inert on requests without `valid_at`
+- Memories without temporal bounds are always considered valid
+
+### Batch Write
+
+Available as the batch form of the `caura_write` tool (MCP + OpenClaw plugin, pass `items=[...]`) and the `POST /api/v1/memories/bulk` REST endpoint. Writes up to 100 memories in a single request. Optimized for throughput:
+
+REST callers must send a unique `X-Bulk-Attempt-Id` header (1–128 characters;
+letters, digits, `.`, `_`, `:`, and `-`) and reuse it when retrying the same
+logical batch. MCP does not expose that header, so the server generates an
+attempt id for each MCP batch call.
+
+- **Batch embeddings** — single API call for all texts instead of N calls
+- **Parallel enrichment** — LLM enrichment runs concurrently (bounded at 10)
+- **Batch dedup** — one `WHERE content_hash IN (...)` query + intra-batch duplicate detection
+- **Single transaction** — all memories inserted and committed at once
+- **Single rate-limit check** — quota verified once for the whole batch
+
+```json
+{
+  "tenant_id": "acme",
+  "fleet_id": "engineering",
+  "agent_id": "researcher-1",
+  "items": [
+    {"content": "Customer A uses PostgreSQL 16 in production"},
+    {"content": "Customer B migrated to managed Postgres last quarter", "memory_type": "fact"},
+    {"content": "Customer C prefers email notifications", "weight": 0.8}
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "created": 3,
+  "duplicates": 0,
+  "errors": 0,
+  "results": [
+    {"index": 0, "status": "created", "id": "..."},
+    {"index": 1, "status": "created", "id": "..."},
+    {"index": 2, "status": "created", "id": "..."}
+  ],
+  "bulk_ms": 450
+}
+```
+
+Each item in `items` supports the same fields as a single-`content` write
+(`memory_type`, `weight`, `status`, `source_uri`, entity links, RDF triples,
+and temporal bounds). The same caller-writeable `memory_type` restriction
+applies. `tenant_id`, `fleet_id`, and `agent_id` are set once at the top level.
+When calling `caura_write`, pass exactly one of `content` (single) or `items`
+(batch).
+
+A retry with the same attempt id is reported as
+`"status": "duplicate_attempt"`; an exact content match from a different
+attempt is `"status": "duplicate_content"` with `duplicate_of` pointing to
+the existing memory ID. All enrichment, entity extraction, and contradiction
+detection run the same as single writes.
+
+### Deduplication
+
+Content-hash rejects exact duplicates within a tenant+fleet scope (HTTP 409). Same content can exist in different fleets.
+
+### Troubleshooting
+
+| Issue | Fix |
+|---|---|
+| Plugin tools don't appear | Ensure all three `plugins` keys are set in `openclaw.json`: `allow`, `entries`, and `load.paths`. Restart OpenClaw |
+| Tools not in agent sessions | Auto-fixed on first plugin load (adds v1.0 names, removes stale pre-v1.0 names). If it persists after restart, run `openclaw gateway memclaw.allowlist.fix` or check that `CAURA_AUTO_FIX_CONFIG` is not set to `false` <!-- legacy-name-floor: memclaw.allowlist.fix is the live gateway RPC method name --> |
+| Plugin allowed but not loading | Missing `plugins.entries.memclaw.enabled: true` or `plugins.load.paths` entry — the installer and Fix Configuration set both | <!-- legacy-name-floor: troubleshooting names the frozen live config key -->
+| All config issues | Use the "Fix Configuration" button in Fleet Browser Plugin Manager to auto-fix all settings |
+| `ECONNREFUSED` | Check `CAURA_API_URL`, ensure API is running |
+| API URL redirects | Set `CAURA_API_URL` to the final server URL. Credential-bearing plugin requests reject redirects so an API key cannot be forwarded to another host. |
+| Agent-key provisioning unavailable | Concurrent calls for one agent share one provisioning attempt. Failed attempts wait 60 seconds before retrying; a 404 disables provisioning until plugin restart. The existing tenant-key fallback remains, so this is not an agent-revocation control. |
+| 401 Unauthorized | Check `CAURA_API_KEY` env var on gateway |
+| 403 Forbidden | Key used for wrong tenant, or agent trust level too low |
+| 409 Conflict | Duplicate content — safe to ignore |
+| Empty search results | Verify tenant_id, check fleet_id scope, write test memories |

@@ -1,0 +1,429 @@
+"""Pub/Sub consumer for core-api.
+
+Subscribes core-api to two back-channels published by core-worker
+after the async write path lands a memory row:
+
+* ``Topics.Memory.ENRICHED`` (CAURA-595) — fired after a successful
+  enrichment PATCH.
+* ``Topics.Memory.EMBEDDED`` (loadtest-7 fix) — fired after a
+  successful embedding PATCH.
+
+Both consumers run :func:`detect_contradictions_async`. Two events
+trigger the detector because either the embed or the enrich worker
+can land first, and the detector needs both fields available; whichever
+event arrives second sees the other side present and runs detection.
+The detector is idempotent under repeated calls on the same row, so
+the rare case where both events trigger detection back-to-back doesn't
+double-write contradiction rows.
+
+Atomic-fact fan-out (parent → child memories) IS handled here, by
+:func:`_fan_out_persisted_atomic_facts` under the ``ENRICHED`` handler.
+This paragraph used to say the opposite — that the worker dropped
+``EnrichmentResult.atomic_facts`` entirely so they never reached storage
+— which stopped being true at A70 (#1424 persisted them, #1430 wired up
+this consumer, both 2026-09-09) while the text stayed. The worker now
+routes the facts into the row's metadata and publishes ``ENRICHED``;
+this side reads them back off the row and creates the children through
+the same ``fan_out_atomic_facts`` the synchronous path uses.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from pydantic import ValidationError
+
+from common.enrichment import AtomicFact
+from common.events.base import Event
+from common.events.factory import get_event_bus
+from common.events.memory_embedded import MemoryEmbedded
+from common.events.memory_enriched import MemoryEnriched
+from common.events.org_settings_changed_event import OrgSettingsChangedEvent
+from common.events.topics import Topics
+from core_api.clients.storage_client import get_storage_client
+from core_api.services.contradiction import Trigger, run_contradiction_detection
+from core_api.services.governance_remediation import (
+    GovernanceCascadeError,
+    remediate_after_enrichment,
+)
+from core_api.services.memory_service import _resolve_parent_weight, fan_out_atomic_facts
+from core_api.services.organization_settings import invalidate_cache, resolve_config
+
+logger = logging.getLogger(__name__)
+
+
+async def _fan_out_persisted_atomic_facts(sc, memory: dict, payload, outcome) -> None:
+    """Create the child memories for facts the async worker persisted (A70).
+
+    The synchronous path fans out inline. The worker cannot: its storage client
+    has no create-memory call, and giving it one would also mean a second copy
+    of ``fan_out_atomic_facts`` — a block whose every guarantee traces to an
+    incident (#808, CAURA-222, OSS #814, CAURA-602, the 2026-07-27 stranded
+    embeddings). So the worker stores the facts and this consumer creates the
+    rows, through the same function the synchronous path uses.
+
+    Never raises. A fan-out failure must not nack the event: contradiction
+    detection runs after this and is the handler's primary job, and a nack would
+    redeliver the whole handler to retry work that is already idempotent.
+    """
+    md = memory.get("metadata_") or {}
+    raw_facts = md.get("atomic_facts")
+    if not raw_facts:
+        return
+    try:
+        facts = [AtomicFact.model_validate(f) for f in raw_facts]
+    except (ValidationError, TypeError):
+        # Written by us one enrichment ago, so an unparseable shape means the
+        # schema moved under a row an older build wrote. Dropping is right: no
+        # retry re-parses it, and leaving the key set would re-attempt this on
+        # every redelivery forever.
+        logger.exception(
+            "memory-enriched: unparseable persisted atomic_facts; clearing",
+            extra={"memory_id": str(payload.memory_id), "tenant_id": payload.tenant_id},
+        )
+        facts = []
+
+    if facts:
+        # ``outcome.visibility`` FIRST — this is exactly why
+        # ``RemediationOutcome`` carries it. ``memory`` was read before the
+        # governance PATCH, so its ``visibility`` is the PRE-policy value, and a
+        # child inheriting that re-publishes precisely what ``keep_private`` just
+        # made private (#808).
+        parent_visibility = outcome.visibility or memory.get("visibility") or "scope_team"
+        try:
+            counts = await fan_out_atomic_facts(
+                sc,
+                atomic_facts=facts,
+                memory_id=payload.memory_id,
+                tenant_id=payload.tenant_id,
+                fleet_id=memory.get("fleet_id"),
+                agent_id=memory.get("agent_id") or "",
+                parent_metadata=md,
+                parent_visibility=parent_visibility,
+                parent_weight=_resolve_parent_weight(memory.get("weight")),
+                parent_ts_start=memory.get("ts_valid_start"),
+                tenant_config=await resolve_config(payload.tenant_id),
+                parent_expires_at=memory.get("expires_at"),
+                parent_run_id=memory.get("run_id"),
+                parent_source_uri=memory.get("source_uri"),
+            )
+        except Exception:
+            # Marker deliberately left in place: the facts are still stored, so a
+            # redelivery or a later re-enrichment can retry, and the fan-out's own
+            # live-hash dedup stops a retry duplicating whatever did land.
+            logger.exception(
+                "memory-enriched: atomic-fact fan-out failed; facts left in metadata for retry",
+                extra={"memory_id": str(payload.memory_id), "tenant_id": payload.tenant_id},
+            )
+            return
+        logger.info(
+            "memory-enriched: atomic-fact fan-out created=%d deduped=%d unembedded=%d",
+            counts["created"],
+            counts["deduped"],
+            counts["unembedded"],
+            extra={"memory_id": str(payload.memory_id), "tenant_id": payload.tenant_id},
+        )
+
+    # Mark consumed. The bus is at-least-once, so this is the CHEAP idempotency
+    # path, not the guarantee — that is the fan-out's own live-hash dedup, which
+    # already absorbs a redelivery arriving before this write lands. Merged via
+    # ``metadata_patch`` so sibling keys the worker set survive.
+    try:
+        await sc.update_memory(
+            str(payload.memory_id),
+            payload.tenant_id,
+            {"metadata_patch": {"atomic_facts": None}},
+        )
+    except Exception:
+        logger.warning(
+            "memory-enriched: could not clear the atomic_facts marker; a redelivery "
+            "will re-enter the fan-out and be absorbed by its dedup",
+            exc_info=True,
+            extra={"memory_id": str(payload.memory_id), "tenant_id": payload.tenant_id},
+        )
+
+
+async def handle_memory_enriched(event: Event) -> None:
+    """Process one ``Topics.Memory.ENRICHED`` event.
+
+    Loads the memory row from storage (so we have the embedding +
+    fleet_id that the minimal payload doesn't carry) and dispatches to
+    ``detect_contradictions_async`` when the embedding has already
+    landed. Schema-drift / malformed payloads ack-drop with a loud
+    ``dropped=True`` log entry so a poison message can't loop the
+    subscription.
+
+    The detection coroutine is awaited inline rather than spawned via
+    ``track_task``: it owns its own ``try/except`` and never raises, so
+    the bus always acks regardless of detection outcome — but the await
+    delays the ack until detection completes, which prevents
+    redelivery from stacking concurrent detections on the same memory.
+    """
+    try:
+        payload = MemoryEnriched(**event.payload)
+    except (ValidationError, TypeError):
+        # ``ValidationError`` covers shape drift (missing required
+        # fields, wrong types). ``TypeError`` covers ``event.payload``
+        # not being a mapping at all — ``**non_dict`` raises before
+        # Pydantic ever sees it. Both are poison-message conditions
+        # that re-raising would just nack-loop on; ack-drop loudly.
+        logger.exception(
+            "dropping malformed memory-enriched payload",
+            extra={
+                "event_type": event.event_type,
+                "event_id": str(event.event_id),
+                "dropped": True,
+            },
+        )
+        return
+
+    sc = get_storage_client()
+    # H-02: ``read=False`` (WRITER). This is a read-your-write — the worker PATCHes
+    # the enrichment and publishes immediately after, and Pub/Sub delivery is
+    # typically sub-second, so a replica read races replication. On the replica the
+    # miss lands in the ack-drop below, which never redelivers, and this handler is
+    # one of only two contradiction-detection triggers on the deferred path.
+    memory = await sc.get_memory(str(payload.memory_id), payload.tenant_id, read=False)
+    if memory is None:
+        # Genuinely deleted between the worker's PATCH and this handler — which the
+        # writer read makes true. Read from the replica it was not: an unreplicated
+        # row is also absent, so this branch silently absorbed lag as deletion.
+        logger.info(
+            "memory-enriched: target row missing; ack-dropping",
+            extra={
+                "memory_id": str(payload.memory_id),
+                "tenant_id": payload.tenant_id,
+            },
+        )
+        return
+
+    # Fast-mode governance remediation: the worker just PATCHed the LLM's
+    # contains_pii / business_relevance onto the row; apply the tenant's
+    # configured action (drop / keep-private / flag) now — the fast-mode
+    # counterpart to the synchronous GovernanceDecision step. ``resolve_config``
+    # tolerates a None session (cache-first; cold-miss opens its own).
+    gov_cfg = await resolve_config(payload.tenant_id)
+    try:
+        outcome = await remediate_after_enrichment(memory, gov_cfg)
+    except GovernanceCascadeError as exc:
+        # The parent WAS remediated; only rows derived from it could not be.
+        # Caught HERE and nowhere deeper, because the two callers of
+        # ``remediate_after_enrichment`` need opposite things from this failure:
+        #
+        #   - ``_enrich_memory_background`` is about to create MORE derived rows,
+        #     so it must abort. It does not catch this, and must not.
+        #   - this handler creates nothing. Letting the raise through would nack
+        #     the event, and the dispatcher redelivers on nack — re-running the
+        #     whole drop branch and emitting a SECOND ``critical=True`` audit for
+        #     a memory already dropped. Every redelivery. Duplicate destructive
+        #     entries in a tamper-evident log, for a row nothing further can be
+        #     done to.
+        #
+        # The outcome rides on the exception precisely so this branch can honour
+        # the parent's verdict without re-running it.
+        outcome = exc.outcome
+        logger.error(
+            "memory-enriched: governance remediated the row but could not clean up "
+            "rows derived from it; they still carry content the policy forbade",
+            exc_info=True,
+            extra={"memory_id": str(payload.memory_id), "tenant_id": payload.tenant_id},
+        )
+    if outcome.dropped:
+        # Row was dropped by policy — skip contradiction detection on it.
+        logger.info(
+            "memory-enriched: row dropped by governance policy; ack",
+            extra={"memory_id": str(payload.memory_id), "tenant_id": payload.tenant_id},
+        )
+        return
+
+    # A70 — create the children for facts the worker persisted. Placed here
+    # deliberately:
+    #   * AFTER remediation, so a dropped row spawns nothing and children inherit
+    #     the post-policy visibility (#808);
+    #   * BEFORE the embedding check, because a parent whose vector has not landed
+    #     still has valid facts and each child embeds itself. Gating on the
+    #     parent's embedding would strand the facts behind an unrelated race.
+    await _fan_out_persisted_atomic_facts(sc, memory, payload, outcome)
+
+    embedding = memory.get("embedding")
+    if not embedding:
+        # Embed worker hasn't completed yet (or its PATCH 404'd).
+        # ``deferred_reason`` is structured so a Cloud Logging metric
+        # can scrape the count of skipped detections — without it,
+        # there's no production visibility into how often the race
+        # fires.
+        logger.info(
+            "memory-enriched: embedding not yet present; deferring contradiction detection",
+            extra={
+                "memory_id": str(payload.memory_id),
+                "tenant_id": payload.tenant_id,
+                "deferred_reason": "embedding_missing",
+            },
+        )
+        return
+
+    fleet_id = memory.get("fleet_id")
+
+    # Pass the already-fetched row through so the detector skips a
+    # redundant ``sc.get_memory`` (it still re-checks ``deleted_at``
+    # for the soft-delete-during-detection race).
+    await run_contradiction_detection(
+        payload.memory_id,
+        payload.tenant_id,
+        fleet_id,
+        trigger=Trigger.EMBED,
+        content=payload.content,
+        embedding=embedding,
+        new_memory=memory,
+    )
+
+    logger.info(
+        "memory-enriched processed",
+        extra={
+            "memory_id": str(payload.memory_id),
+            "tenant_id": payload.tenant_id,
+            "fleet_id": fleet_id,
+            "embedding_dim": len(embedding),
+        },
+    )
+
+
+async def handle_memory_embedded(event: Event) -> None:
+    """Process one ``Topics.Memory.EMBEDDED`` event.
+
+    Mirror of :func:`handle_memory_enriched` for the embed-finishes-
+    after-enrich ordering. Loads the memory row from storage (so we
+    have the embedding the minimal payload doesn't carry, plus
+    ``fleet_id``) and dispatches to :func:`detect_contradictions_async`
+    once the embedding has landed. Schema-drift / malformed payloads
+    ack-drop with a loud ``dropped=True`` log entry so a poison
+    message can't loop the subscription.
+
+    Like the enriched handler, the detection coroutine is awaited
+    inline rather than spawned via ``track_task``: it owns its own
+    ``try/except`` and never raises, so the bus always acks regardless
+    of detection outcome — but the await delays the ack until detection
+    completes, which prevents redelivery from stacking concurrent
+    detections on the same memory.
+    """
+    try:
+        payload = MemoryEmbedded(**event.payload)
+    except (ValidationError, TypeError):
+        logger.exception(
+            "dropping malformed memory-embedded payload",
+            extra={
+                "event_type": event.event_type,
+                "event_id": str(event.event_id),
+                "dropped": True,
+            },
+        )
+        return
+
+    sc = get_storage_client()
+    # H-02: ``read=False`` (WRITER) — see handle_memory_enriched. The embed path is
+    # the sharper case: on the deferred-embed path this back-channel is the SOLE
+    # Path A contradiction trigger, and with tenant enrichment disabled no ENRICHED
+    # event ever fires to cover for it, so a lagged read dropped detection
+    # unconditionally. Contradictory memories then both stay ``active`` and recall
+    # keeps returning the stale one.
+    memory = await sc.get_memory(str(payload.memory_id), payload.tenant_id, read=False)
+    if memory is None:
+        # Genuinely deleted — true against the writer, not against a replica, where
+        # an unreplicated row is indistinguishable from a deleted one.
+        logger.info(
+            "memory-embedded: target row missing; ack-dropping",
+            extra={
+                "memory_id": str(payload.memory_id),
+                "tenant_id": payload.tenant_id,
+            },
+        )
+        return
+
+    embedding = memory.get("embedding")
+    if not embedding:
+        # Now genuinely "should not happen": the worker PATCHes the embedding, waits
+        # for it, and only then publishes, so the writer has it. Reading the replica
+        # this fired routinely under lag while claiming to be impossible.
+        #
+        # ERROR, not warning: the only remaining causes are a real invariant
+        # violation (a column rewrite, a soft-delete racing the PATCH), and the cost
+        # is a silently-missed contradiction check. Still ack — a retry would read
+        # the same writer row and reach the same branch.
+        logger.error(
+            "memory-embedded: embedding missing on read-back; ack-dropping",
+            extra={
+                "memory_id": str(payload.memory_id),
+                "tenant_id": payload.tenant_id,
+            },
+        )
+        return
+
+    fleet_id = memory.get("fleet_id")
+
+    await run_contradiction_detection(
+        payload.memory_id,
+        payload.tenant_id,
+        fleet_id,
+        trigger=Trigger.EMBED,
+        content=payload.content,
+        embedding=embedding,
+        new_memory=memory,
+    )
+
+    logger.info(
+        "memory-embedded processed",
+        extra={
+            "memory_id": str(payload.memory_id),
+            "tenant_id": payload.tenant_id,
+            "fleet_id": fleet_id,
+            "embedding_dim": len(embedding),
+        },
+    )
+
+
+async def handle_org_settings_changed(event: Event) -> None:
+    """Process one ``Topics.Org.SETTINGS_CHANGED`` event (CAURA-571).
+
+    Drops the affected org's entry from THIS process's settings cache, so a
+    settings change made on any worker/instance takes effect here promptly
+    instead of waiting out the per-process 5-min TTL. The publishing worker
+    already invalidated its own cache locally; this is the fan-out to every
+    other process (the topic is subscribed with ``broadcast=True``).
+
+    Idempotent — evicting an absent or already-fresh entry is a harmless no-op —
+    so the at-least-once bus may redeliver freely. A malformed payload is
+    ack-dropped (no retry will make it parse).
+    """
+    try:
+        payload = OrgSettingsChangedEvent.model_validate(event.payload)
+    except ValidationError:
+        logger.exception(
+            "dropping malformed org-settings-changed payload",
+            extra={
+                "event_type": event.event_type,
+                "event_id": str(event.event_id),
+                "dropped": True,
+            },
+        )
+        return
+    invalidate_cache(payload.org_id)
+    logger.info(
+        "settings cache invalidated via broadcast",
+        extra={"event_id": str(event.event_id), "org_id": payload.org_id},
+    )
+
+
+def register_consumers() -> None:
+    """Wire the consumers into the event bus.
+
+    Must run before ``bus.start()`` — the Pub/Sub backend spawns its
+    pull loops in ``start()`` from the current handler registry, so a
+    late ``subscribe()`` would silently orphan the handler.
+    """
+    bus = get_event_bus()
+    bus.subscribe(Topics.Memory.ENRICHED, handle_memory_enriched)
+    bus.subscribe(Topics.Memory.EMBEDDED, handle_memory_embedded)
+    # Broadcast: EVERY core-api process must drop its settings cache, not just
+    # one — so this uses a per-process subscription, unlike the work-queue
+    # consumers above (CAURA-571).
+    bus.subscribe(Topics.Org.SETTINGS_CHANGED, handle_org_settings_changed, broadcast=True)

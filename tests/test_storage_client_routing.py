@@ -1,0 +1,636 @@
+"""Tests for CAURA-591 Part B — core-api storage client reader/writer split.
+
+When ``CORE_STORAGE_READ_URL`` is set, the client routes GET + tagged-read
+POST calls to the reader URL. Everything else (including un-tagged POST,
+PATCH, DELETE) still goes to the writer URL. Empty ``CORE_STORAGE_READ_URL``
+collapses both back to a single URL — the OSS / pre-split default.
+"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import patch
+
+import httpx
+import pytest
+
+pytestmark = pytest.mark.asyncio
+
+
+class _SpyTransport(httpx.AsyncBaseTransport):
+    """httpx transport that records each request's target URL and
+    returns a canned 200 JSON body — no real HTTP, no real upstream."""
+
+    def __init__(self, body: bytes = b"{}") -> None:
+        self.requests: list[httpx.Request] = []
+        self._body = body
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return httpx.Response(200, content=self._body, request=request)
+
+
+def _patch_client_transports(
+    client, writer_transport: _SpyTransport, reader_transport: _SpyTransport
+) -> None:
+    """Swap the client's httpx pools for test spies. Leaves base URL
+    calculations untouched so we can assert on the final URL."""
+    client._http = httpx.AsyncClient(
+        transport=writer_transport, timeout=client._http.timeout
+    )
+    client._read_http = httpx.AsyncClient(
+        transport=reader_transport, timeout=client._http.timeout
+    )
+
+
+async def _fresh_client(writer_url: str, reader_url: str):
+    """Build a storage client with the requested URLs patched in, then
+    replace its httpx pools with spy transports. Returns (client, writer_spy, reader_spy)."""
+    from core_api.clients.storage_client import CoreStorageClient
+    from core_api.config import settings
+
+    with (
+        patch.object(settings, "core_storage_api_url", writer_url),
+        patch.object(settings, "core_storage_read_url", reader_url),
+    ):
+        client = CoreStorageClient()
+    writer_spy = _SpyTransport()
+    reader_spy = _SpyTransport()
+    _patch_client_transports(client, writer_spy, reader_spy)
+    return client, writer_spy, reader_spy
+
+
+async def test_get_goes_to_reader_when_read_url_set() -> None:
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+    await client.get_memory("11111111-1111-1111-1111-111111111111", "t1")
+    assert len(reader.requests) == 1
+    assert len(writer.requests) == 0
+    assert reader.requests[0].url.host == "reader"
+
+
+async def test_find_by_content_hash_stays_on_writer() -> None:
+    """Exact-hash dedup gate on the write path; replica lag would let a
+    just-written row slip past dedup."""
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+    await client.find_by_content_hash("t", "abc123")
+    assert len(writer.requests) == 1
+    assert len(reader.requests) == 0
+
+
+async def test_find_duplicate_hash_stays_on_writer() -> None:
+    """Update-path dedup check; must see the just-updated row."""
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+    await client.find_duplicate_hash("t", "abc123")
+    assert len(writer.requests) == 1
+    assert len(reader.requests) == 0
+
+
+async def test_governance_child_lookup_stays_on_writer() -> None:
+    """H-10 — the cascade reads rows it is about to soft-delete.
+
+    A read-your-write, and the FIRST ``_get_list`` caller that is one: the
+    method's own comment used to say no caller sat on a write path, which is
+    why it had no opt-out. On a retry after a partial cascade failure this
+    lookup must not return children whose delete already committed — a replica
+    under lag would hand them back, and the cascade would re-audit and
+    re-soft-delete a row it had already handled, putting a duplicate
+    destructive entry in a compliance log.
+    """
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+
+    await client.find_children_by_parent_id(
+        "t1", "11111111-1111-1111-1111-111111111111"
+    )
+
+    assert len(writer.requests) == 1
+    assert len(reader.requests) == 0
+    assert writer.requests[0].url.path.endswith("/memories/by-parent-id")
+
+
+async def test_get_list_still_defaults_to_the_reader() -> None:
+    """OVER-CORRECTION GUARD. The opt-out must stay opt-IN.
+
+    Adding a ``read`` parameter to ``_get_list`` must not change where its
+    existing callers go. This pins that for one of them rather than asserting
+    anything about whether the replica is the right home for each — that is a
+    per-caller question this change does not reopen.
+    """
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+
+    await client.find_by_supersedes_id("t1", "11111111-1111-1111-1111-111111111111")
+
+    assert len(reader.requests) == 1
+    assert len(writer.requests) == 0
+
+
+async def test_exact_lifecycle_audit_read_stays_on_writer() -> None:
+    """A just-created canary audit must not transiently 404 on a replica."""
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+
+    await client.get_lifecycle_audit_row(41, org_id="canary")
+
+    assert len(writer.requests) == 1
+    assert len(reader.requests) == 0
+    assert writer.requests[0].url.path.endswith("/lifecycle-audit/41")
+    assert writer.requests[0].url.params["org_id"] == "canary"
+
+
+async def test_lifecycle_audit_summary_uses_reader_with_explicit_unscoped_body() -> (
+    None
+):
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+
+    await client.get_lifecycle_audit_summary(
+        since_hours=30,
+        triggered_by="core-operations",
+    )
+
+    assert len(writer.requests) == 0
+    assert len(reader.requests) == 1
+    assert reader.requests[0].method == "POST"
+    assert reader.requests[0].url.path.endswith("/lifecycle-audit/summary")
+    assert json.loads(reader.requests[0].content) == {
+        "org_id": None,
+        "since_hours": 30,
+        "triggered_by": "core-operations",
+    }
+
+
+async def test_get_idempotency_stays_on_writer() -> None:
+    """Read-before-write guard for idempotency replay; stale replica would
+    let a retried request re-execute instead of returning the cached body."""
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+    await client.get_idempotency("t", "key-1")
+    assert len(writer.requests) == 1
+    assert len(reader.requests) == 0
+
+
+async def test_find_embedding_by_content_hash_stays_on_writer() -> None:
+    """Write-path embedding cache lookup. A miss here re-embeds — replica
+    lag would cause expensive unnecessary provider calls."""
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+    await client.find_embedding_by_content_hash("t", "abc123")
+    assert len(writer.requests) == 1
+    assert len(reader.requests) == 0
+
+
+async def test_tagged_post_read_goes_to_reader() -> None:
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+    await client.scored_search({"tenant_id": "t", "embedding": [], "query": "q"})
+    assert len(reader.requests) == 1
+    assert len(writer.requests) == 0
+
+
+async def test_untagged_post_goes_to_writer() -> None:
+    """create_memory is an un-tagged POST — writes MUST land on the writer
+    even when a reader URL is configured."""
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+    await client.create_memory({"tenant_id": "t", "content": "c"})
+    assert len(writer.requests) == 1
+    assert len(reader.requests) == 0
+
+
+async def test_patch_goes_to_writer() -> None:
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+    await client.update_embedding("11111111-1111-1111-1111-111111111111", "t", [0.1])
+    assert len(writer.requests) == 1
+    assert len(reader.requests) == 0
+
+
+async def test_delete_goes_to_writer() -> None:
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+    await client.delete_agent("agent-1", tenant_id="t")
+    assert len(writer.requests) == 1
+    assert len(reader.requests) == 0
+
+
+async def test_dedup_lookup_stays_on_writer() -> None:
+    """bulk_find_by_content_hashes is used inline during writes; replica
+    lag would let a just-written duplicate slip through. Regression
+    guard for the CAURA-591 A carve-out."""
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+    await client.bulk_find_by_content_hashes("t", ["hash1", "hash2"])
+    assert len(writer.requests) == 1
+    assert len(reader.requests) == 0
+
+
+async def test_semantic_duplicate_check_stays_on_writer() -> None:
+    """find_semantic_duplicate is the near-dup gate on the write path;
+    routing to the reader would reintroduce duplicate races."""
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+    await client.find_semantic_duplicate({"tenant_id": "t", "embedding": []})
+    assert len(writer.requests) == 1
+    assert len(reader.requests) == 0
+
+
+async def test_no_read_url_means_reader_client_is_writer_client() -> None:
+    """OSS / pre-split deploy: ``core_storage_read_url=''`` must collapse
+    to one pool. Otherwise we'd double the connection budget against the
+    same upstream for no reason."""
+    from core_api.clients.storage_client import CoreStorageClient
+    from core_api.config import settings
+
+    with (
+        patch.object(settings, "core_storage_api_url", "http://only:8002"),
+        patch.object(settings, "core_storage_read_url", ""),
+    ):
+        client = CoreStorageClient()
+    assert client._read_http is client._http
+    assert client._read_prefix == client._prefix
+
+
+async def test_read_url_creates_distinct_http_pool() -> None:
+    """With the split configured, the two pools must be independent so
+    reader throughput can't starve writes (and vice-versa)."""
+    from core_api.clients.storage_client import CoreStorageClient
+    from core_api.config import settings
+
+    with (
+        patch.object(settings, "core_storage_api_url", "http://writer:8002"),
+        patch.object(settings, "core_storage_read_url", "http://reader:8002"),
+    ):
+        client = CoreStorageClient()
+    assert client._read_http is not client._http
+    assert client._read_prefix != client._prefix
+    await client.close()
+
+
+async def test_identical_read_and_write_urls_collapse_to_one_pool() -> None:
+    """If an operator accidentally sets ``CORE_STORAGE_READ_URL`` to the
+    same value as ``CORE_STORAGE_API_URL``, we must not double the
+    connection budget against a single upstream."""
+    from core_api.clients.storage_client import CoreStorageClient
+    from core_api.config import settings
+
+    with (
+        patch.object(settings, "core_storage_api_url", "http://same:8002"),
+        patch.object(settings, "core_storage_read_url", "http://same:8002"),
+    ):
+        client = CoreStorageClient()
+    assert client._read_http is client._http
+    assert client._read_prefix == client._prefix
+    await client.close()
+
+
+# -------------------------------------------------------------------------
+# CAURA-591 Part B Y3 — ID-token Authorization header
+# -------------------------------------------------------------------------
+#
+# When the storage services are deployed with ``--no-allow-unauthenticated``
+# core-api must present an identity token for the target's audience. The
+# storage client calls ``identity_token.fetch_auth_header(audience)`` on
+# every request and attaches the returned dict. Local / test envs have
+# no metadata server so the fetch returns ``{}`` and no header is added —
+# see ``test_identity_token.py`` for the cache behaviour; the tests here
+# assert the header reaches each request method on both pools.
+
+
+def _patch_fetch(return_value: dict[str, str]):
+    """Context manager that patches ``fetch_auth_header`` in both the
+    ``identity_token`` module and the reference the storage_client
+    holds (it does ``from ... import fetch_auth_header``, which copies
+    the reference at import time)."""
+    from core_api.clients import identity_token
+    from core_api.clients import storage_client as sc_mod
+
+    # Clear module-level state directly — no production test-helper
+    # seam required.
+    identity_token._cache.clear()
+    identity_token._failure_cache.clear()
+    identity_token._audience_locks.clear()
+
+    async def _fake(_audience: str) -> dict[str, str]:
+        return dict(return_value)  # fresh dict per call to avoid shared-state flakiness
+
+    return patch.multiple(sc_mod, fetch_auth_header=_fake), patch.multiple(
+        identity_token, fetch_auth_header=_fake
+    )
+
+
+async def test_authorization_header_attached_on_reader_calls() -> None:
+    # https:// audiences exercise the ID-token path; the storage
+    # client short-circuits before the metadata fetch for http://
+    # audiences (Cloud Run --no-allow-unauthenticated is always TLS,
+    # so a plain-HTTP audience is by definition local/in-cluster and
+    # never needs a token). These header-propagation tests
+    # deliberately use https:// to verify the live token-fetch path.
+    a, b = _patch_fetch({"Authorization": "Bearer tok-reader"})
+    with a, b:
+        client, writer, reader = await _fresh_client(
+            writer_url="https://writer:8002", reader_url="https://reader:8002"
+        )
+        await client.get_memory("11111111-1111-1111-1111-111111111111", "t1")
+    assert reader.requests[0].headers["Authorization"] == "Bearer tok-reader"
+    assert reader.requests[0].headers["X-Storage-Secret"] == "test-storage-secret"
+
+
+async def test_authorization_header_attached_on_writer_calls() -> None:
+    a, b = _patch_fetch({"Authorization": "Bearer tok-writer"})
+    with a, b:
+        client, writer, reader = await _fresh_client(
+            writer_url="https://writer:8002", reader_url="https://reader:8002"
+        )
+        await client.create_memory({"tenant_id": "t", "content": "c"})
+    assert writer.requests[0].headers["Authorization"] == "Bearer tok-writer"
+    assert writer.requests[0].headers["X-Storage-Secret"] == "test-storage-secret"
+
+
+async def test_authorization_header_attached_on_patch() -> None:
+    a, b = _patch_fetch({"Authorization": "Bearer tok-writer"})
+    with a, b:
+        client, writer, reader = await _fresh_client(
+            writer_url="https://writer:8002", reader_url="https://reader:8002"
+        )
+        await client.update_embedding(
+            "11111111-1111-1111-1111-111111111111", "t", [0.1]
+        )
+    assert writer.requests[0].headers["Authorization"] == "Bearer tok-writer"
+    assert writer.requests[0].headers["X-Storage-Secret"] == "test-storage-secret"
+
+
+async def test_authorization_header_attached_on_delete() -> None:
+    a, b = _patch_fetch({"Authorization": "Bearer tok-writer"})
+    with a, b:
+        client, writer, reader = await _fresh_client(
+            writer_url="https://writer:8002", reader_url="https://reader:8002"
+        )
+        await client.delete_agent("agent-1", tenant_id="t")
+    assert writer.requests[0].headers["Authorization"] == "Bearer tok-writer"
+    assert writer.requests[0].headers["X-Storage-Secret"] == "test-storage-secret"
+
+
+async def test_http_audience_skips_token_fetch() -> None:
+    """Plain-HTTP audience MUST short-circuit before the metadata
+    fetch so an unreachable metadata server (local docker, ASGI
+    bridges) can't race the call's own timeout budget. The mocked
+    ``fetch_auth_header`` returns a header that the storage client
+    must NOT attach — proves the bypass is active end-to-end."""
+    a, b = _patch_fetch({"Authorization": "Bearer tok-should-not-attach"})
+    with a, b:
+        client, writer, reader = await _fresh_client(
+            writer_url="http://writer:8002", reader_url="http://reader:8002"
+        )
+        await client.get_memory("11111111-1111-1111-1111-111111111111", "t1")
+    assert "Authorization" not in reader.requests[0].headers
+    assert reader.requests[0].headers["X-Storage-Secret"] == "test-storage-secret"
+
+
+async def test_no_authorization_header_when_no_credentials() -> None:
+    """Environments without a metadata server (tests, local, OSS) get
+    ``{}`` from ``fetch_auth_header`` and the storage client must send
+    the request without an Authorization header rather than crashing."""
+    a, b = _patch_fetch({})
+    with a, b:
+        client, writer, reader = await _fresh_client(
+            writer_url="http://writer:8002", reader_url="http://reader:8002"
+        )
+        await client.get_memory("11111111-1111-1111-1111-111111111111", "t1")
+    assert "Authorization" not in reader.requests[0].headers
+    assert reader.requests[0].headers["X-Storage-Secret"] == "test-storage-secret"
+
+
+class _StatusCodeTransport(httpx.AsyncBaseTransport):
+    """httpx transport that always returns the given status code. Used
+    to verify cache behaviour across 401 vs 403: eviction fires only
+    on 401 (token rejected by our identity layer); 403 is a
+    permission denial by the target and does NOT imply the token is
+    bad, so we keep the cache intact."""
+
+    def __init__(self, status_code: int, content: bytes = b"{}") -> None:
+        self.requests: list[httpx.Request] = []
+        self._status = status_code
+        self._content = content
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return httpx.Response(self._status, content=self._content, request=request)
+
+
+async def _run_auth_status_test(
+    status_code: int,
+    *,
+    expect_evicted: bool,
+    content: bytes = b"{}",
+) -> None:
+    """Shared harness — seed a cached token, issue a request that
+    gets ``status_code`` back, and assert whether the cache entry
+    survived based on ``expect_evicted``."""
+    from core_api.clients import identity_token
+    from core_api.clients.storage_client import CoreStorageClient
+    from core_api.config import settings
+
+    identity_token._cache.clear()
+    identity_token._failure_cache.clear()
+    identity_token._audience_locks.clear()
+
+    identity_token._cache["http://writer:8002"] = {"Authorization": "Bearer stale"}
+    assert "http://writer:8002" in identity_token._cache
+
+    with (
+        patch.object(settings, "core_storage_api_url", "http://writer:8002"),
+        patch.object(settings, "core_storage_read_url", "http://reader:8002"),
+    ):
+        client = CoreStorageClient()
+
+    client._http = httpx.AsyncClient(
+        transport=_StatusCodeTransport(status_code, content),
+        timeout=client._http.timeout,
+    )
+    client._read_http = httpx.AsyncClient(
+        transport=_SpyTransport(), timeout=client._read_http.timeout
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.create_memory({"tenant_id": "t", "content": "c"})
+
+    if expect_evicted:
+        assert "http://writer:8002" not in identity_token._cache
+    else:
+        assert "http://writer:8002" in identity_token._cache
+
+
+async def test_401_response_evicts_cached_id_token() -> None:
+    """401 = token explicitly rejected at the identity layer. The
+    cache entry must go so the next request forces a fresh fetch —
+    otherwise every request 401s for 50 min."""
+    await _run_auth_status_test(401, expect_evicted=True)
+
+
+async def test_storage_secret_401_keeps_cached_id_token() -> None:
+    """A storage-secret mismatch cannot be repaired by refreshing IAM."""
+    await _run_auth_status_test(
+        401,
+        expect_evicted=False,
+        content=b'{"detail":"invalid storage service credentials"}',
+    )
+
+
+async def test_403_response_keeps_cached_id_token() -> None:
+    """403 = permission denied by the target, not a bad token. The
+    cache must survive so we don't thrash the metadata server with
+    refreshes of a token that was authoritatively authed — the real
+    fix is IAM-side (grant the caller's SA the right role)."""
+    await _run_auth_status_test(403, expect_evicted=False)
+
+
+# ── oss-0902-l-52 follow-up: agent re-fetches that follow a write ──────────
+
+
+async def test_get_agent_defaults_to_the_reader() -> None:
+    """Non-regression. Most ``get_agent`` callers are plain lookups — trust
+    gates, fleet resolution, 404 checks — and the point of the opt-out is to
+    leave those on the reader rather than give up the split for four sites."""
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+    await client.get_agent("agent-1", "t1")
+    assert len(reader.requests) == 1
+    assert len(writer.requests) == 0
+
+
+async def test_get_agent_read_false_goes_to_the_writer() -> None:
+    """``read=False`` forces the primary, as it does for ``get_document``.
+
+    Before this existed, ``get_agent`` took no ``read`` argument at all, so a
+    re-fetch issued immediately after a write was served from the replica. Under
+    lag it returns the row as it was BEFORE the update it exists to report.
+    """
+    client, writer, reader = await _fresh_client(
+        writer_url="http://writer:8002", reader_url="http://reader:8002"
+    )
+    await client.get_agent("agent-1", "t1", read=False)
+    assert len(writer.requests) == 1
+    assert len(reader.requests) == 0
+    assert writer.requests[0].url.host == "writer"
+
+
+async def test_the_trust_level_refetch_asks_for_the_primary() -> None:
+    """Pins the CALL SITE, not just the capability.
+
+    Adding ``read=`` to the client fixes nothing on its own — the bug was that
+    the re-fetch did not ask for the primary. ``update_trust_level``'s own
+    docstring calls ``agents.trust_level`` the single source of truth that every
+    gate reads live; answering with the previous value reports a promotion that
+    has already been applied as not having happened.
+    """
+    from unittest.mock import AsyncMock
+    from unittest.mock import patch as _patch
+
+    from core_api.services import agent_service
+
+    sc = AsyncMock()
+    sc.update_trust_level = AsyncMock(return_value=None)
+    sc.get_agent = AsyncMock(return_value={"agent_id": "a1", "trust_level": 2})
+
+    with (
+        _patch.object(agent_service, "get_storage_client", return_value=sc),
+        _patch.object(
+            agent_service, "lookup_agent", AsyncMock(return_value={"agent_id": "a1"})
+        ),
+    ):
+        await agent_service.update_trust_level("t1", "a1", 2)
+
+    sc.get_agent.assert_awaited_once()
+    assert sc.get_agent.await_args.kwargs.get("read") is False, (
+        "the re-fetch after update_trust_level must come from the primary"
+    )
+
+
+# ── get_or_create_agent: the miss is the dangerous answer ──────────────────
+
+
+def _goca_client(reader_returns, primary_returns=None):
+    """Storage client stub that answers reads by which pool they asked for."""
+    from unittest.mock import AsyncMock
+
+    sc = AsyncMock()
+    calls: list[bool] = []
+
+    async def _get_agent(agent_id, tenant_id, *, read=True):
+        calls.append(read)
+        return reader_returns if read else primary_returns
+
+    sc.get_agent = _get_agent
+    sc.create_or_update_agent = AsyncMock(return_value={"id": "new", "agent_id": "a1"})
+    return sc, calls
+
+
+async def test_a_reader_miss_is_confirmed_against_the_primary() -> None:
+    """A lagged miss must not become a re-registration.
+
+    ``agent_add``'s conflict branch overwrites ``trust_level`` — it protects
+    ``install_id`` and ``owner_install_uuid`` and deliberately does not protect
+    trust. So creating over a live agent silently demotes one that had earned
+    trust, or promotes one sitting at 0 awaiting approval.
+    """
+    from unittest.mock import patch as _patch
+
+    from core_api.services import agent_service
+
+    live = {"id": "x", "agent_id": "a1", "trust_level": 3, "fleet_id": None}
+    sc, calls = _goca_client(reader_returns=None, primary_returns=live)
+
+    with (
+        _patch.object(agent_service, "get_storage_client", return_value=sc),
+        _patch.object(agent_service, "log_action", new_callable=lambda: _AsyncNoop()),
+    ):
+        got = await agent_service.get_or_create_agent("t1", "a1")
+
+    assert calls == [True, False], "a miss must be re-checked against the primary"
+    assert got["trust_level"] == 3, "the live agent must be returned, not re-created"
+    sc.create_or_update_agent.assert_not_awaited()
+
+
+async def test_a_reader_hit_does_not_pay_for_the_primary() -> None:
+    """The trade that makes the fix above affordable.
+
+    This runs on every MCP call and every memory write. Confirming a HIT as
+    well would move that whole population off the replica to fix a case that
+    already ends in a write.
+    """
+    from unittest.mock import patch as _patch
+
+    from core_api.services import agent_service
+
+    live = {"id": "x", "agent_id": "a1", "trust_level": 3, "fleet_id": None}
+    sc, calls = _goca_client(reader_returns=live)
+
+    with _patch.object(agent_service, "get_storage_client", return_value=sc):
+        await agent_service.get_or_create_agent("t1", "a1")
+
+    assert calls == [True], f"hit path asked the primary too: {calls}"
+
+
+class _AsyncNoop:
+    async def __call__(self, *a, **k):
+        return None

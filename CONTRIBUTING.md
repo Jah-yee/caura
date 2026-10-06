@@ -1,0 +1,349 @@
+# Contributing to Caura
+
+Thanks for your interest in contributing! This document covers how to get set
+up, the expected workflow, and how we review changes.
+
+## Ground Rules
+
+- By contributing, you agree that your contributions will be licensed under the
+  [Apache License 2.0](LICENSE).
+- **Sign off every commit** under the [Developer Certificate of Origin](https://developercertificate.org/) (DCO) — see "Sign-off (DCO)" below.
+- **Use [Conventional Commits](https://www.conventionalcommits.org/)** for commit subjects — see "Commit messages" below.
+- Be respectful. See our [Code of Conduct](CODE_OF_CONDUCT.md).
+- For security issues, see [SECURITY.md](SECURITY.md) — do not open a public
+  issue.
+
+## Development Setup
+
+### Prerequisites
+
+- Python 3.12+
+- PostgreSQL 16+ with the `pgvector` extension (or use Docker Compose)
+- Node.js 20+ (only if you're working on the `plugin/` directory)
+- `uv` (recommended) or `pip` for Python dependency management
+
+### Clone and set up a venv
+
+```bash
+git clone https://github.com/caura-ai/caura.git
+cd caura
+uv venv .venv
+source .venv/bin/activate
+uv pip install -e "core-api/[dev]" -e "core-storage-api/[dev]"
+```
+
+### Install the pre-commit hook
+
+One-time setup that makes every `git commit` run `ruff check` and
+`ruff format` — catches formatting regressions before they reach the PR:
+
+```bash
+pip install pre-commit   # or: uv pip install pre-commit
+pre-commit install
+```
+
+The hook is configured in `.pre-commit-config.yaml` and only runs against
+`core-api/src/` and `core-storage-api/src/`. `mypy` is intentionally not in
+the hook (it needs the real project venv to resolve workspace imports
+correctly) — CI runs it authoritatively, and you can run it locally via
+the command under "Run local checks" below.
+
+### Run services locally
+
+The fastest path is Docker Compose:
+
+```bash
+docker compose -f docker-compose.dev.yml up -d
+```
+
+This starts PostgreSQL + pgvector, Redis, and the core API with hot reload.
+
+### Run the test suite
+
+```bash
+pytest tests/ -v
+```
+
+`core-api` also keeps a small unit suite of its own, which needs no database:
+
+```bash
+pytest core-api/tests/ -v
+```
+
+`core-storage-api` has a second suite that needs a **separate database**:
+
+```bash
+pytest core-storage-api/tests/ -v
+```
+
+Two databases, because the suites provision incompatibly and cannot share one:
+`tests/` builds its schema with `Base.metadata.create_all`, while
+`core-storage-api/tests/` runs the real Alembic chain. Run them against one
+database and it breaks in a way that points away from the cause — `create_all`
+leaves tables with no `alembic_version` and none of the chain's migration-only
+objects (e.g. `tenant_suppression`, which has no ORM model), so the storage
+suite's `init_database()` refuses to stamp it and every storage test errors at
+setup. (It used to stamp head and skip every migration, which was worse: nothing
+failed at all.) Run them the other way round and the migrated schema is the one
+that gets polluted.
+
+Each suite defaults to its own database — `caura_test` for `tests/` and
+`caura_storage` for `core-storage-api/tests/` — so no environment variable is
+needed, and neither suite touches the `caura` database the local stack runs
+against. Create them once:
+
+```bash
+createdb caura_test    && psql -d caura_test    -c 'CREATE EXTENSION IF NOT EXISTS vector'
+createdb caura_storage && psql -d caura_storage -c 'CREATE EXTENSION IF NOT EXISTS vector'
+```
+
+`DATABASE_URL` (storage suite) and `TEST_DATABASE_URL` (root suite) override
+them. CI provisions and passes both explicitly.
+
+See `README.md` for more deployment options and environment variable details.
+
+## Workflow
+
+1. **Open an issue first** for anything non-trivial — a bug fix under ~30 lines
+   is fine to submit directly as a PR, but larger changes benefit from
+   discussion before code is written.
+2. **Create a branch** from `main` with a short descriptive name (e.g. `feat/fleet-id-filter`, `fix/plugin-heartbeat`).
+3. **Make your change.** Keep PRs focused — one logical change per PR.
+4. **Add or update tests.** We don't accept new features without tests, and bug
+   fixes should include a regression test.
+5. **Run local checks.** With the pre-commit hook installed, ruff check +
+   ruff format already ran on `git commit`, so you only need:
+   ```bash
+   mypy core-api/src/ core-storage-api/src/
+   pytest tests/ core-api/tests/
+   ```
+   Without the hook, also run ruff by hand:
+   ```bash
+   ruff check core-api/src/ core-api/tests/ core-storage-api/src/
+   ruff format --check core-api/src/ core-api/tests/ core-storage-api/src/
+   mypy core-api/src/ core-storage-api/src/
+   pytest tests/ core-api/tests/
+   ```
+6. **Open a PR against `main`.** Fill out the PR template. Branch protection requires CI green, DCO check green, and ≥1 maintainer approval before merge.
+7. **Respond to review.** Expect at least one round of feedback.
+
+## Commit messages
+
+We use [Conventional Commits](https://www.conventionalcommits.org/). The
+subject line must be `<type>(<optional-scope>): <subject>`, with the
+type drawn from this list:
+
+| Type | Effect on the next release |
+|---|---|
+| `feat` | Minor bump |
+| `fix` | Patch bump |
+| `perf` | Patch bump |
+| `deps` | Patch bump (auto-applied by Dependabot) |
+| `revert` | Patch bump |
+| `docs` | No release impact, surfaces in CHANGELOG |
+| `refactor` | No release impact, surfaces in CHANGELOG |
+| `test`, `build`, `ci`, `chore` | Hidden from CHANGELOG, no release impact |
+
+Append `!` (`feat!: …`) or a `BREAKING CHANGE:` footer for changes
+that break the [Public API](docs/public-api-stability.md) — these
+trigger a major bump once we ship 1.0.0. Before 1.0.0 they're treated
+as minor (`bump-minor-pre-major: true` in `release-please-config.json`).
+
+**Scopes** (optional but encouraged): `core-api`, `core-storage-api`,
+`core-worker`, `plugin`, `common`, `mcp`, `skill`, `e2e`, `benchmarks`,
+`docs`, `ci`.
+
+**Other rules:**
+
+- Subject line under 72 characters, imperative mood ("add X", not "added X").
+- Include context in the body when the change is non-obvious.
+- One logical change per commit.
+
+**Common parser breakers — avoid in subject lines:**
+
+- **Leading ticket identifier** (e.g. `CAURA-129 feat(contradiction): …`).
+  The conventional-commit parser expects the subject to *start* with a
+  type token; anything before `feat`/`fix`/etc. fails with
+  `unexpected token ' '`. Put the ticket id in the **body**
+  (`Closes CAURA-129.`) instead.
+- **Unicode ellipsis `…` (U+2026)** anywhere in the subject. The
+  parser rejects it with the same error class. If GitHub's squash-merge
+  UI truncates a long title with `…`, rewrite the title before merging.
+- **Non-ASCII punctuation generally** (em-dashes `—`, smart quotes
+  `“ ”`). `ruff` will also flag these in code comments; the parser
+  is even less forgiving in commit titles. Use plain `-` and `"`.
+
+**Squash-merge note:** PR titles must themselves be Conventional Commits,
+because the squash-merge commit on `main` is what release-please reads.
+Reviewers will rename PR titles before merging if needed. A single
+un-parseable subject line in the post-tag window can block the entire
+next release from being opened — when in doubt, lean strict.
+
+## Sign-off (DCO)
+
+Every commit must carry a `Signed-off-by:` trailer asserting the
+[Developer Certificate of Origin](https://developercertificate.org/) —
+a one-paragraph statement that you have the right to submit the work
+under the project's license. This is a lightweight alternative to a CLA
+and is what the Linux kernel, Docker, and GitLab use.
+
+Sign off automatically with `git commit -s`:
+
+```bash
+git commit -s -m "feat(plugin): handle CAURA_API_PREFIX override"
+```
+
+Configure once and forget:
+
+```bash
+git config --global format.signoff true
+```
+
+A repo workflow checks every PR for sign-off. PRs without sign-off on
+each commit will fail the DCO check and cannot be merged. If you forget,
+the PR comment will tell you exactly which commits are missing it and
+how to fix it (`git commit --amend -s` for the most recent, or `git rebase`
+for older commits).
+
+## Release process
+
+Releases are cut automatically from `main` by
+[release-please](https://github.com/googleapis/release-please-action).
+On every push to `main` with new `feat:`, `fix:`, etc. commits,
+release-please opens or updates a release PR. Merging the release PR:
+
+1. Tags `vX.Y.Z` and creates a GitHub Release.
+2. Updates `CHANGELOG.md` with everything since the last tag,
+   grouped by Conventional Commit type.
+3. Bumps the version in every pinned file: `VERSION`, every
+   `pyproject.toml`, `plugin/package.json`, `plugin/openclaw.plugin.json`.
+
+You don't bump versions by hand; just write good commit messages.
+
+## Code Style
+
+- Python: `ruff` for linting and formatting, `mypy` for type checking.
+  Configuration lives in `core-api/pyproject.toml` and
+  `core-storage-api/pyproject.toml`.
+- TypeScript (`plugin/`): TypeScript strict mode, `tsc` for type checking.
+- Line length: 110 characters for Python.
+- No trailing whitespace, LF line endings.
+
+## Naming: use Caura, not the old brand
+
+The product renamed to Caura and the codebase is being migrated to match. CI runs
+a ratchet — `scripts/legacy_name_ratchet.py` — that fails any pull request adding
+a line carrying the old brand to a file that did not already have one.
+
+Name new services, secrets, topics, environment variables, files and identifiers
+`caura`. Every old-brand name that lands has to be redirected and supported
+indefinitely, and it removes a rename option that has already been paid for.
+
+Some additions are legitimate: a compatibility alias, a redirect, a test pinning
+the old wire format. Old names stay readable forever, so these are expected.
+Append the marker to the line and it is exempt:
+
+```python
+LEGACY_TOOL_ALIAS = "..."  # legacy-name-ok: permanent shim, plugins pinned to v1
+```
+
+Put the reason after the marker. The marker exempts only its own line, so it
+lands in the diff where a reviewer will see it and can disagree.
+
+It has to be the whole token — `legacy-name-okay` in a sentence does not exempt
+anything — but the casing is up to you, and the reason is asked for rather than
+enforced.
+
+### Three markers: which claim are you making?
+
+`legacy-name-ok` is for something new that **bears** the old name — the alias,
+the redirect, the pinned wire format above.
+
+Often the line is not declaring anything. It just **names** something the rename
+will never reach, and cannot be correct without the literal: a command a reader
+pastes, a path on disk, a mirror URL. Use `legacy-name-floor` instead:
+
+```markdown
+| macOS | `~/Library/Application Support/...` | <!-- legacy-name-floor: the app dir name -->
+```
+
+Sometimes the line names the old spelling only to prove it is **not** there — a
+test asserting the rename landed, where the literal exists to be searched for
+and not found. Neither marker above is true of that: both claim something still
+answers to the name. Use `legacy-name-absent`:
+
+```python
+assert "memclaw_write_bulk" not in tools  # legacy-name-absent: the old tool is gone
+```
+
+All three exempt the line identically — nothing about pass or fail changes, and
+picking the wrong one cannot turn a build red or green. They are counted apart
+so the aliases stay readable: a documentation sweep can easily add ten mentions
+around one alias, and under a single marker that alias is the eleventh line
+nobody reads.
+
+**When alias and floor are both true of one line, use `legacy-name-ok`.** Some lines name a
+frozen thing and declare a dual-read at once — an image tag whose repository
+name is permanent while its version is read from either spelling. One line takes
+one marker, and the alias is the claim rule 3 wants eyes on, so it wins.
+
+`legacy-name-absent` never combines with either: it says nothing on the line
+bears the name, and they say something does. A line that seems to want both is
+one where the alias or floor claim is the real one.
+
+There is a third case, and it takes no marker at all. Ask what breaks if the old
+spelling is not on that line. If the answer is nothing — it is prose that happens
+to name the thing — **reword it and take no exemption.** That is the test the
+floor marker's claim has to pass: reword the line, and if it is still correct,
+the marker was false.
+
+Marking a line exempt frees a slot in that file, so every new exemption is
+printed in the CI output whether the check passes or not. That is deliberate: it
+is the one move the ratchet cannot adjudicate for itself, so it is the one that
+must never be quiet.
+
+To see the current tracked footprint, request an explicit change split, or run
+the gate before pushing:
+
+```bash
+python3 scripts/legacy_name_ratchet.py --report
+python3 scripts/legacy_name_ratchet.py --report --base origin/main
+python3 scripts/legacy_name_ratchet.py --base origin/main
+```
+
+The bare report is inventory only. Add `--json` for the machine-readable form;
+its gated headline is fleet-summable and its present-tree diagnostic is not.
+
+### Keep the old brand out of the commit subject
+
+`release-please` builds `CHANGELOG.md` from merged commit subjects. A subject
+naming the old brand puts that text into a file that had none, so the ratchet
+fails **the release pull request** — not yours, days later, for whoever opens
+the release to debug.
+
+This bites hardest on rebrand work, where naming what you renamed is the natural
+way to describe the change. Describe it without:
+
+| | |
+|---|---|
+| ✗ | `fix(api): the OpenAPI titles four services publish still said <old brand>` |
+| ✓ | `fix(api): the OpenAPI titles four services publish used the previous brand name` |
+
+The changelog entry links the pull request, which carries the detail the subject
+drops.
+
+Only the subject reaches the changelog, so the body is free — put the old name
+there if it helps a reader. And only the changelog-visible types are affected:
+`test`, `build`, `ci` and `chore` are hidden from `CHANGELOG.md` (see the table
+above), so a subject under those cannot reach it.
+
+**This is not fixable after merge.** The subject is immutable, so the only
+remedy is hand-editing the generated entry on the release pull request — and
+`release-please` force-pushes that branch on every merge to `main`, so the edit
+is lost if anything lands before the release goes in. Getting the subject right
+costs nothing; getting it wrong costs a race.
+
+## Questions
+
+For questions that aren't bug reports, use
+[GitHub Discussions](../../discussions) rather than opening an issue.

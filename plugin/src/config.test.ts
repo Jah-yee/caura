@@ -1,0 +1,759 @@
+import { test, describe } from "node:test";
+import assert from "node:assert/strict";
+import { writeFileSync, readFileSync, mkdtempSync, mkdirSync, rmSync } from "fs";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
+import { tmpdir } from "os";
+import {
+  autoFixAllowlist,
+  ensureExtraSkillDirs,
+  isContextEngineSlotClaimed,
+  isCauraAllowed,
+  isCauraFullyConfigured,
+  isMemorySlotClaimed,
+  shouldRunAutoFix,
+  PLUGIN_ID,
+} from "./config.js";
+import { getPluginDir } from "./paths.js";
+import { CAURA_TOOLS } from "./tools.js";
+import { FROZEN_PLUGIN_ID } from "./legacy-contracts.fixture.js";
+
+describe("PLUGIN_ID", () => {
+  // The id lives in two files that are read by different consumers:
+  // openclaw.plugin.json, which OpenClaw's LOADER reads, and config.ts, which
+  // writes the four id-keyed fields in the USER's openclaw.json. Renaming one
+  // and not the other type-checks and leaves every other test in this suite
+  // green, while producing a plugin that writes entries.<new> into a config
+  // OpenClaw still keys as <old> — memory slot never claimed, keystone
+  // injection silently dead. Nothing else in the build compares the two.
+  test("matches the id in openclaw.plugin.json", () => {
+    const manifestPath = join(
+      dirname(fileURLToPath(import.meta.url)),
+      "..",
+      "openclaw.plugin.json",
+    );
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    assert.equal(
+      PLUGIN_ID,
+      FROZEN_PLUGIN_ID,
+      "the plugin id is an existing-install compatibility contract",
+    );
+    assert.equal(
+      FROZEN_PLUGIN_ID,
+      manifest.id,
+      `config.ts PLUGIN_ID ("${PLUGIN_ID}") and openclaw.plugin.json id ` +
+        `("${manifest.id}") must be identical — OpenClaw reads the manifest, ` +
+        `this module writes the user's config, and a mismatch means the memory ` +
+        `slot is never claimed and keystone injection stops with nothing failing.`,
+    );
+  });
+});
+
+// Minimal "happy-path" config scaffold — every predicate true. Individual
+// tests selectively break one field at a time.
+function happyConfig(): Record<string, unknown> {
+  return {
+    plugins: {
+      allow: [FROZEN_PLUGIN_ID],
+      entries: { [FROZEN_PLUGIN_ID]: { enabled: true } },
+      load: { paths: [getPluginDir()] },
+      slots: { memory: FROZEN_PLUGIN_ID, contextEngine: FROZEN_PLUGIN_ID },
+    },
+    tools: { alsoAllow: [] },
+  };
+}
+
+describe("isMemorySlotClaimed", () => {
+  test("false when plugins.slots is missing", () => {
+    const c = happyConfig();
+    delete (c as any).plugins.slots;
+    assert.equal(isMemorySlotClaimed(c), false);
+  });
+
+  test("false when memory slot is held by a different plugin", () => {
+    const c = happyConfig();
+    (c as any).plugins.slots.memory = "memory-core";
+    assert.equal(isMemorySlotClaimed(c), false);
+  });
+
+  test("true when memory slot is held by the legacy plugin id", () => {
+    assert.equal(isMemorySlotClaimed(happyConfig()), true);
+  });
+});
+
+describe("isCauraFullyConfigured", () => {
+  // Paints the Fleet UI dashboard via heartbeat.setup_status.fully_configured.
+  // Each test below corresponds to one of the four conditions that must hold.
+
+  test("true on happy-path config", () => {
+    assert.equal(isCauraFullyConfigured(happyConfig()), true);
+  });
+
+  test("false when the legacy plugin id is not in a restrictive allowlist", () => {
+    // CAURA-000: pre-fix this test used `plugins.allow = []` to mean
+    // "not allowlisted", which assumed empty = restrictive. The
+    // OpenClaw runtime actually treats empty (and missing) as
+    // PERMISSIVE — "no restriction". Use an explicit non-empty
+    // allowlist that excludes the plugin id to express the real
+    // "not allowlisted" case.
+    const c = happyConfig();
+    (c as any).plugins.allow = ["some-other-plugin"];
+    assert.equal(isCauraFullyConfigured(c), false);
+  });
+
+  test("false when the plugin is disabled", () => {
+    const c = happyConfig();
+    (c as any).plugins.entries[FROZEN_PLUGIN_ID].enabled = false;
+    assert.equal(isCauraFullyConfigured(c), false);
+  });
+
+  test("false when plugin path is not loaded", () => {
+    const c = happyConfig();
+    (c as any).plugins.load.paths = [];
+    assert.equal(isCauraFullyConfigured(c), false);
+  });
+
+  test("false when memory slot is not claimed", () => {
+    const c = happyConfig();
+    (c as any).plugins.slots.memory = "memory-core";
+    assert.equal(isCauraFullyConfigured(c), false);
+  });
+});
+
+
+describe("isContextEngineSlotClaimed (CAURA-000 — keystone-injection gate)", () => {
+  // OpenClaw 2026.5.4 dist/registry-DFFgCbcm.js:241 resolveContextEngine
+  // reads config.plugins.slots.contextEngine. Without it set to the plugin id,
+  // OpenClaw uses its default "legacy" engine and our assemble() is never
+  // called — so the <keystone_rules> block never reaches the prompt.
+
+  test("false when plugins.slots is missing", () => {
+    const c = happyConfig();
+    delete (c as any).plugins.slots;
+    assert.equal(isContextEngineSlotClaimed(c), false);
+  });
+
+  test("false when contextEngine slot held by another plugin (e.g. legacy)", () => {
+    const c = happyConfig();
+    (c as any).plugins.slots.contextEngine = "legacy";
+    assert.equal(isContextEngineSlotClaimed(c), false);
+  });
+
+  test("false when contextEngine slot is undefined (the WhatsApp-regression case)", () => {
+    const c = happyConfig();
+    delete (c as any).plugins.slots.contextEngine;
+    assert.equal(isContextEngineSlotClaimed(c), false);
+  });
+
+  test("true when contextEngine slot is held by the legacy plugin id", () => {
+    assert.equal(isContextEngineSlotClaimed(happyConfig()), true);
+  });
+});
+
+describe("isCauraFullyConfigured — contextEngine slot is now required", () => {
+  // Pre-fix happyConfig() didn't include contextEngine and isCauraFullyConfigured
+  // returned true anyway. That hid the WhatsApp keystone-injection regression
+  // because Fleet UI's "fully configured" badge was green while assemble()
+  // silently never ran. Adding the slot to the predicate surfaces the gap.
+
+  test("false when contextEngine slot is missing", () => {
+    const c = happyConfig();
+    delete (c as any).plugins.slots.contextEngine;
+    assert.equal(isCauraFullyConfigured(c), false);
+  });
+
+  test("false when contextEngine slot is held by another plugin", () => {
+    const c = happyConfig();
+    (c as any).plugins.slots.contextEngine = "legacy";
+    assert.equal(isCauraFullyConfigured(c), false);
+  });
+});
+
+describe("shouldRunAutoFix — allowlist drift gate", () => {
+  // The original gate ran auto-fix once (guarded by .allowlist-applied),
+  // so a plugin upgrade that ADDED a tool (caura_keystones) never landed
+  // it in tools.alsoAllow on existing installs — and a later OpenClaw
+  // tools.profile then stripped it. The gate now also re-runs on drift.
+  const clean = {
+    flagExists: true,
+    missingToolCount: 0,
+    contextEngineSlotClaimed: true,
+  };
+
+  test("CAURA_AUTO_FIX_CONFIG=true always runs (explicit force)", () => {
+    assert.equal(shouldRunAutoFix({ ...clean, autoFixEnv: "true" }), true);
+  });
+
+  test("CAURA_AUTO_FIX_CONFIG=false never runs, even with drift", () => {
+    assert.equal(
+      shouldRunAutoFix({
+        autoFixEnv: "false",
+        flagExists: false,
+        missingToolCount: 5,
+        contextEngineSlotClaimed: false,
+      }),
+      false,
+    );
+  });
+
+  test("first run (no flag) runs", () => {
+    assert.equal(shouldRunAutoFix({ ...clean, flagExists: false }), true);
+  });
+
+  test("re-runs when a tool is missing despite the flag (the keystones upgrade case)", () => {
+    assert.equal(shouldRunAutoFix({ ...clean, missingToolCount: 1 }), true);
+  });
+
+  test("re-runs when the contextEngine slot is unclaimed despite the flag", () => {
+    assert.equal(
+      shouldRunAutoFix({ ...clean, contextEngineSlotClaimed: false }),
+      true,
+    );
+  });
+
+  test("no-ops on a clean install with the flag present", () => {
+    assert.equal(shouldRunAutoFix(clean), false);
+  });
+});
+
+
+// ---- isCauraAllowed — permissive allowlist semantics (CAURA-000) ----
+//
+// OpenClaw 2026.6.x treats `plugins.allow` as a STRICT allowlist only when
+// it is BOTH present AND non-empty. A missing or empty array means "no
+// restriction" — every enabled plugin can load. Pre-fix our predicate
+// reported "not allowed" for the empty/missing case, which caused
+// `autoFixAllowlist` to create a singleton allowlist for this plugin — silently converting a
+// permissive config into a restrictive one and locking out built-ins
+// like the bundled `openai` provider plugin.
+
+describe("isCauraAllowed — permissive when allow is missing or empty (CAURA-000)", () => {
+  test("true when plugins.allow is missing entirely (permissive default)", () => {
+    const c: any = { plugins: { entries: {}, load: {}, slots: {} } };
+    assert.equal(isCauraAllowed(c), true);
+  });
+
+  test("true when plugins.allow is an empty array (permissive)", () => {
+    const c: any = { plugins: { allow: [], entries: {}, load: {}, slots: {} } };
+    assert.equal(isCauraAllowed(c), true);
+  });
+
+  test("true when plugins.allow is non-empty AND includes the plugin id", () => {
+    const c: any = {
+      plugins: { allow: [FROZEN_PLUGIN_ID, "browser"], entries: {}, load: {}, slots: {} },
+    };
+    assert.equal(isCauraAllowed(c), true);
+  });
+
+  test("false when plugins.allow is non-empty AND excludes the plugin id (the only real 'not allowed' case)", () => {
+    const c: any = {
+      plugins: { allow: ["browser"], entries: {}, load: {}, slots: {} },
+    };
+    assert.equal(isCauraAllowed(c), false);
+  });
+
+  test("true when plugins object is completely missing (no allowlist to speak of)", () => {
+    const c: any = {};
+    assert.equal(isCauraAllowed(c), true);
+  });
+});
+
+
+// ---- autoFixAllowlist.plugins.allow — non-creation invariant (CAURA-000) ----
+//
+// On a fresh install, autoFixAllowlist must NOT create `plugins.allow` from
+// nothing. Doing so would silently flip the user's permissive OpenClaw
+// config into a restrictive one — the exact mechanism behind the
+// customer-reported "openai disabled after 2.8.1 install" symptom.
+//
+// These tests drive the real `autoFixAllowlist` function against tiny
+// temp `openclaw.json` files and read back the resulting config.
+
+function _autoFixWithConfig(initial: Record<string, unknown>): {
+  written: Record<string, unknown> | null;
+  result: ReturnType<typeof autoFixAllowlist>;
+  cleanup: () => void;
+} {
+  const tmp = mkdtempSync(join(tmpdir(), "caura-autofix-test-"));
+  mkdirSync(join(tmp, ".openclaw"), { recursive: true });
+  const cfgPath = join(tmp, ".openclaw", "openclaw.json");
+  writeFileSync(cfgPath, JSON.stringify(initial), "utf-8");
+  const prevHome = process.env.HOME;
+  process.env.HOME = tmp;
+  const result = autoFixAllowlist({ forceSlotOverride: false });
+  process.env.HOME = prevHome;
+  let written: Record<string, unknown> | null = null;
+  try {
+    written = JSON.parse(readFileSync(cfgPath, "utf-8"));
+  } catch {
+    written = null;
+  }
+  return {
+    written,
+    result,
+    cleanup: () => {
+      try {
+        rmSync(tmp, { recursive: true, force: true });
+      } catch {
+        // best-effort
+      }
+    },
+  };
+}
+
+describe("autoFixAllowlist — plugins.allow non-creation (CAURA-000)", () => {
+  test("does NOT create plugins.allow when it was missing (fresh-install regression)", () => {
+    // Mirrors a vanilla openclaw.json that the user / installer never
+    // touched — no `plugins.allow` field at all. Pre-fix autoFix would
+    // CREATE a single-entry `plugins.allow` for this plugin here, the customer's
+    // observed crash mechanism.
+    const ctx = _autoFixWithConfig({
+      plugins: {
+        // NO `allow` field
+        entries: {},
+        load: { paths: [] },
+        slots: {},
+      },
+      tools: {},
+    });
+    try {
+      const written = ctx.written as any;
+      const allow = written?.plugins?.allow;
+      assert.ok(
+        allow === undefined || (Array.isArray(allow) && allow.length === 0),
+        `expected plugins.allow to stay missing/empty after autoFix; got: ${JSON.stringify(allow)}`,
+      );
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("does NOT push to plugins.allow when it was an explicit empty array", () => {
+    const ctx = _autoFixWithConfig({
+      plugins: {
+        allow: [], // user explicitly set empty = permissive
+        entries: {},
+        load: { paths: [] },
+        slots: {},
+      },
+      tools: {},
+    });
+    try {
+      const written = ctx.written as any;
+      assert.deepEqual(written?.plugins?.allow, [], "empty allow must stay empty");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("DOES add the plugin id to an existing non-empty allowlist that excludes it", () => {
+    // User has explicitly opted into a restrictive allowlist. We must
+    // add the plugin id so this plugin can still load — otherwise
+    // we'd disable our own plugin while leaving the user's allowlist
+    // semantics intact.
+    const ctx = _autoFixWithConfig({
+      plugins: {
+        allow: ["browser", "filesystem"],
+        entries: {},
+        load: { paths: [] },
+        slots: {},
+      },
+      tools: {},
+    });
+    try {
+      const written = ctx.written as any;
+      const allow: string[] = written?.plugins?.allow ?? [];
+      assert.ok(
+        allow.includes(FROZEN_PLUGIN_ID),
+        `expected the plugin id to be added; got: ${JSON.stringify(allow)}`,
+      );
+      assert.ok(allow.includes("browser"), "must preserve existing entries");
+      assert.ok(allow.includes("filesystem"), "must preserve existing entries");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("does NOT add the plugin id twice when already in a non-empty allowlist", () => {
+    const ctx = _autoFixWithConfig({
+      plugins: {
+        allow: ["browser", FROZEN_PLUGIN_ID, "filesystem"],
+        entries: {},
+        load: { paths: [] },
+        slots: {},
+      },
+      tools: {},
+    });
+    try {
+      const written = ctx.written as any;
+      const allow: string[] = written?.plugins?.allow ?? [];
+      assert.equal(
+        allow.filter((p) => p === FROZEN_PLUGIN_ID).length,
+        1,
+        `the plugin id must appear exactly once; got: ${JSON.stringify(allow)}`,
+      );
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ensureExtraSkillDirs — append a dir to OpenClaw's skills.load.extraDirs
+// ---------------------------------------------------------------------------
+
+function _ensureExtraDirsWithConfig(
+  initial: Record<string, unknown> | null,
+  dirsOrFn: string[] | ((home: string) => string[]),
+): {
+  written: Record<string, unknown> | null;
+  result: ReturnType<typeof ensureExtraSkillDirs>;
+  cleanup: () => void;
+} {
+  const tmp = mkdtempSync(join(tmpdir(), "caura-extradirs-test-"));
+  mkdirSync(join(tmp, ".openclaw"), { recursive: true });
+  const cfgPath = join(tmp, ".openclaw", "openclaw.json");
+  if (initial !== null) {
+    writeFileSync(cfgPath, JSON.stringify(initial), "utf-8");
+  }
+  // Resolve dirs against the SAME home the function will see, so a test can
+  // build an absolute path that matches a ``~``-relative config entry.
+  const dirs = typeof dirsOrFn === "function" ? dirsOrFn(tmp) : dirsOrFn;
+  const prevHome = process.env.HOME;
+  process.env.HOME = tmp;
+  const result = ensureExtraSkillDirs(dirs);
+  process.env.HOME = prevHome;
+  let written: Record<string, unknown> | null = null;
+  try {
+    written = JSON.parse(readFileSync(cfgPath, "utf-8"));
+  } catch {
+    written = null;
+  }
+  return {
+    written,
+    result,
+    cleanup: () => {
+      try {
+        rmSync(tmp, { recursive: true, force: true });
+      } catch {
+        // best-effort
+      }
+    },
+  };
+}
+
+describe("ensureExtraSkillDirs", () => {
+  test("creates skills.load.extraDirs and appends the dir when absent", () => {
+    const ctx = _ensureExtraDirsWithConfig({ tools: {} }, ["/srv/shared/skills"]);
+    try {
+      assert.equal(ctx.result.changed, true);
+      assert.deepEqual(ctx.result.added, ["/srv/shared/skills"]);
+      const skills = ctx.written?.skills as { load?: { extraDirs?: string[] } };
+      assert.deepEqual(skills.load?.extraDirs, ["/srv/shared/skills"]);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("preserves existing extraDirs and appends only the missing one", () => {
+    const ctx = _ensureExtraDirsWithConfig(
+      { skills: { load: { extraDirs: ["/already/there"], watch: true } } },
+      ["/srv/shared/skills"],
+    );
+    try {
+      assert.equal(ctx.result.changed, true);
+      assert.deepEqual(ctx.result.added, ["/srv/shared/skills"]);
+      const load = (ctx.written?.skills as { load?: { extraDirs?: string[]; watch?: boolean } })
+        .load;
+      assert.deepEqual(load?.extraDirs, ["/already/there", "/srv/shared/skills"]);
+      assert.equal(load?.watch, true, "other load keys are preserved");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("reports alreadyPresent alongside a newly added dir", () => {
+    const ctx = _ensureExtraDirsWithConfig(
+      { skills: { load: { extraDirs: ["/already/here"] } } },
+      ["/already/here", "/srv/new"],
+    );
+    try {
+      assert.equal(ctx.result.changed, true);
+      assert.deepEqual(ctx.result.added, ["/srv/new"]);
+      assert.deepEqual(ctx.result.alreadyPresent, ["/already/here"]);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("is idempotent — a dir already present is a no-op (no write)", () => {
+    const ctx = _ensureExtraDirsWithConfig(
+      { skills: { load: { extraDirs: ["/srv/shared/skills"] } } },
+      ["/srv/shared/skills"],
+    );
+    try {
+      assert.equal(ctx.result.changed, false);
+      assert.deepEqual(ctx.result.added, []);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("matches an existing ~-relative entry against an absolute dir (no dup)", () => {
+    const ctx = _ensureExtraDirsWithConfig(
+      { skills: { load: { extraDirs: ["~/shared/skills"] } } },
+      (home) => [join(home, "shared", "skills")],
+    );
+    try {
+      assert.equal(ctx.result.changed, false, "~ entry should canonically match the absolute dir");
+      assert.deepEqual(ctx.result.added, []);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("preserves non-string entries already in extraDirs (no data loss)", () => {
+    const ctx = _ensureExtraDirsWithConfig(
+      { skills: { load: { extraDirs: ["/keep/me", 42, { weird: true }] } } },
+      ["/srv/shared/skills"],
+    );
+    try {
+      assert.equal(ctx.result.changed, true);
+      const load = (ctx.written?.skills as { load?: { extraDirs?: unknown[] } }).load;
+      assert.deepEqual(load?.extraDirs, ["/keep/me", 42, { weird: true }, "/srv/shared/skills"]);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("fails safe when openclaw.json is missing — error, no throw", () => {
+    const ctx = _ensureExtraDirsWithConfig(null, ["/srv/shared/skills"]);
+    try {
+      assert.equal(ctx.result.changed, false);
+      assert.ok(ctx.result.error && /not found/.test(ctx.result.error));
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("rejects a top-level JSON array — error, file NOT clobbered", () => {
+    // A top-level array is truthy: a bare !config check would let it through,
+    // then JSON.stringify would silently drop the .skills prop and rewrite [].
+    const ctx = _ensureExtraDirsWithConfig(["/pre/existing"] as unknown as Record<string, unknown>, [
+      "/srv/shared/skills",
+    ]);
+    try {
+      assert.equal(ctx.result.changed, false);
+      assert.ok(ctx.result.error && /not a JSON object/.test(ctx.result.error));
+      assert.deepEqual(ctx.written, ["/pre/existing"], "original array left untouched");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("rejects a malformed non-object skills field — error, not clobbered", () => {
+    const ctx = _ensureExtraDirsWithConfig({ skills: "i am a string" }, ["/srv/shared/skills"]);
+    try {
+      assert.equal(ctx.result.changed, false);
+      assert.ok(ctx.result.error && /'skills' is not an object/.test(ctx.result.error));
+      assert.equal((ctx.written as { skills?: unknown }).skills, "i am a string", "untouched");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("rejects a malformed non-object skills.load field — error, not clobbered", () => {
+    const ctx = _ensureExtraDirsWithConfig({ skills: { load: 42 } }, ["/srv/shared/skills"]);
+    try {
+      assert.equal(ctx.result.changed, false);
+      assert.ok(ctx.result.error && /'skills\.load' is not an object/.test(ctx.result.error));
+      assert.equal((ctx.written as { skills?: { load?: unknown } }).skills?.load, 42, "untouched");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("a relative existing entry is not falsely deduped against an absolute dir", () => {
+    const ctx = _ensureExtraDirsWithConfig(
+      { skills: { load: { extraDirs: ["./rel/skills"] } } },
+      ["/srv/shared/skills"],
+    );
+    try {
+      // Relative entries are compared literally (no CWD guess), so the
+      // absolute dir is treated as distinct and appended; the relative
+      // entry is preserved.
+      assert.equal(ctx.result.changed, true);
+      const load = (ctx.written?.skills as { load?: { extraDirs?: string[] } }).load;
+      assert.deepEqual(load?.extraDirs, ["./rel/skills", "/srv/shared/skills"]);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("empty input is a no-op", () => {
+    const ctx = _ensureExtraDirsWithConfig({ skills: {} }, []);
+    try {
+      assert.equal(ctx.result.changed, false);
+      assert.deepEqual(ctx.result.added, []);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
+// ---- autoFixAllowlist — the fresh install with no openclaw.json yet ----
+//
+// ax-0917-h-10. `tools.alsoAllow` is what makes a registered tool survive an
+// OpenClaw `tools.profile`, and exactly two things in the product ever write
+// it: the install script's step 7, and this function. Both used to give up on
+// the same input — a box where `~/.openclaw/openclaw.json` does not exist yet.
+// The install script prints "you will need to configure allowlist manually"
+// and skips; `autoFixAllowlist` returned `openclaw.json not found` and skipped
+// too, on that boot and on every boot after it (the drift gate re-runs, the
+// read fails again). The result was a fresh install whose 11 tools registered
+// and none of which an agent could call, with the only trace a line in
+// gateway.log naming a file the operator then had to hand-write.
+//
+// The distinction that matters: MISSING is safe to create, UNPARSEABLE is not
+// — `readOpenClawConfig` returns null for both, and overwriting the second
+// would destroy a config we cannot read.
+
+function _autoFixWithoutConfigFile(opts?: { makeOpenClawDir?: boolean }): {
+  written: Record<string, unknown> | null;
+  result: ReturnType<typeof autoFixAllowlist>;
+  /** The temp HOME the call ran under — `getPluginDir()` resolves against
+   *  `homedir()` at call time, so the expected plugin dir has to be built
+   *  from this rather than read back after HOME is restored. */
+  home: string;
+  cleanup: () => void;
+} {
+  const tmp = mkdtempSync(join(tmpdir(), "caura-autofix-nocfg-"));
+  if (opts?.makeOpenClawDir !== false) {
+    mkdirSync(join(tmp, ".openclaw"), { recursive: true });
+  }
+  const cfgPath = join(tmp, ".openclaw", "openclaw.json");
+  const prevHome = process.env.HOME;
+  process.env.HOME = tmp;
+  const result = autoFixAllowlist({ forceSlotOverride: false });
+  process.env.HOME = prevHome;
+  let written: Record<string, unknown> | null = null;
+  try {
+    written = JSON.parse(readFileSync(cfgPath, "utf-8"));
+  } catch {
+    written = null;
+  }
+  return {
+    written,
+    result,
+    home: tmp,
+    cleanup: () => {
+      try {
+        rmSync(tmp, { recursive: true, force: true });
+      } catch {
+        // best-effort
+      }
+    },
+  };
+}
+
+describe("autoFixAllowlist — no openclaw.json yet (ax-0917-h-10)", () => {
+  test("creates the config and leaves every declared tool callable", () => {
+    const ctx = _autoFixWithoutConfigFile();
+    try {
+      assert.equal(
+        ctx.result.error,
+        undefined,
+        `auto-fix must not fail on a missing config; got: ${ctx.result.error}`,
+      );
+      assert.equal(ctx.result.changed, true);
+      const alsoAllow: string[] = (ctx.written as any)?.tools?.alsoAllow ?? [];
+      assert.deepEqual(
+        [...CAURA_TOOLS].filter((t) => !alsoAllow.includes(t)),
+        [],
+        "every tool the plugin registers must be in tools.alsoAllow — a name " +
+          "that is missing here is a tool no agent can call on a fresh install",
+      );
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("the created config also claims both slots and the load path", () => {
+    // alsoAllow alone is not a working install: without the memory slot
+    // register() is never called, and without contextEngine the keystone
+    // block never reaches the prompt. The created file must be the same
+    // config the install script writes, so no hand-editing is left over.
+    const ctx = _autoFixWithoutConfigFile();
+    try {
+      const w = ctx.written as any;
+      assert.equal(w?.plugins?.slots?.memory, FROZEN_PLUGIN_ID);
+      assert.equal(w?.plugins?.slots?.contextEngine, FROZEN_PLUGIN_ID);
+      assert.equal(w?.plugins?.entries?.[FROZEN_PLUGIN_ID]?.enabled, true);
+      const expectedPluginDir = join(ctx.home, ".openclaw", "plugins", FROZEN_PLUGIN_ID);
+      assert.ok(
+        (w?.plugins?.load?.paths ?? []).includes(expectedPluginDir),
+        `expected ${expectedPluginDir} on load.paths; got ${JSON.stringify(w?.plugins?.load?.paths)}`,
+      );
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("creating the config still does NOT create plugins.allow (CAURA-000)", () => {
+    // The create path must not be a back door around the non-creation
+    // invariant: a one-entry `plugins.allow` would flip a permissive
+    // OpenClaw install into a restrictive one that locks out every other
+    // plugin, which is the customer-reported "openai disabled" crash.
+    const ctx = _autoFixWithoutConfigFile();
+    try {
+      const allow = (ctx.written as any)?.plugins?.allow;
+      assert.ok(
+        allow === undefined || (Array.isArray(allow) && allow.length === 0),
+        `expected no plugins.allow on the created config; got: ${JSON.stringify(allow)}`,
+      );
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("creates ~/.openclaw when the directory does not exist either", () => {
+    const ctx = _autoFixWithoutConfigFile({ makeOpenClawDir: false });
+    try {
+      assert.equal(ctx.result.error, undefined);
+      const alsoAllow: string[] = (ctx.written as any)?.tools?.alsoAllow ?? [];
+      assert.equal(alsoAllow.length, CAURA_TOOLS.length);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  test("refuses to overwrite a config that is present but unparseable", () => {
+    // The other half of the null return. Creating here would silently
+    // replace a config we could not read — losing every unrelated
+    // OpenClaw setting in it.
+    const tmp = mkdtempSync(join(tmpdir(), "caura-autofix-bad-"));
+    mkdirSync(join(tmp, ".openclaw"), { recursive: true });
+    const cfgPath = join(tmp, ".openclaw", "openclaw.json");
+    const corrupt = '{ "plugins": { "allow": ["browser"] ';
+    writeFileSync(cfgPath, corrupt, "utf-8");
+    const prevHome = process.env.HOME;
+    process.env.HOME = tmp;
+    const result = autoFixAllowlist({ forceSlotOverride: false });
+    process.env.HOME = prevHome;
+    try {
+      assert.equal(result.changed, false);
+      assert.match(String(result.error), /could not be parsed/);
+      assert.equal(
+        readFileSync(cfgPath, "utf-8"),
+        corrupt,
+        "the unreadable config must be left byte-for-byte alone",
+      );
+    } finally {
+      try {
+        rmSync(tmp, { recursive: true, force: true });
+      } catch {
+        // best-effort
+      }
+    }
+  });
+});

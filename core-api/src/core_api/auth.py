@@ -1,0 +1,869 @@
+import hmac
+import logging
+
+from fastapi import HTTPException, Request, Security
+from fastapi.security import APIKeyHeader
+
+from core_api import errors
+from core_api.agent_ids import AgentIdentity, canonical_service_agent_id
+from core_api.audit_actor import SURFACE_HEADER, actor_detail, parse_surface
+from core_api.config import settings
+from core_api.constants import API_KEY_HEADER
+from core_api.errors import coded_detail
+from core_api.heartbeat.clients import record as _record_client_family
+from core_api.suppression import is_tenant_suppressed
+from core_api.tenant_context import set_current_tenant, set_readable_tenants
+
+logger = logging.getLogger(__name__)
+
+api_key_header = APIKeyHeader(name=API_KEY_HEADER, auto_error=False)
+
+
+def get_admin_key() -> str | None:
+    """Return the configured admin key (prefers admin_api_key, falls back to legacy api_key)."""
+    return settings.admin_api_key or settings.api_key
+
+
+class AuthContext:
+    """Holds the authenticated identity.
+
+    OSS auth paths:
+    1. Admin API key (ADMIN_API_KEY)      → is_admin=True, tenant_id=None
+    2. Caura API key (CAURA_API_KEY)      → gates all non-admin access when set
+    3. Standalone mode                     → tenant_id from config, org_role="admin"
+    4. X-Tenant-ID header (enterprise)    → tenant_id from header
+
+    Multi-tenant reads:
+    An agent may be authorized to read from tenants beyond its home tenant.
+    ``readable_tenant_ids`` is the full set the caller may read from (always
+    includes ``tenant_id``). Writes are always scoped to ``tenant_id``.
+    ``capabilities`` constrains the mutation gate; when not None, ``write``
+    must be in the set for any mutating call to succeed. Cross-tenant
+    credentials typically carry ``{read, write}`` capabilities; the
+    "writes pin to home" semantics come from ``enforce_tenant`` on the
+    write target — not from a structural absence of write capability.
+    """
+
+    def __init__(
+        self,
+        tenant_id: str | None,
+        is_demo: bool = False,
+        is_admin: bool = False,
+        user_id: str | None = None,
+        org_id: str | None = None,
+        org_role: str | None = None,
+        agent_id: AgentIdentity | None = None,
+        agent_id_verified: bool = False,
+        is_read_only: bool = False,
+        is_install_credential: bool = False,
+        install_uuid: str | None = None,
+        readable_tenant_ids: list[str] | None = None,
+        capabilities: set[str] | None = None,
+        # Back-compat alias — older callers still pass ``scopes``.
+        scopes: set[str] | None = None,
+        surface: str | None = None,
+        is_person: bool = False,
+    ):
+        self.tenant_id = tenant_id
+        self.is_demo = is_demo
+        self.is_admin = is_admin
+        # A signed-in person, not an agent or a machine key. Only Path 4 sets
+        # it: the gateway stamped ``X-Org-Role``, which it does for a session or
+        # JWT and never for an API key of any kind, and named no agent. The
+        # standalone paths give every caller ``org_role="admin"``, agents
+        # included, so ``org_role`` alone can't tell a person apart; this can.
+        # A person sees every memory scope in a tenant they can read (the Prism
+        # decision record, §3), so the list reads in ``routes/memories`` skip
+        # the ``scope_agent`` filter for one. Without a gateway secret the
+        # header is the caller's claim, as ``X-Tenant-ID`` is there, and that
+        # reaches no new row: a credential that names no agent can already
+        # list any agent's private rows by passing that agent's id.
+        self.is_person = is_person
+        # The person the gateway vouched for (``X-User-ID``), set on Path 4
+        # behind the gateway secret only; None everywhere else. For the audit
+        # trail: see ``core_api.audit_actor``.
+        self.user_id = user_id
+        # The allow-listed ``X-Caura-Surface``: which Caura client sent the
+        # request. The client's own claim, so metrics and audit only. No gate
+        # may read it.
+        self.surface = surface
+        self.org_id = org_id
+        self.org_role = org_role  # "admin" | "member" | None
+        self.agent_id = agent_id  # enterprise: set from X-Agent-ID header
+        # PROVENANCE of ``agent_id``, not its presence: True only where the
+        # identity was ESTABLISHED for the request rather than asserted by the
+        # caller. Today exactly one path can say yes — Path 4, where the
+        # gateway resolved the credential and injected ``X-Agent-ID`` behind
+        # the ``X-Gateway-Secret`` perimeter check.
+        #
+        # WHY IT IS A SEPARATE FIELD and not something a reader can infer from
+        # ``agent_id``. ``auth.py`` builds that attribute from the same raw
+        # header on Path 2 as on Path 4, so its truthiness answers "did the
+        # caller name an agent", which is a different question from "is that
+        # name trustworthy". Every gate that only needs the first question
+        # keeps reading ``agent_id`` and is unaffected; a gate whose decision
+        # turns on the second must read THIS. ``routes/keystones`` is the one
+        # such gate today (oss-0922-m-03) — its trust floor was skipping the
+        # anti-spoof bump for a shared-key holder because presence read as
+        # proof. See ``docs/plans/rest-mcp-agent-identity-asymmetry.md``.
+        #
+        # Deliberately NOT "did the caller send a gateway secret": on a
+        # deployment that configures none, Path 4 already trusts the identity
+        # headers by design, and making this field disagree with that posture
+        # would restrict OSS without closing a privilege boundary that exists.
+        # That is a separate decision, recorded as the strict variant in the
+        # doc above.
+        self.agent_id_verified = agent_id_verified
+        # Set by the enterprise gateway when the org has exceeded plan limits
+        # after a subscription cancellation. Blocks creates/updates but allows
+        # deletes (so users can reduce usage) and reads.
+        self.is_read_only = is_read_only
+        # True when the gateway authenticated the call with a caura-daemon
+        # install credential (kind=install_credential; HMAC-derived
+        # ``mci_v1_`` prefix on the wire — intentional carve-out from
+        # the unified ``mc_`` surface for retry idempotency). Drives
+        # bulk-write relaxation for broker-mode callers — they don't
+        # drive an ``X-Bulk-Attempt-Id`` header and don't have an
+        # ``agent_id`` on the wire.
+        self.is_install_credential = is_install_credential
+        self.install_uuid = install_uuid
+        # Tenants this caller may READ from. Always non-empty when tenant_id
+        # is set; equal to ``[tenant_id]`` for single-tenant keys.
+        if readable_tenant_ids:
+            self.readable_tenant_ids = list(readable_tenant_ids)
+            if tenant_id and tenant_id not in self.readable_tenant_ids:
+                self.readable_tenant_ids.insert(0, tenant_id)
+        else:
+            self.readable_tenant_ids = [tenant_id] if tenant_id else []
+        # Capability set. None = full (legacy/admin keys). When a set
+        # is provided, callers must pass ``write`` for any mutating
+        # operation. ``scopes`` is accepted as a back-compat alias so
+        # older AuthContext(scopes=...) callers keep working.
+        self.capabilities = capabilities if capabilities is not None else scopes
+        # Legacy alias retained as a read-only view so old code that
+        # still reads ``ctx.scopes`` keeps functioning during the
+        # deprecation window. Aliasing rather than dual storage prevents
+        # the two from drifting apart.
+        self.scopes = self.capabilities
+
+    @property
+    def is_cross_tenant_read(self) -> bool:
+        """True if this auth context can read from more than its home tenant."""
+        return len(self.readable_tenant_ids) > 1
+
+    def source_tenants_for_audit(self) -> list[str]:
+        """Return tenants whose data was widened into for this request,
+        excluding the home tenant.
+
+        Hook for the per-use cross-tenant-read audit event. Wired into
+        recall/search/list/stats/document-read handlers — they call
+        this after a widened query, pass the result count breakdown,
+        and the ``log_cross_tenant_read`` helper in
+        ``services/audit_service.py`` emits one event per source tenant
+        via the same async-batched queue ``log_action`` uses.
+
+        Each emitted event has:
+          action=cross_tenant_read
+          tenant_id=<source tenant>           # logged TO this tenant
+          detail={
+            home_tenant_id: self.tenant_id,
+            home_agent_id: self.agent_id,
+            query_summary: <truncated query>,
+            result_count_from_this_tenant: <int>,
+          }
+
+        Returns ``[]`` for single-tenant credentials so single-tenant
+        callers pay zero overhead. The emission helper is also a no-op
+        on empty input — the audit pipeline trusts this method to
+        gate.
+        """
+        if not self.is_cross_tenant_read or not self.tenant_id:
+            return []
+        return [t for t in self.readable_tenant_ids if t != self.tenant_id]
+
+    def audit_actor(self) -> dict[str, str | None]:
+        """The ``user_id`` and ``surface`` keys for a write's audit ``detail``."""
+        return actor_detail(self.user_id, self.surface)
+
+    def enforce_read_only(self) -> None:
+        """Raise 403 if the caller is not allowed to mutate state.
+
+        Two unconditional read-only signals, both checked here so every
+        write-shaped endpoint that already calls this gate is covered
+        without needing per-site edits:
+
+        - ``is_demo`` → demo sandbox is read-only.
+        - ``capabilities`` is set and does NOT include ``write`` → the
+          credential is read-only by construction (a credential minted
+          with capabilities={'read'} — e.g., a viewer or reporting
+          credential). Legacy credentials (capabilities=None) pass
+          through unchanged.
+
+        Usage-limit / plan-cap enforcement is intentionally separate
+        (``enforce_usage_limits``) because the delete path is allowed
+        to bypass usage-limit blocks; demo + capability blocks have no
+        such carve-out.
+
+        Note: a cross-tenant credential with ``capabilities={read,
+        write}`` PASSES this gate — its restriction is "writes pin to
+        home_tenant_id", which is enforced by ``enforce_tenant`` on
+        the write target, not here.
+        """
+        if self.is_demo:
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    errors.AUTH_DEMO_SANDBOX,
+                    "Demo sandbox is read-only.",
+                    remediation="Use a real tenant credential to write.",
+                ),
+            )
+        if self.capabilities is not None and "write" not in self.capabilities:
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    errors.AUTH_READ_ONLY_KEY,
+                    "This API key is read-only and cannot perform write operations.",
+                    remediation=(
+                        "This is a property of the CREDENTIAL, not of the endpoint or "
+                        "of tenant keys in general — mint a key with the 'write' "
+                        "capability (Settings → Organization → API Credentials) and "
+                        "retry the same call."
+                    ),
+                ),
+            )
+
+    def enforce_usage_limits(self) -> None:
+        """Raise 403 if the org is over its plan limits (read-only mode).
+
+        Use on create/update endpoints. Do NOT use on delete endpoints — users
+        in read-only mode must be able to delete data to get back under limits.
+        Demo mode (is_demo) is enforced separately via enforce_read_only().
+        """
+        if self.is_read_only:
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    errors.AUTH_PLAN_LIMIT,
+                    "Organization is in read-only mode: usage exceeds plan limits. "
+                    "Upgrade your plan or delete data to restore write access.",
+                    remediation="Deletes stay permitted so you can get back under the limit.",
+                ),
+            )
+
+    def enforce_admin(self) -> None:
+        """Raise 403 unless the caller is the system super admin."""
+        if not self.is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    errors.AUTH_ADMIN_REQUIRED,
+                    "Admin access required",
+                    remediation="This endpoint needs the system admin key; a tenant or agent credential cannot reach it.",
+                ),
+            )
+
+    @property
+    def is_org_admin(self) -> bool:
+        """Whether the caller may act on org-admin surfaces.
+
+        Two credentials qualify and they arrive by different routes: the
+        system admin key (``is_admin``, auth Path 1) and a user principal the
+        gateway stamped ``X-Org-Role: admin`` (``org_role``, Path 4). Callers
+        that need one of these needed BOTH checks, and wrote them inline —
+        ``skills_inbox`` twice and ``documents`` once, each as
+        ``bool(getattr(auth, "is_admin", False)) or getattr(auth, "org_role",
+        None) == "admin"``.
+
+        Three hand-written copies of one predicate is how the two halves drift
+        apart, and the ``getattr`` spelling hid that ``auth`` is always a real
+        ``AuthContext`` here. There was also a fourth copy — an
+        ``enforce_org_admin()`` raiser that every one of those callers bypassed
+        in favour of its own error code, and that no route ever called. It is
+        gone; this property is what the live callers share. A route that wants
+        to REFUSE rather than branch should raise its own coded 403, which is
+        what all three already do.
+        """
+        return bool(self.is_admin) or self.org_role == "admin"
+
+    def enforce_not_agent_credential(self, action: str = "perform this action") -> None:
+        """Raise 403 if the caller is an agent-scoped credential.
+
+        Agent management (trust level, fleet, deletion) and org settings are
+        admin-plane operations. An agent-scoped credential (the enterprise
+        gateway injects ``X-Agent-ID`` only for ``kind=agent_key``) must not be
+        able to escalate its own trust_level, relocate its fleet, delete peer
+        agents, or rewrite tenant settings — otherwise the trust ladder is
+        self-defeating. Tenant/user/admin credentials (no ``X-Agent-ID``) are
+        unaffected, so the dashboard and admin tooling keep working without
+        depending on ``org_role`` being plumbed on the gateway auth branch.
+        """
+        if self.is_admin:
+            return
+        if self.agent_id:
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    errors.AUTH_AGENT_CREDENTIAL_FORBIDDEN,
+                    f"Agent-scoped credentials cannot {action}; use an admin credential.",
+                    action=action,
+                ),
+            )
+
+    def enforce_not_org_member(self, action: str) -> None:
+        """Raise 403 if the gateway stamped the caller ``X-Org-Role: member``.
+
+        Org settings and agent trust, fleet and deletion are org-admin
+        surfaces, like the Skills Inbox actions ``is_org_admin`` gates (L-72).
+        This refuses only an explicit member, not "anyone short of
+        ``is_org_admin``": a caller with no org role (the CAURA_API_KEY path,
+        a gateway credential stamped without one) keeps the access
+        ``enforce_not_agent_credential`` gives it.
+        """
+        if self.org_role == "member":
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    errors.AUTH_ORG_ADMIN_REQUIRED,
+                    f"Org members cannot {action}; ask an org admin.",
+                    action=action,
+                ),
+            )
+
+    def enforce_self_agent(
+        self,
+        requested_agent_id: str | None,
+        *,
+        field: str = "agent_id",
+        message: str | None = None,
+    ) -> None:
+        """Raise 403 if an agent credential named an agent other than itself.
+
+        The self plane, a third question from the two gates above it:
+        ``enforce_read_only`` asks whether this credential may write at all,
+        ``enforce_not_agent_credential`` refuses agent credentials outright, and
+        this one admits an agent credential but only as ITSELF. Self-service
+        routes — tune your own profile, read your own notes — are exactly the
+        ones that must NOT take ``enforce_not_agent_credential``, since it would
+        refuse the callers they exist for, and no caller of this one does. It is
+        orthogonal to the write gate rather than paired with it: the write paths
+        among them also call ``enforce_read_only``, the read paths do not.
+
+        ``field`` names the offending parameter in the default message and rides
+        along in ``error.details`` either way, so a caller that sent two of them
+        can tell which one was refused. ``message`` replaces the whole sentence
+        where a route has something more specific to say; the two are
+        independent, since ``field`` reaches the caller regardless.
+
+        ``None`` passes, and only ``None`` — an omission means the caller
+        asserted no identity, which each route treats as "use the authenticated
+        identity" or as a deliberately wider aggregate. An explicit empty string
+        is an assertion and is refused. Both spellings that can produce one bind
+        ``""`` rather than ``None`` (measured: ``?agent_id=`` on a required or
+        optional ``Query``, and ``{"filter_agent_id": ""}`` in a JSON body — the
+        body is the likelier source, from a serializer that emits empty strings
+        for unset fields).
+
+        Admin credentials are exempt with no special case: ``get_auth_context``
+        returns ``AuthContext(tenant_id=None, is_admin=True)`` on the admin-key
+        branch and never plumbs ``X-Agent-ID`` into it, so the first clause
+        declines to fire. Pinned in ``tests/test_auth_context.py`` against that
+        real branch rather than a hand-built context, which would only have
+        pinned the constructor default.
+
+        ``services/caller_identity.py`` spells the same predicate and
+        deliberately answers it the other way — it logs the mismatch and lets
+        the verified identity win instead of refusing. It is not a missing
+        caller of this gate; the routes behind it want an override.
+        """
+        if (
+            self.agent_id
+            and requested_agent_id is not None
+            and canonical_service_agent_id(requested_agent_id) != canonical_service_agent_id(self.agent_id)
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    errors.AUTH_AGENT_IDENTITY_MISMATCH,
+                    message
+                    or (
+                        f"{field} '{requested_agent_id}' does not match the "
+                        f"authenticated agent identity '{self.agent_id}'."
+                    ),
+                    field=field,
+                ),
+            )
+
+    def effective_agent_id(self, requested_agent_id: str | None) -> AgentIdentity | None:
+        """The agent this request ACTS AS: the authenticated identity, or the
+        caller's assertion only when the credential authenticates none.
+
+        The precedence half of the self plane, where ``enforce_self_agent`` is
+        the refusing half. Routes that must not 403 a legitimate caller use
+        this instead: an agent credential silently keeps its own identity, and
+        a tenant or user credential — which authenticates no agent — may still
+        name one, which is what a dashboard listing a fleet does.
+
+        WHY THIS IS A METHOD AND NOT ``self.agent_id or requested``. It is
+        exactly that expression; the value is entirely in the name. The bare
+        form could not be told from an audit-log line of the same shape, so
+        ``tests/test_authz_gate_inventory.py`` had to delete the rule that
+        credited it — the block above ``SELF_ID_PARAMS`` there has the case in
+        full, and is the copy to keep current.
+
+        SCOPE, because the name is broader than the guarantee. This returns the
+        identity; it does not decide what the caller may do with it, and
+        calling it is not authorization. It is for the visibility or
+        authorization identity ONLY — an audit attribution that must record
+        what the request carried, even when authorization ignored it, is a
+        different value and must keep spelling itself out. ``delete_memory`` is
+        the live example of both in one handler, and is deliberately not
+        converted — pinned by
+        ``test_the_audit_attribution_is_not_bound_by_the_helper``, so this
+        paragraph is a rule rather than a request.
+        """
+        resolved = self.agent_id or requested_agent_id
+        # ``is not None``, not truthiness: an explicit ``""`` assertion is
+        # PRESERVED here (pinned by test_auth_context.py), because
+        # ``enforce_self_agent`` treats it as an assertion and refuses it.
+        # Collapsing it to None would read as "no assertion" instead.
+        return AgentIdentity(canonical_service_agent_id(resolved)) if resolved is not None else None
+
+    def enforce_tenant(self, requested_tenant: str | None) -> None:
+        """Raise if the caller may not write to ``requested_tenant``.
+
+        403 on a genuine mismatch — but a match is only meaningful between two
+        concrete tenants. ``None == None`` is the absence of both a target and
+        a scope, not authorization, and the bare equality below would read it
+        as a pass. That pairing is reachable: the ``CAURA_API_KEY`` path (auth
+        Path 2) builds ``AuthContext(tenant_id=None)`` for a valid key sent
+        without an ``x-tenant-id`` header, and several write bodies carry
+        ``tenant_id: str | None`` — so a request that omits the tenant reaches
+        here as ``enforce_tenant(None)`` on a tenantless context and, before
+        this guard, was authorized with no scope at all.
+
+        Naming no tenant is a 400 — a request problem, since the credential is
+        authenticated (the same call the sanctioned ``_require_tenant`` makes
+        for #987). Every other unmatched case, including a tenantless
+        non-admin naming a real tenant, stays a 403.
+        """
+        if self.is_admin:
+            return  # super admin bypass
+        if requested_tenant is None:
+            raise HTTPException(
+                status_code=400,
+                detail=coded_detail(
+                    errors.AUTH_TENANT_REQUIRED,
+                    "This operation must name a tenant.",
+                    remediation="Supply the target tenant_id on the request.",
+                ),
+            )
+        if self.tenant_id != requested_tenant:
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    errors.AUTH_TENANT_MISMATCH,
+                    f"API key is not authorized for tenant '{requested_tenant}'",
+                    requested_tenant=requested_tenant,
+                    remediation="The credential is valid; it is bound to a different tenant.",
+                ),
+            )
+
+    def enforce_readable_tenant(self, requested_tenant: str) -> None:
+        """Raise 403 unless the caller may READ from the requested tenant.
+
+        Use on read-shaped endpoints that accept an explicit tenant_id. For
+        single-tenant keys this is equivalent to ``enforce_tenant``; for
+        cross-tenant keys it permits any tenant in ``readable_tenant_ids``.
+        """
+        if self.is_admin:
+            return
+        if requested_tenant not in self.readable_tenant_ids:
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    errors.AUTH_TENANT_NOT_READABLE,
+                    f"API key is not authorized to read tenant '{requested_tenant}'",
+                    requested_tenant=requested_tenant,
+                ),
+            )
+
+    def enforce_cross_tenant_read(self) -> None:
+        """Raise 403 unless this credential may read beyond its home tenant.
+
+        The gate for admin-plane, cross-tenant read artifacts (e.g. the cached
+        agent-activity digest at GET /api/v1/reports/agent-activity). Strict by
+        design: a single-tenant key never qualifies — those callers reach the
+        report through the enterprise org-report proxy, which is org-admin-gated
+        and itself holds a cross-tenant read credential. ``is_admin`` (the
+        internal super-admin key) always passes.
+
+        Bounding *which* tenants remains ``enforce_readable_tenant`` per target;
+        this only asserts the credential has cross-tenant read at all.
+        """
+        if self.is_admin:
+            return
+        if not self.is_cross_tenant_read:
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    errors.AUTH_CROSS_TENANT_REQUIRED,
+                    "Cross-tenant read privileges are required for this report.",
+                ),
+            )
+
+    def enforce_write_scope(self) -> None:
+        """Raise 403 if this credential's capabilities exclude ``write``.
+
+        No-op for credentials without an explicit capability set (legacy
+        + admin paths keep working unchanged). Standalone helper for
+        the niche case where a handler wants a finer-grained check than
+        ``enforce_read_only`` (which also covers ``is_demo``).
+        """
+        if self.capabilities is None:
+            return
+        if "write" not in self.capabilities:
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    errors.AUTH_READ_ONLY_KEY,
+                    "This API key is read-only and cannot perform write operations.",
+                    remediation=(
+                        "A property of the credential, not of the endpoint — mint a key "
+                        "with the 'write' capability and retry."
+                    ),
+                ),
+            )
+
+
+def _parse_csv_header(value: str | None) -> list[str]:
+    """Parse a comma-separated header value into a stripped, non-empty list."""
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+async def _block_if_suppressed(tenant_id: str | None) -> None:
+    """Raise 403 if the tenant's enterprise org has been soft-deleted.
+
+    CAURA-694 boundary guard. The check is cached (30 s TTL, see
+    :mod:`core_api.suppression`) so the hot-path cost is one dict lookup
+    per request. Admin and tenant-less paths are skipped by the
+    ``tenant_id`` guard.
+
+    The 403 message is intentionally generic — surfacing
+    "soft-deleted" to the caller risks leaking org lifecycle state to
+    a partner whose key was provisioned under that org. "Suspended"
+    is the user-visible posture the dashboard already shows.
+    """
+    if not tenant_id:
+        return
+    if await is_tenant_suppressed(tenant_id):
+        raise HTTPException(
+            status_code=403,
+            # Deliberately says nothing more. The generic wording is the point —
+            # see this function's docstring — so the code carries the machine
+            # signal without the message leaking org lifecycle state.
+            detail=coded_detail(
+                errors.AUTH_ORG_SUSPENDED,
+                "Organization is suspended; access denied.",
+            ),
+        )
+
+
+async def _block_if_any_readable_suppressed(tenant_id: str | None, readable_tenants: list[str]) -> None:
+    """Apply :func:`_block_if_suppressed` to every cross-tenant read in
+    ``readable_tenants``, skipping the home ``tenant_id`` (which the
+    caller already checked).
+
+    Bot review round 2 on PR #244 (🟢 Low): a multi-tenant credential
+    whose readable set spans a suppressed org would otherwise pass the
+    home-only guard. The enterprise ingress should already exclude
+    suppressed tenants from this list, but defence-in-depth at the OSS
+    boundary means we don't rely on that. The cache makes each extra
+    check one dict lookup per tenant per 30 s.
+    """
+    for rt in readable_tenants:
+        if rt and rt != tenant_id:
+            await _block_if_suppressed(rt)
+
+
+def _stash_request_tenant(request: Request, tenant_id: str) -> None:
+    """Best-effort: record the resolved tenant on ``request.state`` so the
+    request-observation middleware can attribute capability usage to an org.
+
+    Guarded because some unit tests invoke ``get_auth_context`` with a
+    lightweight fake request object that has no Starlette ``state``; a real
+    ``Request`` always does. Failure here must never break auth.
+    """
+    try:
+        request.state.tenant_id = tenant_id
+    except AttributeError:
+        pass
+
+
+def _set_rate_limit_key(request: Request, value: str) -> None:
+    """Name the request's rate-limit bucket after what auth verified (L-69).
+
+    The limiter buckets by this value, hashed, and by client IP when auth named
+    none: a header nothing checked must not name a bucket, or a fresh made-up
+    value per request is a fresh budget per request. Guarded like
+    ``_stash_request_tenant``; failure here must never break auth.
+    """
+    try:
+        request.state.rate_limit_key = value
+    except AttributeError:
+        pass
+
+
+def _gateway_rate_limit_key(request: Request, tenant_id: str) -> str:
+    """The bucket for a request the gateway authenticated (Path 4 behind the secret).
+
+    Core-api cannot tell which credential the gateway accepted: its auth
+    subrequest tries a JWT bearer, then the session cookie, then ``X-API-Key``,
+    and forwards all of them unchanged. So a credential names the bucket only
+    when it is the request's sole one (``X-API-Key`` or ``Authorization``, and no
+    cookie), since the gateway can only have accepted that. Otherwise the bucket
+    is the identity the gateway set, which it overwrites on every request like
+    ``X-Agent-ID`` and ``X-Org-Role``: tenant, user, agent and install.
+    """
+    api_key = request.headers.get("x-api-key") or ""
+    authorization = request.headers.get("authorization") or ""
+    if not request.headers.get("cookie") and bool(api_key) != bool(authorization):
+        bearer = authorization[len("Bearer ") :] if authorization.startswith("Bearer ") else ""
+        if api_key or bearer:
+            return f"credential:{api_key or bearer}"
+    identity = [request.headers.get(h) or "" for h in ("x-user-id", "x-agent-id", "x-install-uuid")]
+    return "identity:" + "|".join([tenant_id, *identity])
+
+
+async def get_auth_context(
+    request: Request,
+    key: str | None = Security(api_key_header),
+) -> AuthContext:
+    ctx = await _resolve_auth_context(request, key)
+    # On every path, unlike the identity headers: it names the client, not the
+    # caller, and nothing may trust it. An unknown value is dropped, never 4xx.
+    ctx.surface = parse_surface(request.headers.get(SURFACE_HEADER))
+    # Anonymous heartbeat: count the client family (by User-Agent prefix)
+    # once the caller is authenticated. One prefix match, and a no-op unless
+    # the heartbeat policy enabled the counter at boot — the raw header is
+    # never stored. See core_api.heartbeat.clients.
+    _record_client_family(request.headers.get("user-agent"))
+    return ctx
+
+
+async def _resolve_auth_context(request: Request, key: str | None) -> AuthContext:
+    admin_key = get_admin_key()
+    # Enterprise gateway injects X-Agent-ID when the caller's credential
+    # is agent-scoped (kind=agent_key). Constructed here rather than left a bare
+    # string because this header IS the REST plane's authentication boundary —
+    # the twin of ``mcp_server``'s ``_agent_id_var`` — and every ``AuthContext``
+    # built below carries this one value. This module is still on the mypy
+    # ``ignore_errors`` list, so nothing here would have forced the step; making
+    # it explicit is what keeps the boundary visible (and recorded in
+    # ``tests/test_agent_identity_construction.py``) until the exemption goes.
+    _agent_header = request.headers.get("x-agent-id") or None
+    agent_id = AgentIdentity(_agent_header) if _agent_header else None
+    # Enterprise gateway injects X-Org-Read-Only: true when the org has
+    # exceeded plan limits after a subscription cancellation. In standalone
+    # and OSS-direct paths the header is absent, so enforcement is a no-op.
+    is_read_only = request.headers.get("x-org-read-only", "").lower() == "true"
+    # Multi-tenant read support: the gateway plumbs the set of tenants this
+    # caller may read from. Absent header → single-tenant key (defaults to
+    # [tenant_id] inside AuthContext). Present → AuthContext.readable_tenant_ids
+    # widens to the union, while writes still target tenant_id.
+    readable_tenants = _parse_csv_header(request.headers.get("x-readable-tenant-ids"))
+    # Capabilities plumbed alongside readable tenants. Empty/absent →
+    # None (full scope, legacy behavior). X-Capabilities is the
+    # canonical header from the unified auth-api; X-Key-Scopes is
+    # accepted as a back-compat alias during the gateway rollout
+    # window so an old gateway running against a new core-api (or
+    # vice versa) doesn't break auth.
+    capability_list = _parse_csv_header(
+        request.headers.get("x-capabilities") or request.headers.get("x-key-scopes")
+    )
+    capabilities: set[str] | None = set(capability_list) if capability_list else None
+
+    # ── Path 1: Admin API key ──
+    if key and admin_key and hmac.compare_digest(key, admin_key):
+        _set_rate_limit_key(request, f"credential:{key}")
+        set_current_tenant(None)  # Admin — RLS bypass
+        return AuthContext(tenant_id=None, is_admin=True)
+
+    # ── Path 2: CAURA_API_KEY gate (optional, for network-exposed OSS) ──
+    #
+    # Every ``AuthContext`` below leaves ``agent_id_verified`` at its default
+    # of False, and that is the substance of this path rather than an
+    # omission: the shared key proves the caller may REACH this deployment,
+    # not which agent it is — it is tenant-wide and binds no agent identity.
+    # ``agent_id`` is still plumbed, because the caller naming itself is
+    # useful and several gates (``enforce_delete``,
+    # ``enforce_not_agent_credential``) only FIRE when it is set, so clearing
+    # it here would loosen them. The MCP plane states the same conclusion at
+    # ``mcp_server.py:448`` and keeps ``via_gateway`` False for it.
+    mclaw_key = settings.memclaw_api_key  # legacy-name-ok: live compatibility field
+    if mclaw_key:
+        if key and hmac.compare_digest(key, mclaw_key):
+            _set_rate_limit_key(request, f"credential:{key}")
+            # Valid Caura key — resolve tenant from standalone or header
+            if settings.is_standalone:
+                from core_api.standalone import get_standalone_tenant_id
+
+                tenant_id = get_standalone_tenant_id()
+                await _block_if_suppressed(tenant_id)
+                set_current_tenant(tenant_id)
+                _stash_request_tenant(request, tenant_id)
+                return AuthContext(tenant_id=tenant_id, org_role="admin", agent_id=agent_id)
+            tenant_id = request.headers.get("x-tenant-id")
+            if tenant_id:
+                await _block_if_suppressed(tenant_id)
+                # ``readable_tenants`` is typically not set on this
+                # branch today, but apply the cross-tenant guard for
+                # symmetry with Path 4 so a future widening of this
+                # path picks up the protection automatically. Bot
+                # review round 2 on PR #244.
+                await _block_if_any_readable_suppressed(tenant_id, readable_tenants)
+                set_current_tenant(tenant_id)
+                _stash_request_tenant(request, tenant_id)
+                return AuthContext(
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    is_read_only=is_read_only,
+                )
+            set_current_tenant(None)
+            return AuthContext(tenant_id=None, agent_id=agent_id)
+        # Key configured but not provided or wrong — reject
+        if not key:
+            raise HTTPException(
+                status_code=401,
+                detail=coded_detail(
+                    errors.AUTH_MISSING_API_KEY,
+                    "Missing API key. Include X-API-Key header.",
+                ),
+            )
+        raise HTTPException(
+            status_code=401,
+            detail=coded_detail(
+                errors.AUTH_INVALID_API_KEY,
+                "Invalid API key.",
+                remediation="The key was sent but did not match. Check for a truncated paste or a rotated key.",
+            ),
+        )
+
+    # ── Path 3: Standalone mode (no key required) ──
+    if settings.is_standalone:
+        from core_api.standalone import get_standalone_tenant_id
+
+        tenant_id = get_standalone_tenant_id()
+        await _block_if_suppressed(tenant_id)
+        set_current_tenant(tenant_id)
+        _stash_request_tenant(request, tenant_id)
+        return AuthContext(tenant_id=tenant_id, org_role="admin")
+
+    # ── Path 4: X-Tenant-ID header (set by enterprise nginx / ingress) ──
+    tenant_id = request.headers.get("x-tenant-id")
+    if tenant_id:
+        # Perimeter check: this path TRUSTS the X-Tenant-ID / X-Agent-ID /
+        # X-Readable-Tenant-IDs headers with no credential of its own — safe
+        # only when the request came through the gateway. When a shared secret
+        # is configured, require the gateway-injected ``X-Gateway-Secret`` so a
+        # caller hitting core-api directly (e.g. its public run.app URL) cannot
+        # impersonate a tenant by setting the identity headers itself. No-op
+        # when unset (OSS / standalone / dev).
+        gw_secret = settings.gateway_shared_secret
+        if gw_secret and not hmac.compare_digest(request.headers.get("x-gateway-secret") or "", gw_secret):
+            raise HTTPException(
+                status_code=401,
+                detail=coded_detail(
+                    errors.AUTH_GATEWAY_ONLY,
+                    "Direct access to this service is not permitted.",
+                    remediation="Route the request through the public gateway host.",
+                ),
+            )
+        if gw_secret:
+            # Through the gateway. Without a secret these headers are the
+            # caller's own and name no bucket, so the limiter falls back to IP.
+            _set_rate_limit_key(request, _gateway_rate_limit_key(request, tenant_id))
+        await _block_if_suppressed(tenant_id)
+        # Cross-tenant credentials carry a list of readable tenants via
+        # ``X-Readable-Tenant-IDs``. The home tenant was just checked
+        # above; verify each additional readable tenant is also live
+        # so a partner key whose readable set spans a suppressed org
+        # can't reach that org's data. Bot review round 2 on PR #244.
+        await _block_if_any_readable_suppressed(tenant_id, readable_tenants)
+        # The gateway's /_auth subrequest plumbs the api_key's ``kind``
+        # so this layer can branch on credential provenance without
+        # an extra DB hop. ``install_credential`` is what caura-daemon
+        # uses; ``user_api_key`` (the default) is the dashboard /
+        # SDK path.
+        credential_kind = (request.headers.get("x-caura-credential-kind") or "").lower()
+        is_install_credential = credential_kind == "install_credential"
+        install_uuid = request.headers.get("x-install-uuid") or None
+        # Org-level role of the human principal behind the request
+        # (``org_members``: "admin" | "member"), plumbed by the
+        # gateway's /_auth subrequest from the session row / JWT
+        # claim. Drives the admin gates on operator surfaces (e.g.
+        # the Skills Inbox actions). Read on THIS branch only: the
+        # header is trustworthy exactly when the request came through
+        # the gateway — enforced by the X-Gateway-Secret check above
+        # when configured, and the gateway overwrites any
+        # client-supplied X-Org-Role via proxy_set_header. (Without a
+        # secret, this path already trusts X-Tenant-ID itself, so
+        # X-Org-Role adds no new spoofing surface.) Values outside
+        # the org-membership model are dropped, not forwarded —
+        # downstream ``== "admin"`` gates must never see a smuggled
+        # third role. Agent-credential requests carry no org
+        # membership, so the auth service never emits the header for
+        # them and API keys stay unable to act on admin-only routes.
+        org_role_raw = (request.headers.get("x-org-role") or "").strip().lower()
+        org_role = org_role_raw if org_role_raw in ("admin", "member") else None
+        # The person behind a dashboard session or JWT. The gateway sets
+        # ``X-User-ID`` from its /_auth subrequest on every request, and sends
+        # none for an API key of any kind. Stricter than the headers above,
+        # which this path trusts with or without a secret: the value is only
+        # recorded in the audit trail, and the trail must not name a person on
+        # the caller's word. Without the secret nothing shows the gateway set
+        # it, so it is dropped, as the rate-limit bucket drops it.
+        user_id = ((request.headers.get("x-user-id") or "").strip() or None) if gw_secret else None
+        set_current_tenant(tenant_id)
+        _stash_request_tenant(request, tenant_id)
+        # When the gateway plumbs a multi-tenant read set, expose it to the
+        # DB layer so reads (and downstream RLS policies, when configured)
+        # can widen. The home tenant is prepended to keep the set complete.
+        if readable_tenants:
+            combined: list[str] = [tenant_id]
+            for t in readable_tenants:
+                if t != tenant_id:
+                    combined.append(t)
+            set_readable_tenants(combined)
+        else:
+            set_readable_tenants(None)
+        return AuthContext(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            org_role=org_role,
+            is_person=org_role is not None and agent_id is None,
+            agent_id=agent_id,
+            # The only path that may claim it: the gateway resolved the
+            # credential and injected ``X-Agent-ID`` itself, behind the
+            # perimeter check above (and it overwrites any client-supplied
+            # value via proxy_set_header, the same reason X-Org-Role is read
+            # on this branch alone).
+            agent_id_verified=True,
+            is_read_only=is_read_only,
+            is_install_credential=is_install_credential,
+            install_uuid=install_uuid,
+            readable_tenant_ids=readable_tenants or None,
+            capabilities=capabilities,
+        )
+
+    # No tenant header + no admin key configured = reject.
+    # Unscoped access without authentication is not allowed.
+    raise HTTPException(
+        status_code=401,
+        detail=coded_detail(
+            errors.AUTH_MISSING_TENANT_CONTEXT,
+            "Missing API key or X-Tenant-ID header.",
+        ),
+    )

@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Generate the event-subscription manifest consumed by infra provisioning checks.
+
+The manifest maps each deployed service to the exact set of Pub/Sub topics it
+subscribes to in **PubSub / SaaS deployment mode** — i.e. the topics for which a
+``${env}-<service>--<topic>`` subscription must exist in the infrastructure
+(see caura-enterprise ``terraform/.../pubsub``). It is the contract that
+lets the enterprise repo's ``check_pubsub_provisioning.py`` fail CI when OSS adds
+a consumed topic without the matching Terraform subscription — the gap that took
+staging down when an insights-requested lifecycle topic shipped unprovisioned.
+
+Lifecycle topics are captured **dynamically** by invoking the real registration
+helpers against a recording bus, so a new ``bus.subscribe`` added to a helper is
+picked up automatically (the manifest-drift test then forces a regen, which the
+enterprise check turns into a provisioning requirement).
+
+This script depends only on the ``common`` package (always importable), never on
+the per-service packages — OSS CI installs only a subset of them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import sys
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+from common.events import lifecycle_handlers, suppression_handlers
+from common.events.topics import Topics, renamed
+
+MANIFEST_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "common"
+    / "events"
+    / "events_manifest.json"
+)
+
+# Subscriptions registered by each service's own ``register_consumers()``
+# (core-api/src/core_api/consumer.py and core-worker/src/core_worker/consumer.py)
+# rather than by a shared helper in ``common.events.lifecycle_handlers``. They are
+# listed explicitly here rather than captured dynamically because OSS CI does not
+# install the worker package, so it cannot be imported in this generator. If you
+# add a direct ``bus.subscribe`` in a service's register_consumers(), add it here
+# too — ``test_direct_subscribes_match_consumer_files`` enforces that.
+#
+# Mostly memory-pipeline topics, but not exclusively: a LIFECYCLE topic lands here
+# when its consumer is registered directly instead of through a helper. The
+# embed-backfill sweep is registered in core-worker because the work lives in
+# ``core_worker.backfill``, which core-api — implementing the same lifecycle
+# adapter protocol — cannot run.
+_DIRECT_SUBSCRIBES: dict[str, list[str]] = {
+    "core-api": [str(Topics.Memory.ENRICHED), str(Topics.Memory.EMBEDDED)],
+    "core-worker": [
+        str(Topics.Lifecycle.EMBED_BACKFILL_REQUESTED),
+        str(Topics.Memory.EMBED_REQUESTED),
+        str(Topics.Memory.ENRICH_REQUESTED),
+    ],
+}
+
+# Which shared registration helpers each service invokes in PubSub/SaaS mode.
+# core-api registers the LLM pipeline ops; core-worker registers the SQL archive
+# ops and the org-suppression mirror. (In OSS-standalone/InProcess mode core-api
+# also registers the archive ops, but that path provisions no Pub/Sub
+# subscriptions, so it is out of scope here.)
+#
+# Not only ``lifecycle_handlers``: this used to be, and
+# ``suppression_handlers.register_suppression_consumer`` fell through every
+# mechanism as a result. It is not a direct ``bus.subscribe`` in a consumer
+# file, so ``test_direct_subscribes_match_consumer_files`` could not see it
+# either, and ``caura.org.suppression-changed`` was consumed by core-worker
+# while absent from the manifest the enterprise provisioning check reads.
+# ``test_every_subscribing_helper_module_is_registered_here`` now fails when a
+# new module starts subscribing without being listed.
+# ``Callable[[Any], None]``, not ``Callable[[object], None]``: each helper takes
+# its own concrete adapter type, and Callable is CONTRAVARIANT in its argument,
+# so a ``Callable[[PipelineStorageAdapter], None]`` is not a subtype of one
+# taking ``object``. Any is the accurate description of a deliberately
+# heterogeneous registry, rather than a claim every helper accepts anything.
+_SHARED_REGISTRARS: dict[str, list[Callable[[Any], None]]] = {
+    "core-api": [lifecycle_handlers.register_pipeline_consumers],
+    "core-worker": [
+        lifecycle_handlers.register_archive_consumers,
+        suppression_handlers.register_suppression_consumer,
+    ],
+}
+
+
+class _RecordingBus:
+    """Minimal bus stand-in that records the topics passed to ``subscribe``."""
+
+    def __init__(self) -> None:
+        self.topics: list[str] = []
+
+    def subscribe(self, topic: str, handler: object) -> None:
+        self.topics.append(str(topic))
+
+
+def _capture_helper_topics(register: Callable[[object], None]) -> list[str]:
+    bus = _RecordingBus()
+    # Each helper resolves the bus via a module-level ``get_event_bus()``, so
+    # patch the name where THAT helper binds it. Resolved from the function's
+    # own module rather than hardcoded: pinning it to ``lifecycle_handlers`` is
+    # what made this mechanism silently unavailable to every other helper
+    # module — the patch would have applied to the wrong module and the real
+    # bus would have been called.
+    module = sys.modules[register.__module__]
+    with mock.patch.object(module, "get_event_bus", return_value=bus):
+        register(
+            object()
+        )  # helpers only capture the adapter in a partial; never call it
+    return bus.topics
+
+
+def build_manifest() -> dict:
+    services: dict[str, list[str]] = {}
+    # Union both keysets so each dict is independently authoritative — a service
+    # added to one but not the other must not be silently dropped.
+    for service in sorted(set(_SHARED_REGISTRARS) | set(_DIRECT_SUBSCRIBES)):
+        topics: set[str] = set(_DIRECT_SUBSCRIBES.get(service, []))
+        for register in _SHARED_REGISTRARS.get(service, []):
+            topics.update(_capture_helper_topics(register))
+        # Brand rename: list the renamed twin of every consumed topic, whether
+        # or not dual-subscribe is switched on anywhere yet.
+        #
+        # This manifest states what infrastructure a service MAY need, not what
+        # one process happens to be doing — the enterprise check turns it into a
+        # provisioning requirement. Listing the twins here is what forces the
+        # Terraform to be in place BEFORE the flag can be turned on in any
+        # environment, which is the ordering that keeps a pull loop off a
+        # subscription that does not exist. Generating from the live flag
+        # instead would make the manifest depend on the generating process's
+        # environment, and would drop the requirement precisely when it is
+        # still needed.
+        topics.update(renamed(topic) for topic in tuple(topics))
+        services[service] = sorted(topics)
+    return {
+        "_comment": (
+            "Generated by scripts/gen_events_manifest.py — do not edit by hand. "
+            "Maps each deployed service to the Pub/Sub topics it subscribes to in "
+            "PubSub/SaaS mode; consumed by caura-enterprise's "
+            "check_pubsub_provisioning.py. Regenerate with: "
+            "python scripts/gen_events_manifest.py"
+        ),
+        "services": services,
+    }
+
+
+def _serialize(manifest: dict) -> str:
+    return json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit non-zero if the committed manifest is stale instead of writing it.",
+    )
+    args = parser.parse_args()
+
+    manifest = build_manifest()
+    rendered = _serialize(manifest)
+
+    if args.check:
+        if not MANIFEST_PATH.exists():
+            print(
+                f"ERROR: {MANIFEST_PATH} is missing; run scripts/gen_events_manifest.py",
+                file=sys.stderr,
+            )
+            return 1
+        current = MANIFEST_PATH.read_text(encoding="utf-8")
+        if current != rendered:
+            diff = "".join(
+                difflib.unified_diff(
+                    current.splitlines(keepends=True),
+                    rendered.splitlines(keepends=True),
+                    fromfile=str(MANIFEST_PATH),
+                    tofile="regenerated",
+                )
+            )
+            print(
+                f"ERROR: {MANIFEST_PATH.name} is stale. Run: python scripts/gen_events_manifest.py\n{diff}",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"{MANIFEST_PATH.name} is up to date.")
+        return 0
+
+    MANIFEST_PATH.write_text(rendered, encoding="utf-8")
+    print(f"Wrote {MANIFEST_PATH}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

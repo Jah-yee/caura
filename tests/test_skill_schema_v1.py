@@ -1,0 +1,1554 @@
+"""Skill Factory Phase 0 acceptance tests (SF-008).
+
+Pure-unit coverage — no DB required. Exercises the
+:mod:`core_api.services.skill_lifecycle.validate_and_normalize_skill_write`
+contract and the configuration plumbing
+(:mod:`core_api.services.organization_settings`) introduced by
+SF-002 + SF-006.
+
+Maps to plan §15 Phase 0 acceptance criteria:
+
+  - ``caura_doc`` ``op=write`` against ``skills`` with
+    ``description > 160 bytes`` returns 422
+  - ``caura_doc`` ``op=write`` against ``skills`` without
+    ``name``/``slug``/``description``/``domain``/``kind``/``source``
+    returns 422
+  - ``kind='update'`` rejects on hash mismatch (409) and on missing
+    live target (404)
+  - ``source='forge'`` is rejected from non-Forge callers (403)
+  - ``status='active'`` is rejected from non-admin callers (403)
+  - eToro pointer-only docs (no content field) are still
+    representable post-migration (source='imported' skips the
+    content-presence requirement)
+
+Integration tests against a live storage-api + the migration apply
+path live separately under ``tests/integration/`` and are not
+required to pass in this file.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import pathlib
+
+import pytest
+from fastapi import HTTPException
+
+from core_api.services.skill_lifecycle import (
+    ADMIN_ONLY_SOURCES,
+    ADMIN_ONLY_STATUSES,
+    ALLOWED_KINDS,
+    ALLOWED_SOURCES,
+    ALLOWED_STATUSES,
+    INTERNAL_ONLY_SOURCES,
+    INTERNAL_ONLY_STATUSES,
+    PROTECTED_LIVE_STATUSES,
+    REQUIRED_TOP_LEVEL_KEYS,
+    SYSTEM_ONLY_STATUSES,
+    SkillWriteContext,
+    validate_and_normalize_skill_write,
+)
+
+# --- Test fixtures --------------------------------------------------------
+
+
+def _agent_ctx(**overrides) -> SkillWriteContext:
+    """Regular agent (non-admin, non-Forge) caller."""
+    base = {
+        "caller_agent_id": "alice",
+        "is_admin": False,
+        "is_internal_forge": False,
+    }
+    base.update(overrides)
+    return SkillWriteContext(**base)
+
+
+def _admin_ctx(**overrides) -> SkillWriteContext:
+    base = {
+        "caller_agent_id": "admin-bob",
+        "is_admin": True,
+        "is_internal_forge": False,
+    }
+    base.update(overrides)
+    return SkillWriteContext(**base)
+
+
+def _forge_ctx(**overrides) -> SkillWriteContext:
+    base = {
+        "caller_agent_id": "forge",
+        "is_admin": False,
+        "is_internal_forge": True,
+    }
+    base.update(overrides)
+    return SkillWriteContext(**base)
+
+
+def _valid_doc(**overrides) -> dict:
+    """A minimally valid skills-write body — happy-path baseline.
+    Tests override individual keys to provoke specific failures.
+    """
+    base = {
+        "name": "Test Skill",
+        "slug": "test-skill",
+        "description": "Short trigger description.",
+        "domain": "dev",
+        "kind": "create",
+        "source": "agent",
+        "content": "## When to use\nStep 1.\nStep 2.\n",
+    }
+    base.update(overrides)
+    return base
+
+
+# --- Enums + constants ----------------------------------------------------
+
+
+@pytest.mark.unit
+class TestEnumConstants:
+    def test_allowed_sources(self):
+        assert frozenset({"forge", "agent", "manual", "imported"}) == ALLOWED_SOURCES
+
+    def test_allowed_kinds(self):
+        assert frozenset({"create", "update"}) == ALLOWED_KINDS
+
+    def test_allowed_statuses(self):
+        # Mirrors plan §5 lifecycle states.
+        assert (
+            frozenset(
+                {
+                    "candidate",
+                    "staged",
+                    "active",
+                    "rejected",
+                    "quarantined",
+                    "stale",
+                    "deprecated",
+                }
+            )
+            == ALLOWED_STATUSES
+        )
+
+    def test_admin_only_partitions(self):
+        # source/status RBAC partitioning is mutually exclusive — no
+        # value can be both admin-only AND internal-only.
+        assert ADMIN_ONLY_SOURCES.isdisjoint(INTERNAL_ONLY_SOURCES)
+        assert ADMIN_ONLY_STATUSES.isdisjoint(INTERNAL_ONLY_STATUSES)
+        assert ADMIN_ONLY_SOURCES <= ALLOWED_SOURCES
+        assert INTERNAL_ONLY_SOURCES <= ALLOWED_SOURCES
+        assert ADMIN_ONLY_STATUSES <= ALLOWED_STATUSES
+        assert INTERNAL_ONLY_STATUSES <= ALLOWED_STATUSES
+
+    def test_system_only_statuses_partition(self):
+        # System-managed terminal/hold states. Disjoint from admin and
+        # internal sets — system-only means "no HTTP caller may set
+        # these directly". Subset of ALLOWED_STATUSES.
+        assert (
+            frozenset({"quarantined", "rejected", "stale", "deprecated"})
+            == SYSTEM_ONLY_STATUSES
+        )
+        assert SYSTEM_ONLY_STATUSES.isdisjoint(ADMIN_ONLY_STATUSES)
+        assert SYSTEM_ONLY_STATUSES.isdisjoint(INTERNAL_ONLY_STATUSES)
+        assert SYSTEM_ONLY_STATUSES <= ALLOWED_STATUSES
+
+    def test_required_keys_contract(self):
+        # The schema contract the route promises agents.
+        assert "name" in REQUIRED_TOP_LEVEL_KEYS
+        assert "slug" in REQUIRED_TOP_LEVEL_KEYS
+        assert "description" in REQUIRED_TOP_LEVEL_KEYS
+        assert "domain" in REQUIRED_TOP_LEVEL_KEYS
+
+
+# --- Adjustment 1: schema validator hook ----------------------------------
+
+
+@pytest.mark.unit
+class TestSchemaValidator:
+    @pytest.mark.parametrize("missing_key", list(REQUIRED_TOP_LEVEL_KEYS))
+    @pytest.mark.asyncio
+    async def test_missing_required_field_rejected(self, missing_key):
+        doc = _valid_doc()
+        doc.pop(missing_key)
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(doc, ctx=_agent_ctx())
+        assert exc.value.status_code == 422
+        assert missing_key in str(exc.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_invalid_slug_rejected(self):
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(slug="UPPER_CASE_SLUG"), ctx=_agent_ctx()
+            )
+        assert exc.value.status_code == 422
+        assert "slug" in str(exc.value.detail).lower()
+
+    @pytest.mark.asyncio
+    async def test_invalid_kind_rejected(self):
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(kind="patch"), ctx=_agent_ctx()
+            )
+        assert exc.value.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_invalid_source_rejected(self):
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(source="bogus"), ctx=_agent_ctx()
+            )
+        assert exc.value.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_tags_must_be_list_of_strings(self):
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(tags=[1, 2, 3]), ctx=_agent_ctx()
+            )
+        assert exc.value.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_non_dict_data_rejected(self):
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                "not-a-dict",  # type: ignore[arg-type]
+                ctx=_agent_ctx(),
+            )
+        assert exc.value.status_code == 422
+
+
+# --- Adjustment 2: description cap ----------------------------------------
+
+
+@pytest.mark.unit
+class TestDescriptionCap:
+    @pytest.mark.asyncio
+    async def test_default_cap_is_160_bytes(self):
+        # 161 bytes — one over the default 160 cap.
+        doc = _valid_doc(description="A" * 161)
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(doc, ctx=_agent_ctx())
+        assert exc.value.status_code == 422
+        assert "160" in str(exc.value.detail) or "bytes" in str(exc.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_at_exact_cap_allowed(self):
+        # 160 bytes — exactly at the cap, must pass.
+        doc = _valid_doc(description="A" * 160)
+        out, _ = await validate_and_normalize_skill_write(doc, ctx=_agent_ctx())
+        assert out["description"] == "A" * 160
+
+    @pytest.mark.asyncio
+    async def test_multibyte_chars_count_as_bytes_not_codepoints(self):
+        # The cap is in UTF-8 BYTES, not character count. Three-byte
+        # codepoints (e.g. "€" = 3 bytes) burn through faster.
+        char = "€"  # 3 UTF-8 bytes each
+        s = char * 54  # 162 bytes > 160
+        with pytest.raises(HTTPException):
+            await validate_and_normalize_skill_write(
+                _valid_doc(description=s), ctx=_agent_ctx()
+            )
+        s_ok = char * 53  # 159 bytes
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(description=s_ok), ctx=_agent_ctx()
+        )
+        assert out["description"] == s_ok
+
+    @pytest.mark.asyncio
+    async def test_configurable_cap_via_ctx(self):
+        # A tenant lowers the cap to 40 bytes via org settings.
+        ctx = _agent_ctx(description_max_bytes=40)
+        with pytest.raises(HTTPException):
+            await validate_and_normalize_skill_write(
+                _valid_doc(description="A" * 41), ctx=ctx
+            )
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(description="A" * 40), ctx=ctx
+        )
+        assert out["description"] == "A" * 40
+
+
+# --- Adjustment 3: body cap -----------------------------------------------
+
+
+@pytest.mark.unit
+class TestBodyCap:
+    @pytest.mark.asyncio
+    async def test_default_body_cap_40k(self):
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(content="A" * (40_000 + 1)), ctx=_agent_ctx()
+            )
+        assert exc.value.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_content_required_for_non_imported(self):
+        doc = _valid_doc()
+        del doc["content"]
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(doc, ctx=_agent_ctx())
+        assert exc.value.status_code == 422
+        assert "content" in str(exc.value.detail).lower()
+
+    @pytest.mark.asyncio
+    async def test_content_must_be_string(self):
+        with pytest.raises(HTTPException):
+            await validate_and_normalize_skill_write(
+                _valid_doc(content={"not": "a string"}), ctx=_agent_ctx()
+            )
+
+
+# --- Adjustment 4: source defaulting + RBAC -------------------------------
+
+
+@pytest.mark.unit
+class TestSourceRbac:
+    @pytest.mark.asyncio
+    async def test_source_forge_rejected_from_agent(self):
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(source="forge"), ctx=_agent_ctx()
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_source_forge_rejected_from_admin(self):
+        # Even admin can't mint source=forge via API — it's reserved
+        # for the internal lifecycle worker.
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(source="forge"), ctx=_admin_ctx()
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_source_forge_allowed_from_internal_forge(self):
+        # The internal Forge worker IS allowed.
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(source="forge"), ctx=_forge_ctx()
+        )
+        assert out["source"] == "forge"
+
+    @pytest.mark.asyncio
+    async def test_source_manual_rejected_from_agent(self):
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(source="manual"), ctx=_agent_ctx()
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_source_manual_allowed_from_admin(self):
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(source="manual"), ctx=_admin_ctx()
+        )
+        assert out["source"] == "manual"
+
+    @pytest.mark.asyncio
+    async def test_source_agent_allowed_from_everyone(self):
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(source="agent"), ctx=_agent_ctx()
+        )
+        assert out["source"] == "agent"
+
+    @pytest.mark.asyncio
+    async def test_source_imported_pointer_only_path(self):
+        """eToro 1,402 pointer-only docs (no content) survive
+        post-migration as source='imported'. This is the
+        backwards-compat path."""
+        doc = _valid_doc(source="imported")
+        del doc["content"]
+        out, _ = await validate_and_normalize_skill_write(doc, ctx=_admin_ctx())
+        assert out["source"] == "imported"
+        assert "content_hash" not in out  # nothing to hash
+
+
+# --- Adjustment 5: status defaulting + RBAC -------------------------------
+
+
+@pytest.mark.unit
+class TestStatusRbac:
+    @pytest.mark.asyncio
+    async def test_status_defaults_to_staged_for_agent(self):
+        doc = _valid_doc()
+        # No status in body.
+        out, _ = await validate_and_normalize_skill_write(doc, ctx=_agent_ctx())
+        assert out["status"] == "staged"
+
+    @pytest.mark.asyncio
+    async def test_status_defaults_to_candidate_for_forge(self):
+        doc = _valid_doc(source="forge")
+        out, _ = await validate_and_normalize_skill_write(doc, ctx=_forge_ctx())
+        assert out["status"] == "candidate"
+
+    @pytest.mark.asyncio
+    async def test_status_active_rejected_from_agent(self):
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(status="active"), ctx=_agent_ctx()
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_status_active_allowed_from_admin(self):
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(source="manual", status="active"), ctx=_admin_ctx()
+        )
+        assert out["status"] == "active"
+
+    @pytest.mark.asyncio
+    async def test_status_candidate_rejected_from_agent(self):
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(status="candidate"), ctx=_agent_ctx()
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_invalid_status_rejected(self):
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(status="bogus"), ctx=_agent_ctx()
+            )
+        assert exc.value.status_code == 422
+
+    @pytest.mark.parametrize("system_status", sorted(SYSTEM_ONLY_STATUSES))
+    @pytest.mark.asyncio
+    async def test_system_only_status_rejected_from_agent(self, system_status):
+        """Regular agent cannot mint quarantined / rejected / stale /
+        deprecated directly. These are system-managed transitions
+        (Sentinel, Inbox Reject, hash-binding, deprecation flow)."""
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(status=system_status), ctx=_agent_ctx()
+            )
+        assert exc.value.status_code == 403
+        assert "system-managed" in str(exc.value.detail).lower()
+
+    @pytest.mark.parametrize("system_status", sorted(SYSTEM_ONLY_STATUSES))
+    @pytest.mark.asyncio
+    async def test_system_only_status_rejected_from_admin(self, system_status):
+        # Even an admin cannot mint these directly. They land via the
+        # internal lifecycle flow only.
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(source="manual", status=system_status), ctx=_admin_ctx()
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.parametrize("system_status", sorted(SYSTEM_ONLY_STATUSES))
+    @pytest.mark.asyncio
+    async def test_system_only_status_rejected_from_forge(self, system_status):
+        # The internal Forge worker can mint ``candidate`` but cannot
+        # mint terminal/hold states either — the lifecycle worker for
+        # those (Sentinel + Inbox + drift detector) is separate.
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(source="forge", status=system_status), ctx=_forge_ctx()
+            )
+        assert exc.value.status_code == 403
+
+
+# --- Adjustment 6: auto-fill server-controlled fields ---------------------
+
+
+@pytest.mark.unit
+class TestAutoFill:
+    @pytest.mark.asyncio
+    async def test_content_hash_computed(self):
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(content="hello world"), ctx=_agent_ctx()
+        )
+        # Same content → same hash, prefixed.
+        assert out["content_hash"].startswith("sha256:")
+        # Deterministic.
+        out2, _ = await validate_and_normalize_skill_write(
+            _valid_doc(content="hello world"), ctx=_agent_ctx()
+        )
+        assert out["content_hash"] == out2["content_hash"]
+
+    @pytest.mark.asyncio
+    async def test_origin_agent_id_overrides_client_value(self):
+        # The client tries to claim agent_id='attacker'; server
+        # overrides with the auth context.
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(origin={"agent_id": "attacker"}),
+            ctx=_agent_ctx(caller_agent_id="alice"),
+        )
+        assert out["origin"]["agent_id"] == "alice"
+
+    @pytest.mark.asyncio
+    async def test_origin_other_fields_preserved(self):
+        # session_key, run_id, message_id are client-provided and
+        # should pass through unchanged.
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(
+                origin={"session_key": "sk-1", "run_id": "r-2", "message_id": "m-3"}
+            ),
+            ctx=_agent_ctx(caller_agent_id="alice"),
+        )
+        assert out["origin"]["session_key"] == "sk-1"
+        assert out["origin"]["run_id"] == "r-2"
+        assert out["origin"]["message_id"] == "m-3"
+        assert out["origin"]["agent_id"] == "alice"
+
+    @pytest.mark.asyncio
+    async def test_timestamps_filled(self):
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(), ctx=_agent_ctx()
+        )
+        assert "created_at" in out
+        assert "updated_at" in out
+
+    @pytest.mark.asyncio
+    async def test_updated_at_always_server_set(self):
+        # Client supplies their own updated_at — server overwrites.
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(updated_at="1970-01-01T00:00:00+00:00"),
+            ctx=_agent_ctx(),
+        )
+        assert out["updated_at"] != "1970-01-01T00:00:00+00:00"
+
+
+# --- Adjustment 7: Sentinel scan + kind=update hash-binding ---------------
+
+
+@pytest.mark.unit
+class TestHashBindingAndScan:
+    @pytest.mark.asyncio
+    async def test_update_without_target_field_rejected(self):
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(kind="update"), ctx=_agent_ctx()
+            )
+        assert exc.value.status_code == 422
+        assert "target" in str(exc.value.detail).lower()
+
+    @pytest.mark.asyncio
+    async def test_update_without_live_target_returns_404(self):
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(
+                    kind="update",
+                    target={"slug": "test-skill", "target_content_hash": "sha256:abc"},
+                ),
+                ctx=_agent_ctx(),
+                live_skill_doc=None,
+            )
+        assert exc.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_update_hash_mismatch_returns_409(self):
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(
+                    kind="update",
+                    target={
+                        "slug": "test-skill",
+                        "target_content_hash": "sha256:CALLER",
+                    },
+                ),
+                ctx=_agent_ctx(),
+                live_skill_doc={"data": {"content_hash": "sha256:LIVE"}},
+            )
+        assert exc.value.status_code == 409
+        assert (
+            "mismatch" in str(exc.value.detail).lower()
+            or "changed" in str(exc.value.detail).lower()
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_hash_match_succeeds(self):
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(
+                kind="update",
+                target={"slug": "test-skill", "target_content_hash": "sha256:LIVE"},
+            ),
+            ctx=_agent_ctx(),
+            live_skill_doc={"data": {"content_hash": "sha256:LIVE"}},
+        )
+        assert out["kind"] == "update"
+
+    @pytest.mark.asyncio
+    async def test_update_against_imported_pointer_only_returns_409(self):
+        # Live doc is an imported pointer-only skill (no content_hash).
+        # We can't bind — reject.
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(
+                    kind="update",
+                    target={
+                        "slug": "test-skill",
+                        "target_content_hash": "sha256:WHATEVER",
+                    },
+                ),
+                ctx=_agent_ctx(),
+                live_skill_doc={"data": {"name": "Imported", "source": "imported"}},
+            )
+        assert exc.value.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_scan_result_attached_clean(self):
+        out, scan = await validate_and_normalize_skill_write(
+            _valid_doc(), ctx=_agent_ctx()
+        )
+        assert "scan" in out
+        assert out["scan"]["state"] == "clean"
+        assert out["scan"]["critical"] == 0
+        assert scan.state == "clean"
+
+
+# --- H-11: the STORED status is gated, not just the written one -----------
+
+
+def _live(
+    status: str,
+    *,
+    content_hash: str = "sha256:live",
+    owner: str | None = None,
+) -> dict:
+    """A live skills doc in the shape storage returns it.
+
+    ``owner`` stamps ``origin.agent_id``. Left absent by default so the
+    status-gate tests exercise the status axis alone — an unattributed row,
+    which the ownership half deliberately leaves writable.
+    """
+    data = {"slug": "test-skill", "status": status, "content_hash": content_hash}
+    if owner is not None:
+        data["origin"] = {"agent_id": owner}
+    return {"data": data}
+
+
+@pytest.mark.unit
+class TestLiveStatusOverwriteGuard:
+    """H-11 — status RBAC gated the written value, never the stored row.
+
+    ``document_upsert`` is ``on_conflict_do_update`` over the whole blob, so a
+    write aimed at an existing ``doc_id`` replaces it outright. Because the
+    validator only ever inspected the incoming body, a caller with a writable
+    key could point ``kind='create'`` at a live ACTIVE skill, let ``status``
+    default to ``staged``, and retire it — dropping it from every
+    ``status='active'`` surface and destroying its curated content, with the
+    replacement sitting in the inbox looking like a routine submission.
+
+    No privileged status was needed. The DEFAULT one did it. That is the exact
+    threat ``SYSTEM_ONLY_STATUSES``' comment claims to defend against, and the
+    check it annotates could not see the row it was protecting.
+    """
+
+    @pytest.mark.asyncio
+    async def test_agent_cannot_overwrite_a_live_active_skill(self):
+        """THE ATTACK. Fails without the fix — the write was accepted."""
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(),  # kind='create', source='agent', status defaults to staged
+                ctx=_agent_ctx(),
+                live_skill_doc=_live("active"),
+            )
+        assert exc.value.status_code == 403
+        detail = str(exc.value.detail).lower()
+        assert "already exists" in detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("live_status", sorted(SYSTEM_ONLY_STATUSES))
+    async def test_agent_cannot_resurrect_a_system_managed_doc(self, live_status):
+        """Rejected / quarantined / stale / deprecated are equally resurrectable.
+
+        A rejected skill that a non-admin can overwrite is a rejection that
+        does not hold. Parametrized off the constant so a new system status is
+        covered the day it is added.
+        """
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(),
+                ctx=_agent_ctx(),
+                live_skill_doc=_live(live_status),
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_agent_cannot_clobber_a_candidate_under_review(self):
+        """``candidate`` is internal-only to write, so it is protected to overwrite.
+
+        The same comment names this half of the threat — "hide a candidate from
+        review". The finding listed only active/rejected/quarantined/stale/
+        deprecated; deriving the set from the RBAC constants covers this too.
+        """
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(),
+                ctx=_agent_ctx(),
+                live_skill_doc=_live("candidate"),
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_agent_may_still_overwrite_its_own_staged_skill(self):
+        """OVER-REFUSAL GUARD. Iterating on a not-yet-approved skill is the
+        ordinary authoring loop and must keep working — a gate that blocked it
+        would trade a security bug for a usability one."""
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(),
+            ctx=_agent_ctx(),
+            live_skill_doc=_live("staged"),
+        )
+        assert out["status"] == "staged"
+
+    @pytest.mark.asyncio
+    async def test_first_write_of_a_new_slug_is_unaffected(self):
+        """OVER-REFUSAL GUARD. No live doc → nothing to protect."""
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(), ctx=_agent_ctx(), live_skill_doc=None
+        )
+        assert out["status"] == "staged"
+
+    @pytest.mark.asyncio
+    async def test_admin_may_overwrite_an_active_skill(self):
+        """OVER-REFUSAL GUARD. Admin is the legitimate writer of these states —
+        the HITL Inbox edit path is admin-gated and routes through here."""
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(),
+            ctx=_admin_ctx(),
+            live_skill_doc=_live("active"),
+        )
+        assert out["status"] == "staged"
+
+    @pytest.mark.asyncio
+    async def test_internal_forge_may_overwrite_an_active_skill(self):
+        """OVER-REFUSAL GUARD. The lifecycle worker owns these transitions."""
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(source="forge"),
+            ctx=_forge_ctx(),
+            live_skill_doc=_live("active"),
+        )
+        assert out["status"] == "candidate"
+
+    @pytest.mark.asyncio
+    async def test_correct_hash_binding_does_not_buy_an_overwrite(self):
+        """A well-formed ``kind='update'`` with the RIGHT hash is still refused.
+
+        Hash-binding is optimistic concurrency, not authorization. Reads are
+        open to any tenant agent, so ``target_content_hash`` proves only that
+        the caller GET the live skill first — which an attacker can do. The
+        write still lands on the same ``doc_id`` as a full replace, and
+        ``status`` still defaults to ``staged`` because a non-admin cannot
+        write ``active``. Exempting update from the gate on the grounds that
+        7a "already checks it" would reopen H-11 for the price of one extra
+        read, so this test exists to make that regression loud.
+        """
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(
+                    kind="update",
+                    target={"target_content_hash": "sha256:live"},  # the CORRECT hash
+                ),
+                ctx=_agent_ctx(),
+                live_skill_doc=_live("active", content_hash="sha256:live"),
+            )
+        assert exc.value.status_code == 403
+        assert "already exists" in str(exc.value.detail).lower()
+
+    @pytest.mark.asyncio
+    async def test_refusal_does_not_advertise_an_unreachable_remedy(self):
+        """The 403 must not send callers to a door this gate holds shut.
+
+        An earlier revision of the message told the caller to "propose a
+        revision with kind='update'" — advice that is both blocked here and,
+        were it not, the vulnerability itself. Keep the message honest: an
+        admin is the remedy until the Phase 4 proposal flow lands.
+        """
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(), ctx=_agent_ctx(), live_skill_doc=_live("active")
+            )
+        detail = str(exc.value.detail).lower()
+        assert "kind='update'" not in detail
+        assert "admin" in detail
+
+    @pytest.mark.asyncio
+    async def test_agent_may_still_update_its_own_staged_skill(self):
+        """OVER-REFUSAL GUARD. ``kind='update'`` is not blocked as such — only
+        against a PROTECTED live status. Revising one's own staged draft, hash
+        bound, is the ordinary authoring loop and still works."""
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(
+                kind="update",
+                target={"target_content_hash": "sha256:live"},
+            ),
+            ctx=_agent_ctx(),
+            live_skill_doc=_live("staged", content_hash="sha256:live"),
+        )
+        assert out["status"] == "staged"
+
+    @pytest.mark.asyncio
+    async def test_agent_cannot_clobber_another_agents_staged_draft(self):
+        """The `staged` exemption is for the AUTHOR, not for everyone.
+
+        Excluding ``staged`` from the protected set keeps the authoring loop
+        working, but "iterating on its own draft" is a claim about who is
+        writing, and status cannot express it. Without the ownership half,
+        one agent points a write at another's slug and that unreviewed work is
+        gone — no history, nothing in the inbox to show it happened.
+
+        SCOPE: this is a boundary only where agent identity is authenticated
+        (the gateway-verified path, where the signed ``X-Agent-ID`` wins over
+        anything the caller passes). On standalone / shared-key surfaces
+        ``agent_id`` is the caller's own self-declared parameter, so a caller
+        who can declare an id can declare the victim's — there this prevents
+        cooperative agents colliding on a slug, and nothing more. See the
+        SCOPE note at the gate; do not read this test as proving more than it
+        does.
+        """
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(),
+                ctx=_agent_ctx(caller_agent_id="bob"),
+                live_skill_doc=_live("staged", owner="alice"),
+            )
+        assert exc.value.status_code == 403
+        assert "draft" in str(exc.value.detail).lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("live_status", sorted(PROTECTED_LIVE_STATUSES))
+    async def test_status_refusal_does_not_echo_the_protected_status(self, live_status):
+        """The refusal must not name WHICH protected state the row is in.
+
+        ``op=read``/``query``/``search`` all treat a non-active row as
+        non-existent to a non-admin caller, so echoing the status here would
+        undo that: repeated writes against guessed slugs would enumerate which
+        slugs are quarantined, rejected, or under Forge review. A refusal
+        necessarily reveals the slug is occupied; which state it is in is a
+        separate fact. Parametrized so a status added to the set is covered.
+        """
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(), ctx=_agent_ctx(), live_skill_doc=_live(live_status)
+            )
+        assert exc.value.status_code == 403
+        assert live_status not in str(exc.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_ownership_refusal_does_not_name_the_other_agent(self):
+        """The refusal must not disclose WHO owns the draft.
+
+        A write refusal has to admit the slug is occupied — it could not
+        refuse otherwise — but authorship is a separate fact, and the read
+        path already treats it as one: ``op=read`` on a non-active skill
+        answers "Not found" rather than confirm it exists, expressly to avoid
+        an existence leak. Naming the author in this 403 would hand an
+        unauthorized caller strictly more than a permitted read gives them,
+        and agent ids are not opaque — real deployments put human names in
+        them. This guards the obvious debugging regression of putting it back.
+        """
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(),
+                ctx=_agent_ctx(caller_agent_id="bob"),
+                live_skill_doc=_live("staged", owner="alice-surname"),
+            )
+        assert exc.value.status_code == 403
+        assert "alice-surname" not in str(exc.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_unidentified_caller_cannot_clobber_an_attributed_draft(self):
+        """A caller with no agent_id cannot BE the named owner.
+
+        The looser reading — refuse only when both sides are attributed —
+        would let a tenant key with no agent identity overwrite any named
+        author's draft. Where the row names an owner, a caller who cannot
+        show that identity is not it.
+        """
+        with pytest.raises(HTTPException) as exc:
+            await validate_and_normalize_skill_write(
+                _valid_doc(),
+                ctx=_agent_ctx(caller_agent_id=None),
+                live_skill_doc=_live("staged", owner="alice"),
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_author_may_still_overwrite_their_own_staged_draft(self):
+        """OVER-REFUSAL GUARD. The authoring loop, which is the whole point
+        of exempting ``staged``, must survive the ownership check."""
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(),
+            ctx=_agent_ctx(caller_agent_id="alice"),
+            live_skill_doc=_live("staged", owner="alice"),
+        )
+        assert out["status"] == "staged"
+
+    @pytest.mark.asyncio
+    async def test_unattributed_draft_stays_writable(self):
+        """OVER-REFUSAL GUARD. A deployment with no agent identity stamps
+        every draft ``unknown``; gating on that would 403 the ordinary loop
+        for all of them. Both the missing-origin and explicit-``unknown``
+        shapes must stay writable."""
+        from core_api.services.skill_lifecycle import UNATTRIBUTED_AGENT_ID
+
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(), ctx=_agent_ctx(), live_skill_doc=_live("staged")
+        )
+        assert out["status"] == "staged"
+
+        out2, _ = await validate_and_normalize_skill_write(
+            _valid_doc(),
+            ctx=_agent_ctx(caller_agent_id="bob"),
+            live_skill_doc=_live("staged", owner=UNATTRIBUTED_AGENT_ID),
+        )
+        assert out2["status"] == "staged"
+
+    @pytest.mark.asyncio
+    async def test_admin_may_overwrite_another_agents_staged_draft(self):
+        """OVER-REFUSAL GUARD. Admin is exempt from the whole gate, both
+        halves — the Inbox edit path is admin-gated and routes through here."""
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(),
+            ctx=_admin_ctx(),
+            live_skill_doc=_live("staged", owner="alice"),
+        )
+        assert out["status"] == "staged"
+
+    @pytest.mark.asyncio
+    async def test_unattributed_sentinel_is_shared_with_the_stamping_site(self):
+        """The constant must be the one the stamp actually writes.
+
+        If the check and the stamp spelled "unattributed" separately, a change
+        to one would silently turn every unattributed draft into an owned one
+        (or the reverse) — two places that have to agree, which is the shape
+        of the original bug.
+        """
+        from core_api.services.skill_lifecycle import UNATTRIBUTED_AGENT_ID
+
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(), ctx=_agent_ctx(caller_agent_id=None), live_skill_doc=None
+        )
+        assert out["origin"]["agent_id"] == UNATTRIBUTED_AGENT_ID
+
+    def test_protected_set_is_derived_from_the_rbac_constants(self):
+        """The set must not be a hand-maintained copy.
+
+        Spelling it out would let a status added to an RBAC set above go
+        unprotected here until someone noticed — which is the shape of the
+        original bug, two places that had to agree and did not.
+        """
+        from core_api.services.skill_lifecycle import (
+            ADMIN_ONLY_STATUSES,
+            PROTECTED_LIVE_STATUSES,
+        )
+
+        assert PROTECTED_LIVE_STATUSES == (
+            ADMIN_ONLY_STATUSES | INTERNAL_ONLY_STATUSES | SYSTEM_ONLY_STATUSES
+        )
+        # ``staged`` must stay out of it, or the authoring loop breaks.
+        assert "staged" not in PROTECTED_LIVE_STATUSES
+
+
+# --- Migration chain integrity --------------------------------------------
+
+
+@pytest.mark.unit
+class TestRouteSlugRegex:
+    """The ``routes/documents.py`` slug regex governs which ``doc_id``
+    values are accepted on a ``collection='skills'`` write. The
+    Skill Factory namespaces Forge candidates as ``forge/<slug>``
+    and synchronous agent-direct writes as ``agent/<slug>`` (plan
+    §3); without the prefix path Forge writes 422 themselves at the
+    route boundary."""
+
+    def _re(self):
+        from core_api.routes.documents import _SKILL_SLUG_RE
+
+        return _SKILL_SLUG_RE
+
+    def test_plain_slug_accepted(self):
+        assert self._re().fullmatch("deploy-eu-west-dns")
+
+    def test_forge_namespaced_slug_accepted(self):
+        assert self._re().fullmatch("forge/deploy-eu-west-dns")
+
+    def test_agent_namespaced_slug_accepted(self):
+        assert self._re().fullmatch("agent/morning-catchup")
+
+    def test_other_namespaces_rejected(self):
+        # Only ``forge/`` and ``agent/`` are accepted; arbitrary
+        # prefixes still 422 to prevent rogue namespacing.
+        assert self._re().fullmatch("system/x") is None
+        assert self._re().fullmatch("admin/y") is None
+        assert self._re().fullmatch("nested/path/slug") is None
+
+    def test_uppercase_still_rejected(self):
+        # The filesystem-safe rule still applies.
+        assert self._re().fullmatch("FORGE/DEPLOY") is None
+        assert self._re().fullmatch("Deploy") is None
+
+    def test_leading_punctuation_rejected(self):
+        assert self._re().fullmatch("-deploy") is None
+        assert self._re().fullmatch(".deploy") is None
+        assert self._re().fullmatch("forge/-deploy") is None
+
+    def test_max_length_after_prefix(self):
+        # The 100-char body limit applies AFTER the optional prefix.
+        assert self._re().fullmatch("forge/" + "a" * 100)
+        assert self._re().fullmatch("forge/" + "a" * 101) is None
+
+
+@pytest.mark.unit
+def _strip_docstrings_and_comments(src: str) -> str:
+    """Source with comments and docstrings removed, everything else verbatim.
+
+    A migration guard that greps raw source can be satisfied by a COMMENT, which
+    makes it documentation-checking rather than code-checking. Found by mutation:
+    stripping the real ``autocommit_block`` from 038 still passed, because the
+    module docstring named it.
+
+    Line-based on purpose. Rebuilding from ``tokenize`` output re-spaces the source
+    (``op . get_context ( )``) and, on 3.12+, splits f-strings into parts — either
+    of which silently breaks a literal substring check, which is the same class of
+    bug this helper exists to catch. Ordinary string literals are KEPT: the guarded
+    statements are themselves strings (``op.execute("ALTER TABLE ...")``).
+    """
+    import ast
+    import io
+    import tokenize
+
+    lines = src.splitlines()
+
+    drop: set[int] = set()
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(
+            node, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+        ):
+            continue
+        body = getattr(node, "body", [])
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            drop.update(
+                range(body[0].lineno, (body[0].end_lineno or body[0].lineno) + 1)
+            )
+
+    # Truncate each line at its comment, if any (1-indexed rows, 0-indexed cols).
+    cut: dict[int, int] = {}
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type == tokenize.COMMENT:
+            cut.setdefault(tok.start[0], tok.start[1])
+
+    kept = [
+        line[: cut[i]] if i in cut else line
+        for i, line in enumerate(lines, start=1)
+        if i not in drop
+    ]
+    return "\n".join(kept)
+
+
+class TestMigrationChain:
+    """Sanity check that the Phase 0 migrations (020 / 021 / 022) chain
+    correctly off the prior head (019). Detects accidental down_revision
+    typos at PR time without needing a live database."""
+
+    def _load(self) -> dict[str, str | None]:
+        chain: dict[str, str | None] = {}
+        declared_by: dict[str, str] = {}
+        versions = pathlib.Path(
+            "core-storage-api/src/core_storage_api/database/migrations/versions"
+        )
+        for f in sorted(versions.glob("*.py")):
+            spec = importlib.util.spec_from_file_location(f.stem, f)
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            # Keyed by revision, so a duplicate id would overwrite rather than
+            # fork — and every assertion below would read a chain that looks
+            # fine. Two branches numbering a migration the same is the common
+            # way this happens (it happened on #828), and alembic answers it
+            # with "Multiple head revisions are present", at deploy time.
+            assert mod.revision not in chain, (
+                f"revision {mod.revision!r} is declared twice: "
+                f"{declared_by[mod.revision]} and {f.name} — "
+                "renumber the newer one onto the current head"
+            )
+            chain[mod.revision] = mod.down_revision
+            declared_by[mod.revision] = f.name
+        return chain
+
+    def test_single_head(self):
+        """One head, and it is the newest migration.
+
+        The expected value is pinned rather than derived, so adding a migration
+        is a deliberate edit here — that is what catches a second head created
+        by two branches both claiming the same ``down_revision``. Bump it when
+        you add one; do not compute it, or the test stops detecting the fork it
+        exists for.
+        """
+        chain = self._load()
+        heads = set(chain) - {dr for dr in chain.values() if dr is not None}
+        assert heads == {"061"}, f"Expected single head '061', got {sorted(heads)}"
+
+    def test_skill_factory_chain_links(self):
+        chain = self._load()
+        assert chain.get("020") == "019", "020 must follow 019"
+        assert chain.get("021") == "020", "021 must follow 020"
+        assert chain.get("022") == "021", "022 must follow 021"
+        assert chain.get("023") == "022", "023 must follow 022"
+        # 024: fleet_commands auto-upgrade partial index (CAURA-000)
+        assert chain.get("024") == "023", "024 must follow 023"
+        # 025: tamper-evident audit hash chain (eToro governance)
+        assert chain.get("025") == "024", "025 must follow 024"
+        # 026: per-event audit idempotency (client_event_id + partial unique)
+        assert chain.get("026") == "025", "026 must follow 025"
+        # 027: opt-in recall logging (recall_event + recall_candidate)
+        assert chain.get("027") == "026", "027 must follow 026"
+        # 028: agent belonging model (belonging_type + owner_ref)
+        assert chain.get("028") == "027", "028 must follow 027"
+        # 029: agent activity digest (cached per-agent summaries, CAURA-222)
+        assert chain.get("029") == "028", "029 must follow 028"
+        # 030: register the insights service agent for existing tenants
+        assert chain.get("030") == "029", "030 must follow 029"
+        # 031: broker-write agent ownership column (owner_install_uuid)
+        assert chain.get("031") == "030", "031 must follow 030"
+        # 032: agent-digest subagents rollup column (CAURA-222)
+        assert chain.get("032") == "031", "032 must follow 031"
+        # 033: HNSW index on entities.name_embedding (cross-link discovery perf)
+        assert chain.get("033") == "032", "033 must follow 032"
+        # 034: title into memories.search_vector, weighted A over content B
+        assert chain.get("034") == "033", "034 must follow 033"
+        # 035: index the FK columns referencing memories.id (bulk-delete cost)
+        assert chain.get("035") == "034", "035 must follow 034"
+        # 036: unified contradiction model (A55) — conflict/derivation tables + columns
+        assert chain.get("036") == "035", "036 must follow 035"
+        # 037: memories.embedded_content_hash — embedding provenance, so a
+        # vector computed from superseded text becomes detectable
+        assert chain.get("037") == "036", "037 must follow 036"
+        # 038: documents.created_at/updated_at NOT NULL — the columns were always
+        # nullable, so a NULL row 500'd the documents read path (OSS #826)
+        assert chain.get("038") == "037", "038 must follow 037"
+        # 039: tenant_usage_counters — durable per-tenant, per-period counts
+        assert chain.get("039") == "038", "039 must follow 038"
+        # 040: one LIVE memory per (tenant, fleet, agent, content_hash) — the
+        # dedup contract had no schema behind it (OSS #814)
+        assert chain.get("040") == "039", "040 must follow 039"
+        # 041: lifecycle_audit.started_at recency index for cross-org summaries
+        assert chain.get("041") == "040", "041 must follow 040"
+        # 042: tenant_usage_counters.count >= 0 — a negative counter reads as
+        # under-limit and disables plan enforcement for the tenant
+        assert chain.get("042") == "041", "042 must follow 041"
+        # 043: human review state on memory_conflicts — the detector records what
+        # it concluded, nothing recorded what a person concluded, so precision was
+        # unmeasurable (D11).
+        assert chain.get("043") == "042", "043 must follow 042"
+        # 045 — memories.status_changed_at (09/02 M-55). A contradiction is a
+        # status flip, and the row had no timestamp for it, so outcome
+        # inference had to window on created_at and dropped evidence for any
+        # memory older than the scan window.
+        assert chain.get("045") == "044", "045 must follow 044"
+        # 046 — partial index on lifecycle_audit(started_at) WHERE
+        # status='pending'. The reconcile sweep's predicate is selective on the
+        # STATUS, not the timestamp: started_at < now() - interval matches
+        # nearly the whole append-only table, so 041's recency index scanned
+        # almost all of it to return normally-zero rows.
+        assert chain.get("046") == "045", "046 must follow 045"
+        # 047 — lifecycle_audit.claimed_at. Without a claim, an original
+        # message that was merely queued and the reconcile sweep's republish of
+        # it could both move a row out of pending and run the primitive at
+        # once; for crystallize or insights that is duplicate LLM spend.
+        assert chain.get("047") == "046", "047 must follow 046"
+
+    def test_no_plain_set_not_null_on_large_tables(self):
+        """Tightening a column to NOT NULL on a large table must not full-scan
+        under an AccessExclusive lock.
+
+        Same hazard as the CREATE INDEX guard below, different statement: a bare
+        ``SET NOT NULL`` scans the whole table to verify while holding
+        AccessExclusive, blocking writes and pinning the migration advisory lock.
+        The safe shape adds a ``CHECK (col IS NOT NULL) NOT VALID``, VALIDATEs it
+        (ShareUpdateExclusive — does not block reads or writes), and only then sets
+        NOT NULL, which PG12+ satisfies from the validated constraint without a
+        second scan. Each step needs its own transaction, hence ``autocommit_block``.
+
+        Catches BOTH spellings, because the existing index guard learned this the
+        hard way: it originally checked only raw SQL, and ``op.create_index(...)``
+        carried the identical defect straight past it.
+        """
+        import re
+
+        large_tables = {
+            "audit_log",
+            "memories",
+            "entities",
+            "documents",
+            "memory_entity_links",
+            "relations",
+        }
+        # ALTER TABLE <table> ALTER COLUMN <col> SET NOT NULL
+        #
+        # The column position accepts ``{...}`` as well as a bare name, because
+        # ``ruff format`` collapses these statements into f-strings and a ``\w+``
+        # column would then match nothing — the guard would go SILENT on the very
+        # file it is meant to check, which is the documented blind spot that leaves
+        # 007 and 026 outside the CREATE INDEX guard below. Verified by mutation
+        # both ways.
+        #
+        # KNOWN GAP, same as that guard: an interpolated TABLE name cannot be
+        # classified against ``large_tables``, so ``f"ALTER TABLE {tbl} ..."`` is
+        # not caught. Keep the table literal in migrations.
+        raw_pat = re.compile(
+            r"ALTER\s+TABLE\s+(\w+)\s+ALTER\s+COLUMN\s+[\w{}]+\s+SET\s+NOT\s+NULL",
+            re.IGNORECASE,
+        )
+        # op.alter_column("<table>", "<col>", ..., nullable=False)
+        api_pat = re.compile(
+            r"op\.alter_column\(\s*[\"\'](\w+)[\"\'][^)]*nullable\s*=\s*False",
+            re.DOTALL,
+        )
+        versions = pathlib.Path(
+            "core-storage-api/src/core_storage_api/database/migrations/versions"
+        )
+        violations: list[str] = []
+        for f in sorted(versions.glob("*.py")):
+            prefix = f.stem.split("_")[0]
+            if not prefix.isdigit() or int(prefix) < 5:
+                continue
+            src = f.read_text()
+            tables = set(raw_pat.findall(src)) | set(api_pat.findall(src))
+            hit = {t for t in tables if t.lower() in large_tables}
+            if not hit:
+                continue
+            # Look at CODE, not prose. Checking the raw source let a migration
+            # satisfy this by DESCRIBING the safe pattern in its docstring while
+            # not doing it — caught by mutation: stripping the real
+            # ``autocommit_block`` still passed, because the docstring named it.
+            code = _strip_docstrings_and_comments(src)
+            if (
+                "VALIDATE CONSTRAINT" not in code.upper()
+                or ".autocommit_block()" not in code
+            ):
+                violations.append(
+                    f"{f.name}: SET NOT NULL on {sorted(hit)} without the "
+                    "CHECK-NOT-VALID / VALIDATE / autocommit_block pattern"
+                )
+        assert not violations, "unsafe NOT NULL tightening:\n" + "\n".join(violations)
+
+    def test_no_plain_create_index_on_large_tables(self):
+        """Indexes on large, pre-existing tables MUST be built ``CONCURRENTLY``
+        (inside an ``op.get_context().autocommit_block()``). A plain,
+        in-transaction ``CREATE INDEX`` takes an AccessExclusive lock that blocks
+        writes AND holds the migration advisory lock for the whole build — which
+        crashed 6 storage-writer boots on 2026-06-16 (migration 025 indexed
+        ``audit_log`` without CONCURRENTLY). This guards the raw-SQL
+        ``op.execute("CREATE INDEX ...")`` path on the known-large tables; indexes
+        created on a brand-new table in the same migration are unaffected."""
+        import re
+
+        large_tables = {
+            "audit_log",
+            "memories",
+            "entities",
+            "documents",
+            "memory_entity_links",
+            "relations",
+        }
+        # The CONCURRENTLY convention for indexes on already-populated large
+        # tables is enforced from migration 005 onward (see 005/007/011/016/017).
+        # 001–004 build the initial schema and index tables that are empty at
+        # creation, so a plain CREATE INDEX there is harmless. 025 postdates the
+        # convention but predates enforcement and is already applied in prod (the
+        # index exists; the migration can't be rewritten) — documented debt.
+        convention_from = 5
+        applied_debt = {25}
+        # CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] <name> ON <table>
+        pat = re.compile(
+            r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(CONCURRENTLY\s+)?"
+            r"(?:IF\s+NOT\s+EXISTS\s+)?\w+\s+ON\s+(\w+)",
+            re.IGNORECASE,
+        )
+        # op.create_index("<name>", "<table>", ...) — the Alembic API form.
+        api_pat = re.compile(
+            r"op\.create_index\(\s*[\"'][^\"']+[\"']\s*,\s*[\"'](\w+)[\"']",
+            re.DOTALL,
+        )
+        versions = pathlib.Path(
+            "core-storage-api/src/core_storage_api/database/migrations/versions"
+        )
+        violations: list[str] = []
+        for f in sorted(versions.glob("*.py")):
+            prefix = f.stem.split("_")[0]
+            if (
+                not prefix.isdigit()
+                or int(prefix) < convention_from
+                or int(prefix) in applied_debt
+            ):
+                continue
+            src = f.read_text()
+            for concurrently, table in pat.findall(src):
+                if table.lower() in large_tables and not concurrently:
+                    violations.append(f"{f.name}: plain CREATE INDEX on '{table}'")
+            # ``op.create_index(...)`` is the SAME hazard via Alembic's API
+            # rather than raw SQL: it emits a plain, in-transaction CREATE
+            # INDEX. The raw-SQL regex above cannot see it, so migration 037
+            # originally shipped a plain index build on ``memories`` and this
+            # guard passed. Alembic has no CONCURRENTLY option on
+            # ``create_index``, so on a large table the API form is always
+            # wrong — flag every occurrence.
+            for table in api_pat.findall(src):
+                if table.lower() in large_tables:
+                    violations.append(
+                        f"{f.name}: op.create_index() on '{table}' "
+                        "(no CONCURRENTLY option — use op.execute in an autocommit_block)"
+                    )
+        assert not violations, (
+            "Plain (non-CONCURRENTLY) CREATE INDEX on a large table blocks writes "
+            "and holds the migration advisory lock for the whole build (crashed "
+            "storage-writer boots on 2026-06-16). Use CREATE INDEX CONCURRENTLY in "
+            "an op.get_context().autocommit_block() — see migration 007 / 026. "
+            f"Violations: {'; '.join(violations)}"
+        )
+
+    def test_every_fk_referencing_column_is_index_leading(self):
+        """Every FK's referencing column(s) must be usable as an index prefix.
+
+        PostgreSQL enforces a foreign key from the REFERENCING side once per
+        deleted parent row, so an unindexed referencing column turns each delete
+        into a full scan of that table — across ALL tenants, since the scan is
+        not tenant-scoped. Migration 035 landed after this cost 15.3 s of a
+        15.5 s bulk delete (98.7%) on one unindexed self-FK.
+
+        Declaration-level check, so it catches a new FK added without an index
+        at PR time. It cannot catch an index declared here but never migrated —
+        the CONCURRENTLY guard above and the chain tests cover the migration
+        side.
+        """
+        import common.models  # noqa: F401 — registers every mapper on Base
+        from common.models.base import Base
+
+        def prefixes(table):
+            """Column lists some btree on ``table`` can serve as a prefix of."""
+            out = []
+            if len(table.primary_key.columns):
+                out.append([c.name for c in table.primary_key.columns])
+            for ix in table.indexes:
+                # getattr for expression indexes (e.g. func.coalesce): a SQL
+                # expression must not be mistaken for a column of that name.
+                out.append([getattr(e, "name", None) for e in ix.expressions])
+            return out
+
+        missing = []
+        for table in Base.metadata.sorted_tables:
+            available = prefixes(table)
+            for fk in table.foreign_key_constraints:
+                cols = [c.name for c in fk.columns]
+                if not any(p[: len(cols)] == cols for p in available):
+                    target = next(iter(fk.elements)).target_fullname
+                    missing.append(f"{table.name}({', '.join(cols)}) -> {target}")
+        assert not missing, (
+            "Foreign key(s) whose referencing column is not the leading column of "
+            "any index. Deleting a referenced row will scan the whole referencing "
+            "table once per deleted row — see migration 035 for the measured cost. "
+            "Add an Index(...) here and a CONCURRENTLY index in a migration: "
+            f"{'; '.join(missing)}"
+        )
+
+
+@pytest.mark.unit
+class TestForgeEventPayloadNaming:
+    """The Forge run-knob field names must spell the same thing across
+    org_settings, ForgeConfig, and the event payload. Drift between
+    these three is a real bug: an operator who tunes
+    ``skills_factory.forge.max_writes_per_run`` would expect the
+    publisher kwarg to spell it identically. A test pin keeps the
+    three in lockstep."""
+
+    def test_event_payload_field_name_matches_config(self):
+        # Payload field, ForgeConfig dataclass field, and the
+        # org_settings key all spell ``max_writes_per_run``.
+        from common.events.lifecycle_forge_request import LifecycleForgeDistillRequest
+        from core_api.services.forge.forge_service import ForgeConfig
+        from core_api.services.organization_settings import DEFAULT_SETTINGS
+
+        # Payload (pydantic): the field exists with the right name.
+        assert "max_writes_per_run" in LifecycleForgeDistillRequest.model_fields, (
+            "LifecycleForgeDistillRequest.max_writes_per_run must match the "
+            "ForgeConfig + org_settings name; legacy ``max_writes`` was "
+            "renamed for consistency."
+        )
+        assert "max_writes" not in LifecycleForgeDistillRequest.model_fields, (
+            "legacy ``max_writes`` field must be removed — drift trap"
+        )
+        # ForgeConfig dataclass.
+        cfg_fields = {f for f in vars(ForgeConfig()).keys()}
+        assert "max_writes_per_run" in cfg_fields
+        # Settings key.
+        forge_settings = DEFAULT_SETTINGS["skills_factory"]["forge"]
+        assert "max_writes_per_run" in forge_settings
+
+    def test_publisher_kwarg_matches_payload_field(self):
+        # The publisher's keyword argument also spells max_writes_per_run.
+        import inspect
+
+        from common.events.lifecycle_publishers import publish_forge_distill_request
+
+        sig = inspect.signature(publish_forge_distill_request)
+        assert "max_writes_per_run" in sig.parameters
+        assert "max_writes" not in sig.parameters, (
+            "publish_forge_distill_request's legacy ``max_writes`` "
+            "parameter must be removed"
+        )
+
+    # ``test_llm_tokens_field_name_matches_across_layers`` used to sit here,
+    # pinning that ``llm_tokens_per_run`` spelled the same thing in the payload,
+    # the publisher kwarg and the settings key. It was a correct test of the
+    # wrong thing: the three layers agreed perfectly on the name of a knob no
+    # consumer ever read (oss-0922-l-05). The knob is gone, and
+    # ``tests/test_oss_0922_l_05_forge_token_knob_removed.py`` now pins its
+    # ABSENCE across the same three layers — same drift trap, opposite sign.
+
+
+@pytest.mark.unit
+class TestMigration020Index:
+    """The forge_rejected_fingerprints lookup index must include
+    fleet_id (with NULLS FIRST) so the hot-path predicate
+    ``(fleet_id = :f OR fleet_id IS NULL)`` is index-supported.
+    A missing fleet_id column forces PG to filter every (tenant,
+    fp) match in memory."""
+
+    def _migration_020_source(self) -> str:
+        path = pathlib.Path(
+            "core-storage-api/src/core_storage_api/database/migrations/versions/"
+            "020_forge_rejected_fingerprints.py"
+        )
+        return path.read_text()
+
+    def test_lookup_index_includes_fleet_id(self):
+        src = self._migration_020_source()
+        # The CREATE INDEX statement must reference fleet_id.
+        index_block = src[src.index("idx_forge_rejected_fp_lookup") :]
+        # Stop at the next non-string line so we only inspect the
+        # actual index DDL.
+        index_block = index_block[: index_block.index('"\n    )')]
+        assert "fleet_id" in index_block, (
+            "idx_forge_rejected_fp_lookup must include fleet_id "
+            "so the hot-path '(fleet_id = :f OR fleet_id IS NULL)' "
+            "predicate is index-supported"
+        )
+
+    def test_lookup_index_uses_nulls_first_on_fleet_id(self):
+        src = self._migration_020_source()
+        # NULLS FIRST clusters the NULL-fleet rows at the head of
+        # each (tenant, fp) group, matching the
+        # 'fleet_id = :f OR fleet_id IS NULL' shape.
+        assert "fleet_id NULLS FIRST" in src
+
+    def test_lookup_index_still_sorts_rejected_at_desc(self):
+        # The cooloff predicate is "is ANY rejection still active";
+        # DESC on rejected_at lets PG short-circuit at the newest
+        # hit per (tenant, fp, fleet) tuple.
+        src = self._migration_020_source()
+        assert "rejected_at DESC" in src
+
+
+@pytest.mark.unit
+class TestMigration022Sentinel:
+    """The 022 downgrade must NOT strip ``source``/``status`` from
+    rows that the migration did not write — only from rows
+    carrying the ``_migrated_by='022'`` sentinel that Branches 1+2
+    stamp during ``upgrade()``. This pins the SQL string so a
+    refactor of the migration body can't silently regress the
+    downgrade safety contract."""
+
+    def _migration_source(self) -> str:
+        path = pathlib.Path(
+            "core-storage-api/src/core_storage_api/database/migrations/versions/"
+            "022_skills_backfill_source_status.py"
+        )
+        return path.read_text()
+
+    def test_branch_1_stamps_migrated_by_sentinel(self):
+        src = self._migration_source()
+        # Branch 1's UPDATE includes ``_migrated_by`` in its
+        # jsonb_build_object call alongside source='manual'.
+        assert "'_migrated_by', '022'" in src or '"_migrated_by", "022"' in src, (
+            "Branches 1+2 must stamp _migrated_by='022' so the "
+            "downgrade can safely identify rows we wrote"
+        )
+
+    def test_branch_3_and_4_do_not_stamp_sentinel(self):
+        # Branch 3 (status backfill on already-sourced rows) and
+        # Branch 4 (legacy source normalization) intentionally do
+        # NOT carry the sentinel — they are not reversed by the
+        # downgrade in the same way (Branch 4 restores via
+        # legacy_source; Branch 3 is intentionally non-reversed).
+        src = self._migration_source()
+        # Count how many times _migrated_by appears in the upgrade.
+        # Exactly 2 (Branch 1 + Branch 2) — Branch 3 / Branch 4
+        # adding it would create false-positive downgrade strips.
+        upgrade_section = src.split("def upgrade")[1].split("def downgrade")[0]
+        assert upgrade_section.count("'_migrated_by'") == 2, (
+            "Only Branches 1+2 should stamp _migrated_by; "
+            f"got {upgrade_section.count(chr(39) + chr(95) + 'migrated_by' + chr(39))} occurrences"
+        )
+
+    def test_downgrade_filters_by_sentinel(self):
+        # Downgrade's strip-step must filter on _migrated_by='022',
+        # not just on source IN ('manual', 'imported').
+        src = self._migration_source()
+        downgrade_section = src.split("def downgrade")[1]
+        assert "'_migrated_by'" in downgrade_section, (
+            "Downgrade must reference _migrated_by in its WHERE clause"
+        )
+        assert "= '022'" in downgrade_section, (
+            "Downgrade must check _migrated_by = '022' specifically"
+        )
+        # And it must STRIP the sentinel itself (so a re-upgrade
+        # lands cleanly).
+        assert "- '_migrated_by'" in downgrade_section, (
+            "Downgrade must drop _migrated_by after using it"
+        )
+
+
+class TestBackfill034MatchesMigration:
+    """The out-of-band backfill must write what migration 034's trigger writes.
+
+    034 keeps only DDL — the backfill lives in ``scripts/`` because running it in
+    the alembic startup hook blocked the staging deploy on 2026-08-08. That split
+    buys deploy safety and costs a second copy of the tsvector expression, and a
+    silent divergence between them is invisible until a search misses: the script
+    would rewrite rows to a vector the trigger would never produce, and the next
+    write of that row would flip it back.
+    """
+
+    def _migration_expr(self, builder: str) -> str:
+        import importlib.util
+        import pathlib
+
+        f = pathlib.Path(
+            "core-storage-api/src/core_storage_api/database/migrations/versions/"
+            "034_memories_search_vector_title_weighting.py"
+        )
+        spec = importlib.util.spec_from_file_location(f.stem, f)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return getattr(mod, builder)("m.")
+
+    @pytest.mark.parametrize(
+        "const,builder",
+        [("_VECTOR", "_vector"), ("_CONTENT_ONLY", "_content_only")],
+    )
+    def test_script_expressions_match_the_migration(self, const, builder):
+        """Both directions: ``--revert`` must undo exactly what the forward pass did."""
+        import re
+
+        src = pathlib.Path(
+            "core-storage-api/src/core_storage_api/scripts/backfill_034_search_vector.py"
+        ).read_text()
+        m = re.search(rf'^{const} = "(.+)"$', src, re.M)
+        assert m, f"backfill_034_search_vector.py no longer defines {const} on one line"
+
+        expected = self._migration_expr(builder)
+        assert m.group(1) == expected, (
+            f"the backfill script and migration 034 disagree on {const}:\n"
+            f"  script:    {m.group(1)}\n"
+            f"  migration: {expected}\n"
+            f"They must be byte-identical, or the script writes vectors the trigger never would."
+        )

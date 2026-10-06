@@ -1,0 +1,808 @@
+"""Unit tests for the OSS embedding-backfill CLI.
+
+The script lives at ``core-storage-api/scripts/backfill_embeddings.py``
+and re-embeds rows whose embedding is NULL — the post-migration-010
+recovery path for OSS docker-compose users.
+
+These tests mock the engine + ``get_embedding`` so no real DB or
+OpenAI account is required. Integration coverage (against a real
+local Postgres + fake embedding provider) is covered by the staging
+cutover runbook (Spec E), not this PR.
+"""
+
+from __future__ import annotations
+
+import uuid
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+
+def _fake_engine(rows_by_query: dict[str, list[tuple]]) -> MagicMock:
+    """Build a minimal AsyncEngine stand-in that returns canned rows for
+    each ``conn.execute`` call, keyed by a fragment of the SQL.
+
+    *rows_by_query* maps "memories" / "entities" → the full row list to
+    yield in a single page. The first ``execute`` call for each table
+    returns those rows; subsequent calls return an empty list (so the
+    pagination loop terminates).
+    """
+    served: dict[str, bool] = {}
+
+    async def _execute(statement, params=None):
+        sql = str(statement).lower()
+        # UPDATE statements: pretend they succeeded.
+        if sql.startswith("update"):
+            return MagicMock()
+        # SELECT — first call per table returns rows; second returns [].
+        for key, rows in rows_by_query.items():
+            if key in sql and not served.get(key):
+                served[key] = True
+                result = MagicMock()
+                result.all = MagicMock(return_value=rows)
+                return result
+        empty = MagicMock()
+        empty.all = MagicMock(return_value=[])
+        return empty
+
+    conn = MagicMock()
+    conn.execute = AsyncMock(side_effect=_execute)
+    conn.commit = AsyncMock()
+
+    @asynccontextmanager
+    async def _connect():
+        yield conn
+
+    engine = MagicMock()
+    engine.connect = _connect
+    return engine
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_backfill_re_embeds_memories_and_entities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Happy path: each NULL-embedding row gets a re-embed call and a
+    corresponding UPDATE. Reports the right scanned/embedded counts."""
+    from core_storage_api.scripts.backfill_embeddings import run_backfill
+
+    rows = {
+        "from memories": [
+            (uuid.uuid4(), "memory content one", "hash-one"),
+            (uuid.uuid4(), "memory content two", "hash-two"),
+        ],
+        "from entities": [
+            (uuid.uuid4(), "Acme Corp"),
+        ],
+    }
+    monkeypatch.setattr(
+        "core_storage_api.scripts.backfill_embeddings.get_engine"
+        if False
+        else "core_storage_api.database.init.get_engine",
+        lambda: _fake_engine(rows),
+    )
+
+    embed = AsyncMock(return_value=[0.1] * 1024)
+    monkeypatch.setattr("common.embedding.get_embedding", embed)
+
+    reports = await run_backfill(
+        tenant_id=None,
+        batch_size=500,
+        max_inflight=10,
+        dry_run=False,
+    )
+
+    by_table = {r.table: r for r in reports}
+    assert by_table["memories"].scanned == 2
+    assert by_table["memories"].embedded == 2
+    assert by_table["entities"].scanned == 1
+    assert by_table["entities"].embedded == 1
+    # 3 rows → 3 embed calls.
+    assert embed.await_count == 3
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_backfill_dry_run_skips_provider_and_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--dry-run`` counts what would have been done but doesn't call
+    the embedding provider or issue UPDATEs."""
+    from core_storage_api.scripts.backfill_embeddings import run_backfill
+
+    rows = {
+        "from memories": [(uuid.uuid4(), "x", "hx"), (uuid.uuid4(), "y", "hy")],
+        "from entities": [],
+    }
+    monkeypatch.setattr(
+        "core_storage_api.database.init.get_engine",
+        lambda: _fake_engine(rows),
+    )
+    embed = AsyncMock(return_value=[0.1] * 1024)
+    monkeypatch.setattr("common.embedding.get_embedding", embed)
+
+    reports = await run_backfill(
+        tenant_id=None, batch_size=500, max_inflight=10, dry_run=True
+    )
+
+    by_table = {r.table: r for r in reports}
+    assert by_table["memories"].scanned == 2
+    assert by_table["memories"].embedded == 2  # counted as "would have"
+    assert embed.await_count == 0  # but never actually called
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_backfill_skips_empty_content_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row with empty / None content is skipped (not re-embedded with
+    a degenerate empty-string vector). Reported under
+    ``skipped_empty_content``."""
+    from core_storage_api.scripts.backfill_embeddings import run_backfill
+
+    rows = {
+        "from memories": [
+            (uuid.uuid4(), "", "h-empty"),
+            (uuid.uuid4(), "real content", "h-real"),
+            (uuid.uuid4(), None, "h-none"),
+        ],
+        "from entities": [],
+    }
+    monkeypatch.setattr(
+        "core_storage_api.database.init.get_engine",
+        lambda: _fake_engine(rows),
+    )
+    embed = AsyncMock(return_value=[0.1] * 1024)
+    monkeypatch.setattr("common.embedding.get_embedding", embed)
+
+    reports = await run_backfill(
+        tenant_id=None, batch_size=500, max_inflight=10, dry_run=False
+    )
+
+    mems = next(r for r in reports if r.table == "memories")
+    assert mems.scanned == 3
+    assert mems.embedded == 1
+    assert mems.skipped_empty_content == 2
+    assert embed.await_count == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_backfill_aborts_on_consecutive_provider_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``get_embedding`` returns None on too many consecutive rows,
+    the backfill raises a RuntimeError so the operator can investigate
+    rather than spending the next hour writing nothing."""
+    from core_storage_api.scripts import backfill_embeddings
+
+    n_rows = backfill_embeddings._MAX_CONSECUTIVE_NONES + 5
+    rows = {
+        "from memories": [
+            (uuid.uuid4(), f"content {i}", f"h{i}") for i in range(n_rows)
+        ],
+        "from entities": [],
+    }
+    monkeypatch.setattr(
+        "core_storage_api.database.init.get_engine",
+        lambda: _fake_engine(rows),
+    )
+    embed = AsyncMock(return_value=None)
+    monkeypatch.setattr("common.embedding.get_embedding", embed)
+
+    with pytest.raises(RuntimeError, match="consecutive rows"):
+        await backfill_embeddings.run_backfill(
+            tenant_id=None, batch_size=500, max_inflight=2, dry_run=False
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_backfill_only_table_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--only-table memories`` skips entities entirely (no scan, no
+    report)."""
+    from core_storage_api.scripts.backfill_embeddings import run_backfill
+
+    rows = {
+        "from memories": [(uuid.uuid4(), "m1", "h-m1")],
+        "from entities": [(uuid.uuid4(), "ENTITY-SHOULD-NOT-BE-PROCESSED")],
+    }
+    monkeypatch.setattr(
+        "core_storage_api.database.init.get_engine",
+        lambda: _fake_engine(rows),
+    )
+    embed = AsyncMock(return_value=[0.1] * 1024)
+    monkeypatch.setattr("common.embedding.get_embedding", embed)
+
+    reports = await run_backfill(
+        tenant_id=None,
+        batch_size=500,
+        max_inflight=10,
+        dry_run=False,
+        only_table="memories",
+    )
+
+    assert len(reports) == 1
+    assert reports[0].table == "memories"
+
+
+# ---------------------------------------------------------------------------
+# CLI exit-code coverage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_amain_returns_2_on_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``RuntimeError`` from ``run_backfill`` (the "consecutive Nones"
+    abort path) maps to exit code 2 — distinguishable for monitoring as
+    "embedding provider degraded" rather than "config / unexpected"."""
+    from core_storage_api.scripts.backfill_embeddings import _amain
+
+    async def _runtime_explode(**_kw):
+        raise RuntimeError("provider returned None on 20 consecutive rows; stopping")
+
+    monkeypatch.setattr(
+        "core_storage_api.scripts.backfill_embeddings.run_backfill",
+        _runtime_explode,
+    )
+    # A real provider name + key so the fake-provider preflight passes and
+    # the test reaches the exit-code mapping under scrutiny (the suite-wide
+    # conftest default is EMBEDDING_PROVIDER=fake, which the preflight
+    # refuses on live runs).
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    code = await _amain([])
+    assert code == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_amain_returns_1_on_unexpected_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Anything that isn't ``RuntimeError`` (DB unreachable,
+    registry-level ``ValueError`` surfacing here, asyncio cancellation,
+    etc.) maps to exit code 1 with a stack trace logged. Exit-code 1 vs
+    2 lets ops monitoring distinguish 'something else is broken' from
+    'provider degraded'."""
+    import logging
+
+    from core_storage_api.scripts.backfill_embeddings import _amain
+
+    async def _value_explode(**_kw):
+        raise ValueError("OPENAI_EMBEDDING_BASE_URL/SEND_DIMENSIONS conflict")
+
+    monkeypatch.setattr(
+        "core_storage_api.scripts.backfill_embeddings.run_backfill",
+        _value_explode,
+    )
+    # See test_amain_returns_2_on_runtime_error: get past the fake-provider
+    # preflight to reach the exit-code mapping.
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    with caplog.at_level(
+        logging.ERROR, logger="core_storage_api.scripts.backfill_embeddings"
+    ):
+        code = await _amain([])
+
+    assert code == 1
+    assert any(
+        "configuration or unexpected error" in rec.getMessage()
+        for rec in caplog.records
+    ), "expected an ERROR log naming the broader error class"
+
+
+# ---------------------------------------------------------------------------
+# CAURA-222: --rewrite-hint-prefixed mode
+# ---------------------------------------------------------------------------
+
+
+def _capturing_engine(
+    rows_by_query: dict[str, list[tuple]],
+) -> tuple[MagicMock, list[str]]:
+    """Like ``_fake_engine`` but also records every SQL string executed,
+    so tests can assert on the WHERE clause shape under different modes."""
+    captured_sql: list[str] = []
+    served: dict[str, bool] = {}
+
+    async def _execute(statement, params=None):
+        sql = str(statement)
+        captured_sql.append(sql)
+        sql_lower = sql.lower()
+        if sql_lower.startswith("update"):
+            return MagicMock()
+        for key, rows in rows_by_query.items():
+            if key in sql_lower and not served.get(key):
+                served[key] = True
+                result = MagicMock()
+                result.all = MagicMock(return_value=rows)
+                return result
+        empty = MagicMock()
+        empty.all = MagicMock(return_value=[])
+        return empty
+
+    conn = MagicMock()
+    conn.execute = AsyncMock(side_effect=_execute)
+    conn.commit = AsyncMock()
+
+    @asynccontextmanager
+    async def _connect():
+        yield conn
+
+    engine = MagicMock()
+    engine.connect = _connect
+    return engine, captured_sql
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rewrite_hint_prefixed_targets_memories_with_hint_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--rewrite-hint-prefixed scans rows where embedding IS NOT NULL
+    and metadata.retrieval_hint is non-empty. The default mode's
+    embedding-IS-NULL filter must NOT appear in this scan."""
+    from core_storage_api.scripts.backfill_embeddings import _ScanMode, run_backfill
+
+    rows = {
+        "from memories": [
+            (uuid.uuid4(), "memory previously embedded with a hint prefix", "h-hint"),
+        ],
+    }
+    engine, captured_sql = _capturing_engine(rows)
+    monkeypatch.setattr("core_storage_api.database.init.get_engine", lambda: engine)
+    embed = AsyncMock(return_value=[0.4] * 1024)
+    monkeypatch.setattr("common.embedding.get_embedding", embed)
+
+    reports = await run_backfill(
+        tenant_id=None,
+        batch_size=500,
+        max_inflight=10,
+        dry_run=False,
+        mode=_ScanMode.REWRITE_HINT_PREFIXED,
+    )
+
+    by_table = {r.table: r for r in reports}
+    assert "memories" in by_table
+    assert by_table["memories"].scanned == 1
+    assert by_table["memories"].embedded == 1
+    assert embed.await_count == 1
+
+    # Verify the SQL filter shape on the SELECT against memories.
+    select_against_memories = [
+        s
+        for s in captured_sql
+        if "select" in s.lower() and "from memories" in s.lower()
+    ]
+    assert select_against_memories, "no SELECT against memories was emitted"
+    sql = select_against_memories[0].lower()
+    assert "embedding is not null" in sql
+    # MODE DISPATCH ONLY — deliberately not the SQL's exact shape.
+    #
+    # This engine is a mock; it never parses SQL, so it cannot tell a valid
+    # column name from an invalid one. That is precisely how this scan shipped
+    # naming a column that does not exist (``metadata_``, the ORM attribute,
+    # where the database column is ``metadata``) and using a jsonb-only ``?``
+    # operator against a ``json`` column — raising on its first statement, in
+    # every run, while an assertion here pinned the broken string in place and
+    # reported green.
+    #
+    # Substituting corrected strings would repeat that mistake with better
+    # spelling. SQL correctness now belongs to
+    # ``core-storage-api/tests/test_backfill_embeddings_provenance.py``, which
+    # executes against real PostgreSQL and therefore fails on SQL that cannot
+    # run. What a mock can honestly assert is which selector this mode chose.
+    assert "retrieval_hint" in sql
+    # Default-mode selector must NOT be present.
+    assert "embedding is null" not in sql
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rewrite_hint_prefixed_skips_entities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Entities don't carry retrieval_hint metadata, so the hint-rewrite
+    mode skips them — even if rows exist on that table, they shouldn't
+    produce a report or burn embed calls."""
+    from core_storage_api.scripts.backfill_embeddings import _ScanMode, run_backfill
+
+    rows = {
+        "from memories": [(uuid.uuid4(), "memory with hint", "h-hint")],
+        "from entities": [(uuid.uuid4(), "Acme Corp")],
+    }
+    engine, captured_sql = _capturing_engine(rows)
+    monkeypatch.setattr("core_storage_api.database.init.get_engine", lambda: engine)
+    embed = AsyncMock(return_value=[0.5] * 1024)
+    monkeypatch.setattr("common.embedding.get_embedding", embed)
+
+    reports = await run_backfill(
+        tenant_id=None,
+        batch_size=500,
+        max_inflight=10,
+        dry_run=False,
+        mode=_ScanMode.REWRITE_HINT_PREFIXED,
+    )
+
+    by_table = {r.table: r for r in reports}
+    assert set(by_table.keys()) == {"memories"}
+    # The entities table should not have been queried at all in this mode.
+    assert not any("from entities" in s.lower() for s in captured_sql)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_default_mode_uses_null_embedding_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Belt-and-braces: the existing IS-NULL scan path is unchanged when
+    --rewrite-hint-prefixed is not set. Pinned here so the new mode's
+    branching can't silently break the default."""
+    from core_storage_api.scripts.backfill_embeddings import run_backfill
+
+    rows = {
+        "from memories": [(uuid.uuid4(), "x", "hx")],
+        "from entities": [],
+    }
+    engine, captured_sql = _capturing_engine(rows)
+    monkeypatch.setattr("core_storage_api.database.init.get_engine", lambda: engine)
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", AsyncMock(return_value=[0.1] * 1024)
+    )
+
+    await run_backfill(
+        tenant_id=None,
+        batch_size=500,
+        max_inflight=10,
+        dry_run=False,
+    )
+
+    select_against_memories = [
+        s
+        for s in captured_sql
+        if "select" in s.lower() and "from memories" in s.lower()
+    ]
+    assert select_against_memories
+    sql = select_against_memories[0].lower()
+    assert "embedding is null" in sql
+    # Hint-rewrite mode markers must be absent.
+    assert "retrieval_hint" not in sql
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_amain_warns_on_non_idempotent_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Live --rewrite-hint-prefixed runs must surface the non-idempotent
+    nature loudly on stderr AND give the operator a 5s grace window to
+    Ctrl-C before the run starts. retrieval_hint metadata is preserved
+    by the rewrite, so every re-run re-matches and re-embeds the same
+    rows — silent on that fact would let an operator burn provider
+    quota on no-op repeats."""
+    from core_storage_api.scripts.backfill_embeddings import _amain
+
+    async def _noop_run(**_kw):
+        return []
+
+    monkeypatch.setattr(
+        "core_storage_api.scripts.backfill_embeddings.run_backfill", _noop_run
+    )
+    # Mock the grace-period sleep so the test doesn't actually wait 5s.
+    sleeps: list[float] = []
+
+    async def _record_sleep(secs: float) -> None:
+        sleeps.append(secs)
+
+    monkeypatch.setattr(
+        "core_storage_api.scripts.backfill_embeddings.asyncio.sleep",
+        _record_sleep,
+    )
+    # Past the fake-provider preflight (conftest pins EMBEDDING_PROVIDER=fake).
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    code = await _amain(["--rewrite-hint-prefixed"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "NOT idempotent" in captured.err
+    assert "metadata.retrieval_hint" in captured.err
+    # Operator grace window: warning fires, then a 5s pause before
+    # any provider call, so a fat-fingered re-invocation can be
+    # caught with Ctrl-C.
+    assert "Starting in 5 s" in captured.err
+    assert sleeps == [5]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_amain_no_warning_on_dry_run_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--dry-run + --rewrite-hint-prefixed does not call the provider
+    or write anything, so the non-idempotency warning + grace pause
+    would just be noise — suppress both for the scope-estimation use
+    case."""
+    from core_storage_api.scripts.backfill_embeddings import _amain
+
+    async def _noop_run(**_kw):
+        return []
+
+    monkeypatch.setattr(
+        "core_storage_api.scripts.backfill_embeddings.run_backfill", _noop_run
+    )
+    sleeps: list[float] = []
+
+    async def _record_sleep(secs: float) -> None:
+        sleeps.append(secs)
+
+    monkeypatch.setattr(
+        "core_storage_api.scripts.backfill_embeddings.asyncio.sleep",
+        _record_sleep,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    code = await _amain(["--rewrite-hint-prefixed", "--dry-run"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "NOT idempotent" not in captured.err
+    assert "Starting in 5 s" not in captured.err
+    assert sleeps == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_amain_no_warning_on_default_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Default null-embedding scan IS idempotent (writes flip rows from
+    NULL to non-NULL, so re-runs see strictly fewer rows). The warning
+    and the grace pause must be scoped to --rewrite-hint-prefixed only."""
+    from core_storage_api.scripts.backfill_embeddings import _amain
+
+    async def _noop_run(**_kw):
+        return []
+
+    monkeypatch.setattr(
+        "core_storage_api.scripts.backfill_embeddings.run_backfill", _noop_run
+    )
+    sleeps: list[float] = []
+
+    async def _record_sleep(secs: float) -> None:
+        sleeps.append(secs)
+
+    monkeypatch.setattr(
+        "core_storage_api.scripts.backfill_embeddings.asyncio.sleep",
+        _record_sleep,
+    )
+    # Past the fake-provider preflight (conftest pins EMBEDDING_PROVIDER=fake).
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    code = await _amain([])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "NOT idempotent" not in captured.err
+    assert sleeps == []
+
+
+# ---------------------------------------------------------------------------
+# Fake-provider preflight
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_amain_refuses_live_run_on_fake_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """EMBEDDING_PROVIDER=fake + live run → exit 1 before any backfill
+    work. A fake 'repair' flips rows out of the NULL selector forever, so
+    the refusal must fire before ``run_backfill``."""
+    import logging
+
+    from core_storage_api.scripts.backfill_embeddings import _amain
+
+    called: list[bool] = []
+
+    async def _must_not_run(**_kw):
+        called.append(True)
+        return []
+
+    monkeypatch.setattr(
+        "core_storage_api.scripts.backfill_embeddings.run_backfill", _must_not_run
+    )
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "fake")
+
+    with caplog.at_level(
+        logging.ERROR, logger="core_storage_api.scripts.backfill_embeddings"
+    ):
+        code = await _amain([])
+
+    assert code == 1
+    assert called == []
+    assert "resolved to FAKE" in caplog.text
+    assert "--allow-fake-provider" in caplog.text
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_amain_refuses_openai_that_degrades_to_fake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider "openai" with no key anywhere (tenant, env, platform)
+    degrades to FakeEmbeddingProvider inside the registry — the preflight
+    must catch what actually RESOLVED, not just the name. This is the case
+    the old openai-without-OPENAI_API_KEY guard checked, now subsumed."""
+    from core_storage_api.scripts.backfill_embeddings import _amain
+
+    called: list[bool] = []
+
+    async def _must_not_run(**_kw):
+        called.append(True)
+        return []
+
+    monkeypatch.setattr(
+        "core_storage_api.scripts.backfill_embeddings.run_backfill", _must_not_run
+    )
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "openai")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    # conftest pins PLATFORM_EMBEDDING_PROVIDER="" so the platform tier is
+    # off; make it explicit here since it is what this test is about.
+    monkeypatch.setenv("PLATFORM_EMBEDDING_PROVIDER", "")
+
+    code = await _amain([])
+
+    assert code == 1
+    assert called == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_amain_allow_fake_provider_overrides_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--allow-fake-provider is the dev/test escape hatch: same fake
+    environment as the refusal test, but the run proceeds."""
+    from core_storage_api.scripts.backfill_embeddings import _amain
+
+    called: list[bool] = []
+
+    async def _record_run(**_kw):
+        called.append(True)
+        return []
+
+    monkeypatch.setattr(
+        "core_storage_api.scripts.backfill_embeddings.run_backfill", _record_run
+    )
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "fake")
+
+    code = await _amain(["--allow-fake-provider"])
+
+    assert code == 0
+    assert called == [True]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_amain_dry_run_skips_fake_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--dry-run makes no provider calls and writes nothing, so it must
+    work in keyless/fake environments — that is the scope-estimation use
+    case."""
+    from core_storage_api.scripts.backfill_embeddings import _amain
+
+    called: list[bool] = []
+
+    async def _record_run(**_kw):
+        called.append(True)
+        return []
+
+    monkeypatch.setattr(
+        "core_storage_api.scripts.backfill_embeddings.run_backfill", _record_run
+    )
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "fake")
+
+    code = await _amain(["--dry-run"])
+
+    assert code == 0
+    assert called == [True]
+
+
+# ---------------------------------------------------------------------------
+# Embedding provenance: which text each written vector was built from
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_production_specs_declare_provenance_where_the_columns_exist():
+    """Pins the two specs to the schema they actually run against.
+
+    ``memories`` has ``embedded_content_hash`` (migration 037) and must stamp
+    it; ``entities`` has neither that column nor a content hash and must not,
+    or every entity write fails with an undefined-column error.
+
+    Without this, a spec quietly losing its provenance columns would leave the
+    behavioural tests in ``core-storage-api/tests/`` passing against a table
+    that had stopped recording anything — the same silent-success shape the
+    provenance column exists to make impossible.
+    """
+    from core_storage_api.scripts.backfill_embeddings import _TARGETS
+
+    by_table = {s.table: s for s in _TARGETS}
+
+    memories = by_table["memories"]
+    assert memories.provenance is not None, (
+        "memories must stamp provenance; without it the sweep moves rows into "
+        "embedding IS NOT NULL AND embedded_content_hash IS NULL, which nothing scans"
+    )
+    assert memories.provenance.source_hash_column == "content_hash"
+    assert memories.provenance.stamp_column == "embedded_content_hash"
+
+    assert by_table["entities"].provenance is None, (
+        "entities has neither column; declaring provenance would emit an "
+        "undefined-column assignment on every entity write"
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_provenance_rides_the_same_update_as_the_vector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One statement, not two.
+
+    A follow-up UPDATE could commit the vector and then fail before the stamp,
+    leaving exactly the un-provenanced row this guards against — and leaving it
+    on the error path, where it is least likely to be noticed. Asserting on the
+    emitted SQL rather than on a written row because the coupling being pinned
+    is "same statement", which a row read cannot distinguish.
+    """
+    from core_storage_api.scripts.backfill_embeddings import (
+        _TARGETS,
+        _backfill_one_table,
+        _ScanMode,
+    )
+
+    rows = {"from memories": [(uuid.uuid4(), "content", "the-hash")]}
+    engine, captured_sql = _capturing_engine(rows)
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", AsyncMock(return_value=[0.1] * 1024)
+    )
+
+    await _backfill_one_table(
+        engine,
+        next(s for s in _TARGETS if s.table == "memories"),
+        tenant_id=None,
+        batch_size=10,
+        max_inflight=1,
+        dry_run=False,
+        mode=_ScanMode.NULL_EMBEDDING,
+    )
+
+    updates = [s for s in captured_sql if s.lower().startswith("update")]
+    assert len(updates) == 1, f"expected exactly one UPDATE, got {len(updates)}"
+    sql = updates[0].lower()
+    assert "embedding = (:emb)::vector" in sql
+    assert "embedded_content_hash = :ch" in sql, (
+        "provenance is not written by the same statement as the vector"
+    )

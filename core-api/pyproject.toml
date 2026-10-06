@@ -1,0 +1,238 @@
+[project]
+name = "core-api"
+version = "3.25.0"
+description = "Caura Core API service"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    # FastAPI 0.137+ is OK since #364 made the startup guard read app.openapi()
+    # instead of walking app.routes (0.137's include_router mounts a sub-app,
+    # hiding prefixed paths from app.routes). The committed uv.lock pins the exact
+    # version; this range only bounds future re-locks.
+    "fastapi>=0.141.1,<1",
+    "uvicorn[standard]>=0.51.0,<1",
+    # Capped below 2.1 for the reason given in core-storage-api/pyproject.toml;
+    # the two packages move to 2.1 together.
+    "sqlalchemy[asyncio]>=2.0,<2.1",
+    # SQLAlchemy[asyncio] pulls in greenlet. greenlet 3.5.0 shipped wheels for
+    # macOS/Windows ARM only (no Linux x86_64) which broke the Linux runner, but
+    # 3.5.1 restored the Linux x86_64 wheels — so the old <3.5.0 cap is lifted to
+    # <3.6.0 (kept only as a major-version guardrail).
+    "greenlet<3.6.0",
+    "asyncpg>=0.30,<1",
+    "pgvector>=0.5.0,<1",
+    # Required by the insights discover mode (services/insights_service.py
+    # ``_numpy_kmeans``). Declared explicitly because pgvector <0.5.0 used to
+    # pull it in transitively; 0.5.0 made numpy optional, which silently
+    # dropped it from the image and degraded discover to the flat fallback.
+    "numpy>=2.0,<3",
+    "alembic>=1.19.0,<2",
+    "pydantic>=2.0,<3",
+    "pydantic-settings>=2.15.0,<3",
+    "google-cloud-aiplatform>=1.163.0,<3",
+    "google-genai>=2.17.0",
+    "openai>=3,<4",
+    "python-dateutil>=2.8,<3",
+    "httpx>=0.27,<1",
+    "httpx2>=2,<3",
+    "mcp>=2.1.1,<3",
+    "argon2-cffi>=23.1",
+    "cryptography>=42.0",
+    "python-jose[cryptography]>=3.3",
+    "pyotp>=2.9",
+    "cachetools>=7.1.7",
+    "croniter>=6.2.4",
+    # redis-py cap lifted <6 -> <9 (lock resolves 8.0.0). 8.x dropped its pyjwt
+    # transitive and reworked the connection pool, but core-api only uses
+    # ``redis.asyncio.from_url`` (cache.py) and ``r.pipeline(transaction=False)``
+    # (providers/redis_stm.py) — both stable across the 5->8 jump and exercised by
+    # the full test suite under 8.0.0. <9 keeps the next major out as a guardrail.
+    "redis[hiredis]>=8.0.1,<9",
+    "slowapi>=0.1.9,<1.0",
+    "sentry-sdk[fastapi]>=2.66.0,<3",
+    "structlog>=25.4,<27",
+    # PR #7 (Tier-1 ingest A4): structure-aware document chunking.
+    # All three are pure-Python (no system C deps); together ~1 MB.
+    "markdown-it-py>=4.0,<5",  # markdown AST walker
+    "tiktoken>=0.10,<1",  # cl100k_base token counter for size caps
+    "pysbd>=0.3,<1",  # sentence boundary detection for sub-chunk splits
+    # PR #9: FastAPI's UploadFile / Form support needs python-multipart at
+    # runtime. Pulled in transitively today via ``mcp`` but declaring
+    # explicitly so removing/upgrading mcp can't silently break uploads.
+    "python-multipart>=0.0.20,<1",
+]
+
+[project.optional-dependencies]
+# Optional: required only when EVENT_BUS_BACKEND=pubsub (SaaS deployments).
+# Standalone installs default to the in-process bus and don't need this.
+pubsub = ["google-cloud-pubsub>=2.39.1,<3"]
+# Datadog APM tracer (CAURA-0000 observability POC). Opt-in: the app runs under
+# ``ddtrace-run`` only in the Caura SaaS deploy (see Dockerfile /
+# docker-entrypoint.sh). Kept out of the default install so OSS / on-prem /
+# local images carry zero Datadog code. Build with `--extra datadog`
+# (Dockerfile: --build-arg DD_APM_ENABLED=true). Auto-instruments FastAPI /
+# SQLAlchemy / asyncpg / httpx / redis with no code changes.
+datadog = ["ddtrace>=4.12.2"]
+# Optional: multi-format document extraction for the /ingest/* endpoints.
+# Kreuzberg (~64MB, Elastic-2.0) is excluded from the default image to cut
+# cold-start pull + import time — the ingest endpoints return 501 without it
+# (see core_api.services.ingest_service guarded import). Build with
+# `--extra ingest` (Dockerfile: --build-arg WITH_INGEST=1) to enable ingest.
+ingest = ["kreuzberg>=4.10.2,<5"]
+dev = [
+    "core-api[test,pubsub,ingest]",
+    "mypy>=2.3.0,<3.0",
+    "ruff>=0.16.2,<1.0",
+    "types-croniter>=6.2.4.20260711",
+]
+test = [
+    "pytest>=9.1.1,<10.0",
+    "pytest-asyncio>=0.24,<2.0",
+    "pytest-cov>=6.0,<8.0",
+    "httpx>=0.27,<1.0",
+]
+
+[build-system]
+requires = ["setuptools>=83.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 110
+
+exclude = [
+    ".git", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".venv", "__pycache__", "build", "dist",
+]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "B", "C4", "UP", "ARG",
+    "SIM", "TCH", "PTH", "RUF", "ASYNC",
+]
+ignore = [
+    "E501", "TC001", "TC002", "TC003", "ARG001", "ARG002",
+    "B008", "B904", "RUF022", "PTH123", "RUF006", "SIM117",
+    "RUF012", "RUF009",
+    "SIM108", "SIM105", "SIM103", "E701", "E402",
+    "B905", "B007", "B023",
+    "UP042", "UP047",
+    "PTH103", "PTH111", "PTH120",
+    "RUF005", "RUF034", "RUF059",
+    "ASYNC109",
+]
+fixable = ["ALL"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ARG", "S101", "F841"]
+"__init__.py" = ["F401", "E402"]
+"**/app.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["core_api", "common"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.12"
+# ``..`` is the repo root, where ``common/`` lives. common/ is not an installed
+# distribution — it is PYTHONPATH-mounted (the Dockerfile COPYs it to
+# /app/common), so without the repo root here every ``common.*`` import degrades
+# to Any under ``ignore_missing_imports`` and this service's use of the shared
+# library is checked by nothing. That is what let ``from common.llm import
+# LLMRequest`` — a name that has never existed there — ship in the forge cron and
+# raise on every tick (#955) while ``mypy src/`` reported no issues in 200 files.
+# Relative to this file, so CI, a local ``mypy src/`` and an IDE all agree.
+mypy_path = "src:.."
+explicit_package_bases = true
+warn_return_any = false
+warn_unused_ignores = false
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true
+
+# Modules not yet type-checked. Deliberately enumerated one module per line
+# rather than globbed: ``core_api.services.*`` and ``core_api.pipeline.steps.*``
+# exempted 105 modules in order to cover the 19 that actually fail. Seven of
+# the remainder were already recovered by the ``forge`` carve-out below; the
+# other 79 were ungated for no reason — and, worse, every *future* file under
+# those two trees was exempt on creation. A new ``services/_probe.py``
+# returning ``str`` from an ``-> int`` function was reported as "Success: no
+# issues found in 201 source files"; with the globs gone the same file errors.
+#
+# Enumerating the 19 gates those 79, plus ``providers.local_embedding`` which
+# was on this list despite having no errors at all — 80 modules, no code
+# change. It also makes the list a ratchet: a module becomes exempt only by
+# someone adding it here in a reviewed diff, never by being born in the right
+# directory.
+#
+# Every line below is a to-do, not a policy. Delete one, fix what mypy then
+# reports, and the gate tightens for good. That is how
+# ``core_api.services.forge.*`` was recovered: it sat inside the
+# ``core_api.services.*`` glob while ``forge/cron_handler.py`` imported
+# ``LLMRequest`` from ``common.llm`` — a name that has never existed there —
+# and the forge distill cron raised RuntimeError on every tick and had never
+# once run (#955). Being inside an exempted tree is what kept that invisible.
+[[tool.mypy.overrides]]
+module = [
+    "core_api.providers._registry",
+    "core_api.services.contradiction_detector",
+    "core_api.services.crystallizer_service",
+    "core_api.services.entity_extraction_worker",
+    "core_api.services.entity_service",
+    "core_api.services.evolve_service",
+    "core_api.services.governance_remediation",
+    "core_api.services.ingest_service",
+    "core_api.services.insights_service",
+    "core_api.services.interview_service",
+    "core_api.services.memory_service",
+    "core_api.services.organization_settings",
+    "core_api.services.session_trace",
+    "core_api.services.skill_promoter",
+    "core_api.services.stm_service",
+    "core_api.pipeline.steps.search.classify_query",
+    "core_api.pipeline.steps.search.load_and_serialize",
+    "core_api.pipeline.steps.search.parallel_embed_entity_boost",
+    "core_api.pipeline.steps.write.parallel_embed_enrich",
+    "core_api.pipeline.steps.write.schedule_background_tasks",
+    "core_api.routes.fleet",
+    "core_api.clients.storage_client",
+    "core_api.app",
+    "core_api.auth",
+]
+ignore_errors = true
+
+# Redundant against the enumerated list above — forge is no longer inside any
+# exempted glob — and kept anyway. mypy applies the last matching override, so
+# this pins the one module whose exemption is known to have hidden a total
+# production outage, whatever a later edit does to the list above. Three lines
+# of backstop on a gate that has already failed once.
+[[tool.mypy.overrides]]
+module = "core_api.services.forge.*"
+ignore_errors = false
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+omit = ["*/tests/*", "*/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+fail_under = 50
+show_missing = true

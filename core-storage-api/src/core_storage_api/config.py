@@ -1,0 +1,220 @@
+"""Service configuration — all env vars validated at startup."""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+from urllib.parse import quote
+
+from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from common.storage_auth import read_shared_secret_file
+from core_storage_api.db_tls import tls_connect_args
+
+# The "local-dev compatibility default" this preserved is retired: the whole
+# ephemeral local/CI Postgres role+db population (ci.yml, both docker-compose
+# files, .env.example, env.dev, this default) was renamed to the Caura spelling
+# together in one sweep, so nothing outside this repo depends on the old value
+# here any more. Not a legacy-name-ok alias — just the current default.
+LOCAL_DATABASE_URL = "postgresql+asyncpg://caura:changeme@localhost:5432/caura"
+
+
+def _alloydb_database_url(*, host: str, port: int, user: str, password: str, database: str) -> str:
+    return (
+        "postgresql+asyncpg://"
+        f"{quote(user, safe='')}:{quote(password, safe='')}@"
+        f"{host}:{port}/{quote(database, safe='')}"
+    )
+
+
+class Settings(BaseSettings):
+    # ``extra="ignore"`` mirrors core-api/core-worker so a shared monorepo
+    # ``.env`` file (e.g. with OPENAI_API_KEY for core-api) doesn't fail
+    # this service's ``Settings()`` construction at import time. Without
+    # the flag, every unit-test run that touches a module which
+    # transitively imports this config crashes on
+    # ``extra_forbidden`` for keys this service doesn't own.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    environment: Literal["development", "production", "sandbox"] = "development"
+
+    # Database — writes go to the primary at ``database_url``. Reads
+    # route to ``read_database_url`` when it's set (e.g. a managed-Postgres
+    # read replica) and fall back to the primary when empty (OSS
+    # standalone — a single box with no replica). The split offloads
+    # search / GET traffic from the primary. Replication lag on a
+    # streaming replica is typically <5s, acceptable for the read paths
+    # we route.
+    database_url: SecretStr = Field(default=SecretStr(LOCAL_DATABASE_URL), repr=False, exclude=True)
+    # SaaS can bind only ALLOYDB_PASSWORD from Secret Manager. These remain
+    # ordinary settings fields so constructor and .env sources work too.
+    alloydb_host: str = ""
+    alloydb_port: int | None = None
+    alloydb_user: str = ""
+    alloydb_password: SecretStr = SecretStr("")
+    alloydb_database: str = ""
+    read_database_url: SecretStr = Field(default=SecretStr(""), repr=False, exclude=True)
+    # 5+5 matches the post-PR-#166 ``platform-storage-api`` defaults so
+    # both services share the same pool sizing without per-environment
+    # env-var overrides. Pre-this-fix the source defaults were 20+20,
+    # which staging worked around with ``--remove-env-vars`` /
+    # explicit env-var overrides on the writer + reader Cloud Run
+    # services; the mismatch was a footgun for fresh deploys (a new
+    # operator would inherit the 20+20 source default and silently
+    # over-allocate against AlloyDB's connection ceiling, which we
+    # observed on loadtest-1777301515 as
+    # ``asyncpg.TooManyConnectionsError`` during the storm window).
+    # Operators that genuinely need a larger pool can still set
+    # ``DB_POOL_SIZE`` / ``DB_MAX_OVERFLOW`` explicitly; the source
+    # default is now the safe baseline rather than a value that
+    # requires environment-side correction.
+    # Require TLS on every connection this service opens to Postgres.
+    #
+    # Documented in ``.env.example``, ``AGENT-INSTALL.md`` and both compose
+    # files as "Set true in production" since it was introduced, and read by
+    # nothing: no ``connect_args``, no ``sslmode``, no ``ssl=`` existed
+    # anywhere in the tree. ``extra="ignore"`` above is why that was silent —
+    # pydantic-settings accepted the variable and dropped it, so an operator
+    # who set it got neither TLS nor an error. A security control that cannot
+    # be switched on is worse than an absent one: the absent one does not tell
+    # you it is protecting you.
+    #
+    # ``"require"`` encrypts and refuses a server that will not upgrade, which
+    # is what the name promises. It deliberately does NOT verify the
+    # certificate — that is ``"verify-full"``, and it needs a CA bundle
+    # shipped and configured, so offering it here without one would be the
+    # same empty promise in a new place. Operators who need verification pass
+    # it on the DSN (``?ssl=verify-full``); ``db_tls.tls_connect_args`` leaves
+    # such a DSN alone rather than downgrading it, which takes an explicit
+    # check — see there.
+    postgres_require_ssl: bool = False
+    db_pool_size: int = 5
+    db_max_overflow: int = 5
+    db_pool_timeout: int = 60
+    db_pool_recycle: int = 1800
+
+    # How long a booting writer waits to acquire the migration advisory lock
+    # before giving up. One replica runs ``alembic upgrade head`` while holding
+    # the lock; the others poll for it and only serve once it's released. This
+    # must comfortably exceed the slowest real migration — a large
+    # ``CREATE INDEX CONCURRENTLY`` / backfill can run for minutes, and the lock
+    # is held for the whole run — so a legitimately slow migration doesn't crash
+    # the N-1 booting replicas waiting on it. It was a hardcoded 300s, which
+    # migration 025 blew past on 2026-06-16, failing 6 writer boots. The wait is
+    # now a STUCK-migration backstop, not a routine cap. Keep it <= the Cloud Run
+    # startup-probe deadline, or the probe kills the instance before this fires.
+    # Env: MIGRATION_LOCK_WAIT_SECONDS.
+    migration_lock_wait_seconds: int = 1800
+
+    @model_validator(mode="after")
+    def resolve_alloydb_database_url(self) -> Settings:
+        # Explicit DATABASE_URL wins, even when shared environment files carry
+        # incomplete ALLOYDB_* values for another service.
+        if "database_url" in self.model_fields_set:
+            return self
+
+        password = self.alloydb_password.get_secret_value()
+        values = {
+            "ALLOYDB_HOST": self.alloydb_host,
+            "ALLOYDB_USER": self.alloydb_user,
+            "ALLOYDB_PASSWORD": password,
+            "ALLOYDB_DATABASE": self.alloydb_database,
+        }
+        attempted = any(values.values()) or self.alloydb_port is not None
+        if not attempted:
+            return self
+
+        missing = [name for name, value in values.items() if not value]
+        if missing:
+            raise ValueError(f"incomplete AlloyDB configuration; missing: {', '.join(missing)}")
+
+        self.database_url = SecretStr(
+            _alloydb_database_url(
+                host=self.alloydb_host,
+                port=self.alloydb_port or 5432,
+                user=self.alloydb_user,
+                password=password,
+                database=self.alloydb_database,
+            )
+        )
+        return self
+
+    # Service role (CAURA-591 Part B). "hybrid" keeps the original
+    # single-service behaviour and is the safe default for OSS + any
+    # deploy that hasn't opted into the split. Enterprise SaaS runs
+    # two Cloud Run services: the writer (role=writer) owns schema +
+    # serves POST/PATCH/DELETE, the reader (role=reader) runs no
+    # migrations, skips write routes, and uses the read-pool URL as
+    # its primary connection.
+    core_storage_role: Literal["writer", "reader", "hybrid"] = "hybrid"
+    # Internal caller credential. Empty is deliberately not an auth bypass:
+    # the middleware rejects every HTTP request until a value is configured.
+    core_storage_shared_secret: SecretStr = Field(default=SecretStr(""), repr=False, exclude=True)
+    core_storage_shared_secret_file: str = ""
+    # ``GET /_debug/pg_locks`` (contention triage) answers only when this is on
+    # (L-75). Off by default: it reads session state from pg_stat_activity, so
+    # turn it on for a load test or an incident and back off afterwards.
+    core_storage_debug_endpoints: bool = False
+
+    @model_validator(mode="after")
+    def resolve_core_storage_shared_secret(self) -> Settings:
+        if not self.core_storage_shared_secret.get_secret_value():
+            self.core_storage_shared_secret = SecretStr(
+                read_shared_secret_file(self.core_storage_shared_secret_file)
+            )
+        return self
+
+    # Logging
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    # JSON output by default so Cloud Logging picks up severity/message.
+    # Local developers can set LOG_FORMAT_JSON=false for structlog's
+    # coloured ConsoleRenderer.
+    log_format_json: bool = True
+    # On-prem deployments set this to /var/log/caura/<service>/<service>.log
+    # so logs land on disk too (daily-rotated, 5-day retention). Empty string
+    # means stdout only — the SaaS default, unchanged.
+    log_file: str = ""
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def validate_log_level(cls, v: Any) -> Any:
+        # Pydantic's Literal check rejects invalid values with a clear error
+        # after we return — this validator only needs to uppercase so env
+        # vars like LOG_LEVEL=debug are accepted.
+        return v.upper() if isinstance(v, str) else v
+
+    # CORS — internal service, restrict to known callers
+    cors_origins: str = "http://localhost:8000"
+
+    # Scoring
+    # Soft boost applied to memories whose anchor date falls inside the
+    # query-extracted date range.  Replaces the old hard WHERE filter so
+    # semantically strong out-of-range memories stay retrievable.
+    date_range_boost_factor: float = 2.0
+
+    # Soft penalty applied to memories whose ts_valid_end is in the past
+    # relative to the query's valid_at.  Replaces the old hard WHERE filter
+    # (`ts_valid_end >= valid_at`) — an over-eager enrichment date no longer
+    # catastrophically hides the memory, just down-weights it.
+    expired_currency_factor: float = 0.5
+
+
+settings = Settings()  # type: ignore[call-arg]
+
+
+def db_connect_args(dsn: str | None = None) -> dict[str, object]:
+    """asyncpg connect kwargs carrying the configured TLS policy.
+
+    One helper rather than a flag read at each call site, because the sites
+    that matter are easy to miss: the app's engines, the migration runner, and
+    the preflight script all open their own connections, and a migration
+    running in cleartext against a database the app reaches over TLS would
+    defeat the setting while looking configured.
+
+    The policy itself lives in ``core_storage_api.db_tls``, which constructs no
+    ``Settings``. This module cannot be imported without doing so, and the
+    preflight script is documented as runnable (via ``--dsn``) in environments
+    where that construction fails — so the two need one shared implementation
+    reachable from both, not a copy each.
+    """
+    return tls_connect_args(dsn, require=settings.postgres_require_ssl)

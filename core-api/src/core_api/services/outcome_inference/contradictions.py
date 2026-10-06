@@ -1,0 +1,104 @@
+"""Contradiction signal — memory got contradicted soon after recall.
+
+The existing :mod:`core_api.services.contradiction_detector` (Path A
++ Path C) flags memories whose claims a newer write contradicted.
+The detector's effect on the data plane is a status flip on the
+OLDER memory:
+
+  - ``status = 'outdated'``    — RDF-triple path detected a stale
+                                  state-transition (older lost the race)
+  - ``status = 'conflicted'``  — semantic path found a contradiction
+                                  that didn't resolve cleanly
+
+Both indicate "this memory turned out to be wrong" and therefore
+the session that wrote it likely failed at its task. This signal
+fires polarity=FAILURE on the trace that produced the now-outdated /
+conflicted memory.
+
+We restrict the window check to the status TRANSITION time, not the
+memory's original ``created_at`` — i.e. a memory that's been around
+for weeks but only just got contradicted SHOULD still register a
+firing inside the current scan window. Until the storage layer adds
+a ``status_changed_at`` column (CAURA-future), we approximate via
+``COALESCE(updated_at, created_at)`` (an outdated/conflicted memory's
+``updated_at`` is the status flip).
+
+Plan §6 signal #1. Plan §3 schema field
+``signals_summary.contradiction``.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from core_api.clients.storage_client import get_storage_client
+
+from . import (
+    DEFAULT_SIGNAL_WEIGHTS,
+    Polarity,
+    SignalEvidence,
+    SignalKind,
+    SignalQuery,
+    parse_observed_at,
+)
+
+logger = logging.getLogger(__name__)
+
+kind: SignalKind = SignalKind.CONTRADICTION
+
+
+# Re-exported, not redefined: this module treats both as failure evidence, and
+# the set is now shared with every other guard that reads it. See
+# ``core_api.constants``.
+from core_api.constants import CONTRADICTED_STATUSES
+
+
+async def extract(query: SignalQuery) -> list[SignalEvidence]:
+    """Return one evidence per contradicted memory whose status flip
+    falls inside the window. The trace that originally wrote the
+    memory (``run_id``, ``agent_id``) is the one that pays the
+    FAILURE polarity.
+
+    As of Fix 2 Ph5a the analytic read goes through core-storage-api
+    (``sc.outcome_contradiction_signals``); the PG SQL — ``status =
+    ANY(:contradicted_statuses)`` + window on
+    ``COALESCE(updated_at, created_at)`` — lives in
+    ``PostgresService.outcome_contradiction_signals``.
+    """
+    weight = DEFAULT_SIGNAL_WEIGHTS[SignalKind.CONTRADICTION]
+
+    rows = await get_storage_client().outcome_contradiction_signals(
+        tenant_id=query.tenant_id,
+        fleet_id=query.fleet_id,
+        window_start=query.window_start,
+        window_end=query.window_end,
+        contradicted_statuses=list(CONTRADICTED_STATUSES),
+        run_id=query.run_id,
+        agent_id=query.agent_id,
+    )
+
+    out: list[SignalEvidence] = []
+    for row in rows:
+        out.append(
+            SignalEvidence(
+                kind=SignalKind.CONTRADICTION,
+                polarity=Polarity.FAILURE,
+                weight=weight,
+                memory_ids=(str(row["memory_id"]),),
+                details={
+                    "memory_id": str(row["memory_id"]),
+                    "status": row["status"],
+                    "run_id": row["run_id"],
+                    "agent_id": row["agent_id"],
+                },
+                observed_at=parse_observed_at(row.get("observed_at")),
+            )
+        )
+
+    if out:
+        logger.debug(
+            "contradiction signal: %d firings in window for tenant=%s",
+            len(out),
+            query.tenant_id,
+        )
+    return out

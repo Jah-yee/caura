@@ -1,0 +1,884 @@
+"""Unit tests for common.structlog_config — GCP-compatible structlog processors."""
+
+from __future__ import annotations
+
+import json
+import logging
+import warnings
+
+import pytest
+
+import common.structlog_config as structlog_config
+from common.structlog_config import (
+    _THIRD_PARTY_LOGGERS_TO_REROUTE,
+    _add_datadog_status,
+    _add_dd_trace_context,
+    _map_to_gcp_severity,
+    _rename_event_to_message,
+    _reset_for_testing,
+    _route_third_party_to_root,
+    _third_party_logger_original_state,
+    configure_logging,
+)
+
+
+def test_map_to_gcp_severity_adds_matching_label() -> None:
+    for method, expected in [
+        ("info", "INFO"),
+        ("warning", "WARNING"),
+        ("warn", "WARNING"),
+        ("error", "ERROR"),
+        ("critical", "CRITICAL"),
+        ("debug", "DEBUG"),
+    ]:
+        event_dict = {"event": "hello"}
+        result = _map_to_gcp_severity(None, method, event_dict)
+        assert result["severity"] == expected
+
+
+def test_map_to_gcp_severity_unknown_method_falls_back_to_default() -> None:
+    result = _map_to_gcp_severity(None, "notice", {"event": "hi"})
+    assert result["severity"] == "DEFAULT"
+
+
+def test_map_to_gcp_severity_preserves_explicit_override() -> None:
+    # Callers can pass severity= directly to log a higher level than the
+    # method name implies (e.g. logger.info("x", severity="NOTICE")).
+    result = _map_to_gcp_severity(None, "info", {"event": "x", "severity": "NOTICE"})
+    assert result["severity"] == "NOTICE"
+
+
+def test_map_to_gcp_severity_treats_none_override_as_absent() -> None:
+    # `logger.info("x", severity=None)` must not leak "severity": null to
+    # Cloud Logging (which treats it as DEFAULT).
+    result = _map_to_gcp_severity(None, "info", {"event": "x", "severity": None})
+    assert result["severity"] == "INFO"
+
+
+def test_map_to_gcp_severity_treats_empty_string_as_absent() -> None:
+    # GCP maps severity="" to DEFAULT too — replace with the method-derived
+    # label the same way we do for None.
+    result = _map_to_gcp_severity(None, "info", {"event": "x", "severity": ""})
+    assert result["severity"] == "INFO"
+
+
+def test_map_to_gcp_severity_preserves_falsy_non_none_non_empty() -> None:
+    # Don't silently rewrite 0/False/[] — those are caller-bound values, not
+    # an "absent" signal. Contract is: None and "" are absent; anything else
+    # is intentional.
+    values: list[object] = [0, False, []]
+    for value in values:
+        result = _map_to_gcp_severity(None, "info", {"event": "x", "severity": value})
+        assert result["severity"] == value
+
+
+def test_add_datadog_status_maps_each_level() -> None:
+    # Run after _map_to_gcp_severity, exactly as ordered in
+    # _json_processors(), so the status derives from the final severity.
+    for method, expected in [
+        ("info", "info"),
+        ("warning", "warning"),
+        ("warn", "warning"),
+        ("error", "error"),
+        ("critical", "critical"),
+        ("debug", "debug"),
+    ]:
+        event_dict = _map_to_gcp_severity(None, method, {"event": "hello"})
+        result = _add_datadog_status(None, method, event_dict)
+        assert result["status"] == expected
+
+
+def test_add_datadog_status_unknown_method_falls_back_to_info() -> None:
+    # "notice" isn't a structlog level method: severity lands DEFAULT and
+    # status degrades to "info" (Datadog's own default for unrecognized
+    # values) rather than leaking "default".
+    event_dict = _map_to_gcp_severity(None, "notice", {"event": "hi"})
+    result = _add_datadog_status(None, "notice", event_dict)
+    assert result["status"] == "info"
+
+
+def test_add_datadog_status_severity_override_carries_through() -> None:
+    # Explicit severity= overrides — the module-documented route to levels
+    # the standard methods can't emit — must agree across both backends.
+    # NOTICE/ALERT/EMERGENCY are valid syslog-style Datadog statuses.
+    for override, expected in [
+        ("ERROR", "error"),
+        ("NOTICE", "notice"),
+        ("ALERT", "alert"),
+        ("EMERGENCY", "emergency"),
+    ]:
+        result = _add_datadog_status(None, "info", {"event": "x", "severity": override})
+        assert result["status"] == expected
+
+
+def test_add_datadog_status_unrecognized_severity_uses_method_level() -> None:
+    # A severity outside the GCP enum (e.g. an app-domain label that slipped
+    # through) has no Datadog meaning; status falls back to the real
+    # call-site level instead of a value intake would degrade to info.
+    result = _add_datadog_status(None, "warning", {"event": "x", "severity": "P1"})
+    assert result["status"] == "warning"
+
+
+def test_add_datadog_status_falsy_severity_uses_method_level() -> None:
+    # 0/False/[] severities are preserved for GCP (see
+    # test_map_to_gcp_severity_preserves_falsy_non_none_non_empty); status
+    # must derive from the method rather than crash or emit garbage.
+    values: list[object] = [0, False, []]
+    for value in values:
+        result = _add_datadog_status(None, "error", {"event": "x", "severity": value})
+        assert result["status"] == "error"
+
+
+class _FakeTracer:
+    """Stand-in for ddtrace's tracer exposing get_log_correlation_context()."""
+
+    def __init__(self, ctx: dict[str, str]) -> None:
+        self._ctx = ctx
+
+    def get_log_correlation_context(self) -> dict[str, str]:
+        return self._ctx
+
+
+def test_add_dd_trace_context_noop_without_ddtrace(monkeypatch) -> None:
+    # OSS / on-prem: ddtrace isn't installed, so the guarded import left the
+    # module-level tracer None. The processor must pass the event dict through
+    # untouched — no dd.* keys, no crash.
+    monkeypatch.setattr(structlog_config, "_dd_tracer", None)
+    event_dict = {"event": "hello"}
+    result = _add_dd_trace_context(None, "info", event_dict)
+    assert result == {"event": "hello"}
+
+
+def test_add_dd_trace_context_injects_ids_for_active_span(monkeypatch) -> None:
+    monkeypatch.setattr(
+        structlog_config,
+        "_dd_tracer",
+        _FakeTracer(
+            {
+                "dd.trace_id": "6a5fc7b3000000006d13f630a5c9fb22",
+                "dd.span_id": "12914032455535133506",
+                "dd.service": "core-api",
+                "dd.version": "",
+                "dd.env": "production",
+            }
+        ),
+    )
+    result = _add_dd_trace_context(None, "info", {"event": "x"})
+    assert result["dd.trace_id"] == "6a5fc7b3000000006d13f630a5c9fb22"
+    assert result["dd.span_id"] == "12914032455535133506"
+
+
+def test_add_dd_trace_context_skips_when_no_active_span(monkeypatch) -> None:
+    # ddtrace returns trace_id "0" when no span is active; the processor must
+    # NOT stamp ambient (non-request) logs with a null trace.
+    monkeypatch.setattr(
+        structlog_config,
+        "_dd_tracer",
+        _FakeTracer({"dd.trace_id": "0", "dd.span_id": "0"}),
+    )
+    result = _add_dd_trace_context(None, "info", {"event": "x"})
+    assert "dd.trace_id" not in result
+    assert "dd.span_id" not in result
+
+
+def test_add_dd_trace_context_skips_partial_context(monkeypatch) -> None:
+    # Defensive: a partial context (trace_id present, span_id missing/zero — a
+    # future ddtrace shape or a test double) must not KeyError or emit an
+    # uncorrelatable trace-without-span.
+    monkeypatch.setattr(
+        structlog_config,
+        "_dd_tracer",
+        _FakeTracer({"dd.trace_id": "6a5fc7b3000000006d13f630a5c9fb22"}),
+    )
+    result = _add_dd_trace_context(None, "info", {"event": "x"})
+    assert "dd.trace_id" not in result
+    assert "dd.span_id" not in result
+
+
+def test_rename_event_to_message_moves_field() -> None:
+    result = _rename_event_to_message(
+        None, "info", {"event": "hello world", "extra": 1}
+    )
+    assert result == {"message": "hello world", "extra": 1}
+
+
+def test_rename_event_to_message_preserves_existing_message() -> None:
+    # If someone explicitly set `message`, don't overwrite it with `event`.
+    # But still remove `event` so Cloud Logging JSON doesn't carry both.
+    result = _rename_event_to_message(
+        None, "info", {"event": "e", "message": "explicit"}
+    )
+    assert result == {"message": "explicit"}
+
+
+def test_rename_event_to_message_noop_without_event() -> None:
+    result = _rename_event_to_message(None, "info", {"other": "x"})
+    assert result == {"other": "x"}
+
+
+def test_rename_event_to_message_event_none_produces_empty_message() -> None:
+    # logger.info(None) reaches here with `event` explicitly set to None.
+    # Emit an empty string so the GCP entry still has a `message` summary.
+    result = _rename_event_to_message(None, "info", {"event": None})
+    assert result == {"message": ""}
+
+
+# ─── _route_third_party_to_root ─────────────────────────────────────────
+
+
+def test_route_third_party_to_root_clears_handlers_and_enables_propagation() -> None:
+    """Each rerouted logger ends with handlers=[] and propagate=True so its
+    lines flow through the root ProcessorFormatter."""
+    # Pre-populate one of the listed loggers with a fake handler + propagate=False
+    # to simulate uvicorn / fastmcp's shipped state.
+    target = logging.getLogger(_THIRD_PARTY_LOGGERS_TO_REROUTE[0])
+    fake_handler = logging.NullHandler()
+    target.addHandler(fake_handler)
+    target.propagate = False
+    try:
+        _route_third_party_to_root()
+        assert fake_handler not in target.handlers
+        assert target.propagate is True
+    finally:
+        # Restore for any subsequent test that touches this logger.
+        target.propagate = True
+
+
+# ─── UVICORN_ACCESS_LOG ─────────────────────────────────────────────────
+
+
+@pytest.fixture
+def uvicorn_access_sandbox():
+    """Fully restore every global these tests mutate.
+
+    They reach into process-wide logging state — the uvicorn.access logger,
+    the ROOT logger's handlers, and the module's reroute bookkeeping — so
+    without an exact restore they leak into whatever runs next in the same
+    process. Restoring by hand in each test's ``finally`` is what leaked the
+    first time: clearing ``_third_party_logger_original_state`` also discards
+    the snapshots taken for uvicorn / fastmcp / mcp / slowapi, leaving the
+    module believing it had never rerouted anything.
+    """
+    lg = logging.getLogger("uvicorn.access")
+    root = logging.getLogger()
+    saved_handlers = list(lg.handlers)
+    saved_propagate = lg.propagate
+    saved_level = lg.level
+    saved_root_handlers = list(root.handlers)
+    saved_state = dict(_third_party_logger_original_state)
+    # Start from a clean reroute ledger so the branch under test actually
+    # runs rather than hitting the already-done guard.
+    _third_party_logger_original_state.clear()
+    try:
+        yield lg
+    finally:
+        lg.handlers[:] = saved_handlers
+        lg.propagate = saved_propagate
+        lg.setLevel(saved_level)
+        root.handlers[:] = saved_root_handlers
+        _third_party_logger_original_state.clear()
+        _third_party_logger_original_state.update(saved_state)
+
+
+def _simulate_uvicorn_shipped_access_logger() -> logging.Handler:
+    """Put uvicorn.access into the state uvicorn.config.LOGGING_CONFIG leaves."""
+    lg = logging.getLogger("uvicorn.access")
+    handler = logging.NullHandler()
+    lg.addHandler(handler)
+    lg.propagate = False
+    return handler
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "FALSE", "No", " off ", "OFF"])
+def test_access_log_enabled_false_for_falsy_spellings(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Case and surrounding whitespace are normalised: the value is threaded
+    through a delimited --update-env-vars string in the deploy workflows,
+    where a stray space is easy to introduce and invisible in review."""
+    monkeypatch.setenv("UVICORN_ACCESS_LOG", raw)
+    assert structlog_config.access_log_enabled() is False
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "yes", "on", "", "maybe"])
+def test_access_log_enabled_true_for_everything_else(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Anything not clearly falsy keeps the line. The failure modes are not
+    symmetric: reading junk as "off" silently drops request visibility and
+    looks identical to a healthy quiet service, whereas reading it as "on"
+    costs log volume and is immediately obvious. Fail toward the loud side."""
+    monkeypatch.setenv("UVICORN_ACCESS_LOG", raw)
+    assert structlog_config.access_log_enabled() is True
+
+
+def test_access_log_enabled_defaults_true_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opt-OUT, so OSS / on-prem / local installs are unaffected."""
+    monkeypatch.delenv("UVICORN_ACCESS_LOG", raising=False)
+    assert structlog_config.access_log_enabled() is True
+
+
+def test_access_log_disabled_makes_uvicorn_see_no_handlers(
+    monkeypatch: pytest.MonkeyPatch, uvicorn_access_sandbox: logging.Logger
+) -> None:
+    """THE regression test: assert the property uvicorn actually reads.
+
+    uvicorn does not keep the ``access_log=False`` it was configured with —
+    its HTTP protocols re-derive the decision per connection from
+    ``self.access_logger.hasHandlers()``. Passing the kwarg therefore proves
+    nothing on its own, and the first cut of this feature shipped green
+    tests asserting exactly that kwarg while every request kept being logged
+    in staging. Rerouting uvicorn.access (handlers=[], propagate=True) is
+    what re-enabled it: hasHandlers() then walks up to the root handler and
+    answers True.
+
+    Assert the end state instead: no handlers AND propagate=False, so the
+    walk stops here and answers False.
+    """
+    monkeypatch.setenv("UVICORN_ACCESS_LOG", "false")
+    lg = uvicorn_access_sandbox
+    handler = _simulate_uvicorn_shipped_access_logger()
+    # A root handler makes hasHandlers() answer True for any logger that
+    # still propagates — i.e. the exact trap this guards against.
+    logging.getLogger().addHandler(logging.NullHandler())
+
+    _route_third_party_to_root()
+
+    assert handler not in lg.handlers
+    assert lg.propagate is False
+    assert lg.hasHandlers() is False, (
+        "uvicorn re-derives access logging from hasHandlers(); it must be "
+        "False or every request is logged despite UVICORN_ACCESS_LOG=false"
+    )
+
+
+def test_access_log_enabled_still_reroutes_uvicorn_access(
+    monkeypatch: pytest.MonkeyPatch, uvicorn_access_sandbox: logging.Logger
+) -> None:
+    """The default path is untouched: with the line wanted, uvicorn.access is
+    rerouted like any other third-party logger so it reaches structlog as
+    JSON, and hasHandlers() stays True so uvicorn keeps emitting it."""
+    monkeypatch.delenv("UVICORN_ACCESS_LOG", raising=False)
+    lg = uvicorn_access_sandbox
+    handler = _simulate_uvicorn_shipped_access_logger()
+    logging.getLogger().addHandler(logging.NullHandler())
+
+    _route_third_party_to_root()
+
+    assert handler not in lg.handlers
+    assert lg.propagate is True
+    assert lg.hasHandlers() is True
+
+
+def test_access_log_disabled_state_is_restorable(
+    monkeypatch: pytest.MonkeyPatch, uvicorn_access_sandbox: logging.Logger
+) -> None:
+    """The silencing branch must snapshot like the rerouting one, or
+    _reset_for_testing leaves uvicorn.access permanently muted for every
+    later caller in the process."""
+    monkeypatch.setenv("UVICORN_ACCESS_LOG", "false")
+    handler = _simulate_uvicorn_shipped_access_logger()
+
+    _route_third_party_to_root()
+
+    assert "uvicorn.access" in _third_party_logger_original_state
+    snapshot = _third_party_logger_original_state["uvicorn.access"]
+    assert handler in snapshot[0]
+    assert snapshot[1] is False
+
+
+def test_route_third_party_to_root_is_idempotent() -> None:
+    """Calling twice doesn't change state on the second call (already-rerouted
+    loggers stay handler-less, propagate stays True)."""
+    _route_third_party_to_root()
+    snapshot = {
+        name: (
+            list(logging.getLogger(name).handlers),
+            logging.getLogger(name).propagate,
+        )
+        for name in _THIRD_PARTY_LOGGERS_TO_REROUTE
+    }
+    _route_third_party_to_root()
+    for name in _THIRD_PARTY_LOGGERS_TO_REROUTE:
+        lg = logging.getLogger(name)
+        assert list(lg.handlers) == snapshot[name][0]
+        assert lg.propagate == snapshot[name][1]
+
+
+def test_route_third_party_to_root_recall_after_handlerless_reroute_no_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A logger rerouted from ``propagate=False, no-handlers`` (snapshot
+    ``([], False, lvl)``) must be treated as already-done on a re-call.
+    Pre-fix, the idempotency guard keyed on captured handlers being
+    non-empty, so the re-call fell through to the uninitialised early-exit
+    branch and emitted a spurious 'rerouting was a no-op' WARNING."""
+    target = logging.getLogger(_THIRD_PARTY_LOGGERS_TO_REROUTE[0])
+    _third_party_logger_original_state.clear()
+    for h in list(target.handlers):
+        target.removeHandler(h)
+    target.propagate = False
+    target.setLevel(logging.WARNING)
+    try:
+        _route_third_party_to_root()  # reroutes: propagate False→True
+        assert target.propagate is True
+        with caplog.at_level(logging.WARNING, logger="common.structlog_config"):
+            _route_third_party_to_root()  # re-call must be a silent no-op
+        # Other listed loggers may legitimately warn (uninitialised in the
+        # test env) — only the already-rerouted target must stay silent.
+        assert not [
+            r
+            for r in caplog.records
+            if "rerouting was a no-op" in r.getMessage()
+            and repr(target.name) in r.getMessage()
+        ], "re-call after a handler-less reroute must not warn for that logger"
+    finally:
+        target.setLevel(logging.NOTSET)
+        target.propagate = True
+        _third_party_logger_original_state.clear()
+
+
+def test_route_third_party_to_root_pristine_logger_no_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pristine listed logger (no own handlers, propagate=True) already
+    propagates to the root handler, so the 'nothing to reroute' note is DEBUG,
+    not a misleading WARNING. The old WARNING falsely implied records wouldn't
+    reach GCP, when they do via propagation (prod: ``mcp.server.*`` lands as
+    structured JSON)."""
+    target = logging.getLogger(_THIRD_PARTY_LOGGERS_TO_REROUTE[0])
+    _third_party_logger_original_state.clear()
+    for h in list(target.handlers):
+        target.removeHandler(h)
+    target.propagate = True  # pristine: handler-less + propagating
+    try:
+        with caplog.at_level(logging.WARNING, logger="common.structlog_config"):
+            _route_third_party_to_root()
+        assert not [
+            r
+            for r in caplog.records
+            if "no-op" in r.getMessage() or "nothing to reroute" in r.getMessage()
+        ], "a pristine handler-less logger must not WARN — it already reaches root"
+    finally:
+        target.propagate = True
+        _third_party_logger_original_state.clear()
+
+
+def test_route_third_party_to_root_preserves_operator_set_level_when_no_handlers() -> (
+    None
+):
+    """If a logger has no own handlers, its level was set by the operator
+    relative to root (e.g. ``uvicorn --log-level warning``). Don't silently
+    reset to NOTSET — that would flood Cloud Logging with previously
+    suppressed access logs."""
+    target = logging.getLogger(_THIRD_PARTY_LOGGERS_TO_REROUTE[0])
+    # Clear leaked snapshot state from earlier tests so this test sees a
+    # genuinely-empty handler list at snapshot time. Without this, a prior
+    # test's snapshot of ``[NullHandler]`` would make this run go through
+    # the rerouting path that resets the level — masking the regression
+    # this test is supposed to catch.
+    _third_party_logger_original_state.clear()
+    for h in list(target.handlers):
+        target.removeHandler(h)
+    target.propagate = True
+    target.setLevel(logging.WARNING)
+    try:
+        _route_third_party_to_root()
+        assert target.level == logging.WARNING, (
+            "operator-set level should not be silently reset to NOTSET when "
+            "the library hadn't installed its own handlers"
+        )
+    finally:
+        target.setLevel(logging.NOTSET)
+        _third_party_logger_original_state.clear()
+
+
+# ─── stdlib ``extra={...}`` propagation (ExtraAdder bridge) ─────────────
+
+
+@pytest.fixture
+def _json_log_buffer():
+    """Reset structlog config, re-configure with JSON output, then swap
+    every root StreamHandler's stream to an in-memory buffer so the
+    test can inspect emitted JSON. ``capsys``/``capfd`` don't see the
+    handler's output because pytest's stdout swap happens before this
+    file's conftest configure_logging runs, leaving the handler bound
+    to the original FD; the cleanest fix is to capture at the
+    handler-stream layer, not the FD layer."""
+    import io
+
+    _reset_for_testing()
+    configure_logging(environment="test", log_level="DEBUG", json_logs=True)
+    buf = io.StringIO()
+    swapped: list[tuple[logging.Handler, object]] = []
+    for h in logging.getLogger().handlers:
+        if isinstance(h, logging.StreamHandler):
+            swapped.append((h, h.stream))
+            h.stream = buf
+    try:
+        yield buf
+    finally:
+        for h, original in swapped:
+            h.stream = original  # type: ignore[assignment]
+        _reset_for_testing()
+
+
+_DDTRACE_WRITER_LOGGERS = ("ddtrace.internal.writer.writer", "ddtrace.llmobs._writer")
+
+
+def test_ddtrace_writer_loggers_floored_at_critical_when_not_debug() -> None:
+    """The ddtrace trace + LLMObs writer loggers emit benign flush-failure
+    ERRORs ("failed to send, dropping N traces …"). configure_logging must
+    floor them at CRITICAL at both INFO and WARNING so that ERROR noise is
+    dropped from every sink (Datadog / GCP / the caura-ops error alerter) —
+    the ERROR clears root's WARNING filter otherwise and drives alert flap."""
+    for level in ("INFO", "WARNING"):
+        _reset_for_testing()
+        try:
+            configure_logging(environment="test", log_level=level, json_logs=True)
+            for name in _DDTRACE_WRITER_LOGGERS:
+                assert logging.getLogger(name).level == logging.CRITICAL, (
+                    f"{name} must be floored at CRITICAL when configured at {level}"
+                )
+        finally:
+            _reset_for_testing()
+
+
+def test_ddtrace_writer_loggers_not_floored_at_debug() -> None:
+    """At DEBUG (explicit opt-in to verbose output) the writer loggers must NOT
+    be floored, so ddtrace's own diagnostics stay visible."""
+    _reset_for_testing()
+    try:
+        configure_logging(environment="test", log_level="DEBUG", json_logs=True)
+        for name in _DDTRACE_WRITER_LOGGERS:
+            assert logging.getLogger(name).level != logging.CRITICAL, (
+                f"{name} must not be floored at CRITICAL when configured at DEBUG"
+            )
+    finally:
+        _reset_for_testing()
+
+
+def test_reset_clears_ddtrace_writer_floor() -> None:
+    """_reset_for_testing must clear the CRITICAL floor back to NOTSET so a
+    later DEBUG reconfigure isn't left with these stuck at CRITICAL."""
+    _reset_for_testing()
+    configure_logging(environment="test", log_level="INFO", json_logs=True)
+    _reset_for_testing()
+    for name in _DDTRACE_WRITER_LOGGERS:
+        assert logging.getLogger(name).level == logging.NOTSET, (
+            f"{name} must be reset to NOTSET after _reset_for_testing"
+        )
+
+
+def test_stdlib_logger_extras_reach_json_payload(_json_log_buffer) -> None:
+    """``logger.info(msg, extra={...})`` from stdlib must surface its
+    ``extra`` keys as top-level JSON fields, not be silently dropped.
+
+    Pre-fix, ``_base_processors`` lacked ``structlog.stdlib.ExtraAdder()``,
+    so the JSON payload contained only ``message`` and ``timestamp`` —
+    every existing ``extra``-based call site (memory-search, memory-get,
+    per-tenant concurrency saturation, CAURA-682's memory_write_latency)
+    silently lost its structured data at the GCP boundary. This test
+    pins the contract."""
+    logger = logging.getLogger("test_stdlib_extras_propagation")
+    logger.info(
+        "request done",
+        extra={
+            "path": "test-path",
+            "tenant_id": "test-tenant",
+            "duration_ms": 42,
+            "ok": True,
+        },
+    )
+    lines = _json_log_buffer.getvalue().strip().splitlines()
+    records = [json.loads(line) for line in lines if '"request done"' in line]
+    assert len(records) == 1, f"expected one matching record, got: {lines}"
+    record = records[0]
+    assert record["message"] == "request done"
+    assert record["path"] == "test-path"
+    assert record["tenant_id"] == "test-tenant"
+    assert record["duration_ms"] == 42
+    assert record["ok"] is True
+
+
+def test_stdlib_logger_without_extras_still_emits(_json_log_buffer) -> None:
+    """No ``extra`` → no ExtraAdder fields → just the standard payload
+    (message + timestamp + severity). Regression guard for the
+    no-extras path."""
+    logger = logging.getLogger("test_stdlib_no_extras")
+    logger.info("plain message")
+    lines = _json_log_buffer.getvalue().strip().splitlines()
+    records = [json.loads(line) for line in lines if '"plain message"' in line]
+    assert len(records) == 1
+    record = records[0]
+    assert record["message"] == "plain message"
+    assert record["severity"] == "INFO"
+
+
+def test_extra_event_key_does_not_replace_message(_json_log_buffer) -> None:
+    """``ExtraAdder(deny=["event", ...])`` must block silent message
+    corruption when a caller passes ``extra={"event": "x"}``.
+
+    Without the deny entry: ExtraAdder overwrites ``event_dict["event"]``
+    (which ProcessorFormatter set to the real log message), then
+    ``_rename_event_to_message`` renames the extra's value as the GCP
+    ``message`` field — losing the original text silently."""
+    logger = logging.getLogger("test_extra_event_collision")
+    logger.info("real message", extra={"event": "extra-value", "ok": True})
+    lines = _json_log_buffer.getvalue().strip().splitlines()
+    records = [json.loads(line) for line in lines if '"real message"' in line]
+    assert len(records) == 1, f"expected one matching record, got: {lines}"
+    record = records[0]
+    # Real message wins; ``event`` extra is dropped by the deny list.
+    assert record["message"] == "real message"
+    assert record.get("event") is None
+    # Other extras still propagate normally.
+    assert record["ok"] is True
+
+
+def test_extra_message_key_is_rejected_by_stdlib_then_blocked_in_depth(
+    _json_log_buffer,
+) -> None:
+    """``logger.info(msg, extra={"message": "x"})`` is rejected by
+    Python's stdlib ``logging`` itself with
+    ``KeyError("Attempt to overwrite 'message' in LogRecord")`` — so the
+    ``extra={"message": ...}`` path *can't* reach our processor chain.
+    Documented here so a future maintainer doesn't assume the deny
+    entry is unneeded.
+
+    The deny entry is still load-bearing as defense-in-depth for the
+    ``logging.Filter`` path — a filter that stamps ``record.message =
+    "x"`` directly bypasses stdlib's ``extra=`` validation. The second
+    half of this test exercises that path explicitly so the deny entry
+    has a regression guard."""
+    logger = logging.getLogger("test_extra_message_stdlib_guard")
+    with pytest.raises(KeyError, match="Attempt to overwrite 'message'"):
+        logger.info("real message", extra={"message": "extra-value"})
+
+    # Defense-in-depth path: a logging.Filter stamps `record.message`
+    # directly, bypassing stdlib's extra= guard. The deny entry on
+    # `message` in `_add_logrecord_extras` must still prevent the GCP
+    # `message` field from being corrupted by the filter's stamp.
+    class _StampMessageFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            # Stamp directly on the record — stdlib doesn't validate
+            # this path the way it validates ``extra={}``.
+            record.message = "filter-stamped-value"  # type: ignore[attr-defined]
+            return True
+
+    filter_logger = logging.getLogger("test_extra_message_filter_path")
+    filter_obj = _StampMessageFilter()
+    filter_logger.addFilter(filter_obj)
+    try:
+        filter_logger.info("real-filter-message", extra={"ok": True})
+    finally:
+        filter_logger.removeFilter(filter_obj)
+
+    lines = _json_log_buffer.getvalue().strip().splitlines()
+    records = [json.loads(line) for line in lines if '"real-filter-message"' in line]
+    assert len(records) == 1, f"expected one matching record, got: {lines}"
+    record = records[0]
+    # Real message wins; the filter-stamped `message` is dropped by the
+    # deny entry in `_add_logrecord_extras`.
+    assert record["message"] == "real-filter-message"
+    # Other extras still propagate normally.
+    assert record["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "extra_key,extra_value,expected_value",
+    [
+        # ``severity`` — would override _map_to_gcp_severity's
+        # log-level-derived value because the guard only fills on
+        # None/""; a non-empty extra value would survive and produce
+        # an invalid GCP severity or misroute alerts.
+        ("severity", "P1", "INFO"),
+        # ``status`` — an application-domain value (e.g. an HTTP status
+        # code) would reach Datadog's JSON preprocessing as the log's
+        # official status and degrade the line to `info`.
+        ("status", "200", "info"),
+        # ``stack`` — StackInfoRenderer only sets this when
+        # stack_info=True; an extra would propagate untouched.
+        ("stack", "fake-traceback", None),
+        # ``exception`` — format_exc_info only sets this when
+        # exc_info is present; an extra would persist on a log line
+        # with no real exception.
+        ("exception", "fabricated-exception", None),
+    ],
+)
+def test_extra_pipeline_reserved_keys_are_dropped(
+    _json_log_buffer, extra_key: str, extra_value: str, expected_value
+) -> None:
+    """Reserved-output-key extras (``severity``, ``status``, ``stack``,
+    ``exception``) must be dropped by ``_add_logrecord_extras`` so a caller can't
+    silently inject pipeline-managed fields via ``extra={...}``. Each
+    one corresponds to a real corruption vector documented on
+    ``_RESERVED_OUTPUT_KEYS``."""
+    logger = logging.getLogger(f"test_reserved_{extra_key}")
+    logger.info("real-message", extra={extra_key: extra_value, "ok": True})
+    lines = _json_log_buffer.getvalue().strip().splitlines()
+    records = [json.loads(line) for line in lines if '"real-message"' in line]
+    assert len(records) == 1, f"expected one matching record, got: {lines}"
+    record = records[0]
+    # The reserved key is either absent or holds its pipeline-derived
+    # value, NOT the user-supplied extra.
+    if expected_value is None:
+        assert extra_key not in record, (
+            f"{extra_key} should be dropped, but record has "
+            f"{extra_key}={record.get(extra_key)!r}"
+        )
+    else:
+        assert record[extra_key] == expected_value, (
+            f"{extra_key} should equal pipeline value {expected_value!r}, "
+            f"but record has {extra_key}={record.get(extra_key)!r}"
+        )
+    # Other extras still propagate normally — the deny list doesn't
+    # break the happy path.
+    assert record["ok"] is True
+    assert record["message"] == "real-message"
+
+
+def test_stdlib_logger_emits_datadog_status_alongside_severity(
+    _json_log_buffer,
+) -> None:
+    """The JSON payload must carry ``status`` (Datadog) next to
+    ``severity`` (GCP). Pre-fix, the serverless-init envelope's
+    stream-derived status (``info`` for stdout) won at Datadog intake and
+    every log — ERRORs included — landed as status:info, making
+    ``status:error`` queries and log monitors blind."""
+    logger = logging.getLogger("test_dd_status_e2e")
+    logger.warning("warn-level message")
+    logger.error("error-level message")
+    lines = _json_log_buffer.getvalue().strip().splitlines()
+    for needle, severity, status in [
+        ('"warn-level message"', "WARNING", "warning"),
+        ('"error-level message"', "ERROR", "error"),
+    ]:
+        records = [json.loads(line) for line in lines if needle in line]
+        assert len(records) == 1, f"expected one record for {needle}, got: {lines}"
+        assert records[0]["severity"] == severity
+        assert records[0]["status"] == status
+
+
+def test_uvicorn_error_lifecycle_line_emits_info_status(_json_log_buffer) -> None:
+    """The uvicorn *parent supervisor* logs its lifecycle lines ("Started
+    parent process", "Received SIGTERM, exiting.", ...) via the
+    ``uvicorn.error`` logger at INFO. When the server is launched via
+    ``common.serve`` (which calls ``configure_logging()`` in the parent, then
+    ``uvicorn.run(log_config=None)`` so uvicorn installs no handlers of its
+    own), that logger stays pristine and propagates to the structlog root
+    handler — so the line emits as JSON with ``status:info``, not the plain
+    ``INFO:`` text that was reaching Datadog as ``status:error``.
+
+    This pins the classification: an INFO record on a pristine ``uvicorn.error``
+    logger renders through our pipeline as ``severity:INFO`` / ``status:info``.
+    """
+    logging.getLogger("uvicorn.error").info("Started parent process [8]")
+    lines = _json_log_buffer.getvalue().strip().splitlines()
+    # Filter on the quoted message so only the JSON handler's line matches — the
+    # buffer also holds pytest's plain-format capture-handler copies (same
+    # buffer, swapped by the fixture), which lack the surrounding quotes.
+    records = [
+        json.loads(line) for line in lines if '"Started parent process [8]"' in line
+    ]
+    assert len(records) == 1, f"expected one uvicorn.error JSON record, got: {lines}"
+    assert records[0]["severity"] == "INFO"
+    assert records[0]["status"] == "info"
+
+
+def test_configure_logging_captures_warnings(_json_log_buffer) -> None:
+    """``configure_logging()`` must route ``warnings.warn()`` into logging.
+
+    Cloud Run derives a log's status from the stream it arrived on, so a bare
+    stderr warning lands in Datadog as ``status:error``. Measured before this:
+    1,543 of 1,550 error-status logs from staging core-api over 6h (99.5%)
+    were one third-party warning about an unresolved forward reference in a
+    pydantic-settings model — that service's error rate was almost entirely
+    this, and the same false-error mechanism as the uvicorn supervisor lines
+    above, arriving by a different route.
+
+    Asserted on logging's capture flag rather than by raising a warning:
+    pytest's own warnings plugin wraps each test in a recorder that replaces
+    ``warnings.showwarning``, so a ``warnings.warn()`` here would be swallowed
+    by the plugin and never reach ``py.warnings``, and ``showwarning`` itself
+    reads as the recorder's rather than logging's. Re-enabling capture inside
+    the test to work around that would only assert that the test called
+    ``captureWarnings`` — vacuous. The rendering half is covered by
+    ``test_py_warnings_logger_emits_warning_status``.
+
+    ``logging._warnings_showwarning`` is private, but it is the flag
+    ``captureWarnings`` actually toggles (it holds the displaced
+    ``showwarning`` while capture is on) and the recorder does not save or
+    restore it. If a future CPython renames it this fails with AttributeError
+    — loudly, which is the right failure for a test whose job is to notice.
+    """
+    assert logging._warnings_showwarning is not None, (
+        "configure_logging() must call logging.captureWarnings(True), or "
+        "warnings go to stderr and Datadog files them as errors"
+    )
+
+
+def test_py_warnings_logger_emits_warning_status(_json_log_buffer) -> None:
+    """A captured warning must render as ``status:warning``, never error.
+
+    The pairing to the test above: that one pins that warnings are routed
+    into logging, this one pins where they land once they are. Driven through
+    the ``py.warnings`` logger directly — the same approach as the
+    ``uvicorn.error`` test above — so it exercises our pipeline without
+    depending on the interpreter's warning filters or pytest's capture.
+    """
+    logging.getLogger("py.warnings").warning(
+        "cfg.py:47: UserWarning: stand-in for the pydantic-settings warning"
+    )
+
+    lines = _json_log_buffer.getvalue().strip().splitlines()
+    # Filter on the quoted text so only the JSON handler's line matches — the
+    # buffer also holds pytest's plain-format capture-handler copies.
+    needle = '"cfg.py:47: UserWarning: stand-in for the pydantic-settings warning"'
+    records = [json.loads(line) for line in lines if needle in line]
+    assert len(records) == 1, f"expected one py.warnings JSON record, got: {lines}"
+    assert records[0]["status"] == "warning", "a warning must not count as an error"
+    assert records[0]["severity"] == "WARNING"
+
+
+def test_reset_for_testing_undoes_warning_capture() -> None:
+    """A reset must undo warning capture installed by ``configure_logging``.
+
+    Deliberately does not use ``_json_log_buffer``: that fixture resets on the
+    way in and out, which is the very behaviour under test.
+    """
+    _reset_for_testing()
+    logging.captureWarnings(False)
+    previous_showwarning = warnings.showwarning
+    configure_logging(environment="test", log_level="INFO", json_logs=True)
+    try:
+        assert warnings.showwarning is not previous_showwarning, "capture should be on"
+
+        _reset_for_testing()
+
+        assert warnings.showwarning is previous_showwarning, (
+            "_reset_for_testing() must call logging.captureWarnings(False), or "
+            "warning routing leaks past the reset that claims to undo it"
+        )
+    finally:
+        _reset_for_testing()
+        logging.captureWarnings(False)
+
+
+def test_reset_for_testing_preserves_preexisting_warning_capture() -> None:
+    """A reset must not disable warning capture owned by another caller."""
+    _reset_for_testing()
+    logging.captureWarnings(False)
+    logging.captureWarnings(True)
+    captured_showwarning = warnings.showwarning
+    try:
+        configure_logging(environment="test", log_level="INFO", json_logs=True)
+
+        _reset_for_testing()
+
+        assert warnings.showwarning is captured_showwarning
+    finally:
+        _reset_for_testing()
+        logging.captureWarnings(False)

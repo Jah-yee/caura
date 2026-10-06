@@ -1,0 +1,1354 @@
+import asyncio
+import logging
+import os as _os
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp as ASGIApplication
+from starlette.types import Receive, Scope, Send
+
+from common.structlog_config import configure_logging, reroute_third_party_loggers
+from core_api.config import settings as app_settings
+
+# Must run before any other module-level `logging.getLogger(...)` call emits
+# a record, otherwise those records end up going through stdlib's default
+# handler instead of our JSON/GCP pipeline.
+configure_logging(
+    app_settings.environment,
+    app_settings.log_level,
+    json_logs=app_settings.log_format_json,
+    log_file=app_settings.log_file or None,
+)
+
+logger = logging.getLogger(__name__)
+
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+
+from common import permanent_failure
+from common.events.base import EventBus
+from common.events.factory import get_event_bus
+from common.events.inprocess import InProcessEventBus
+from core_api.clients.storage_client import (
+    PermanentStorageWriteError,
+    StoragePointerRejectedError,
+    get_storage_client,
+)
+from core_api.constants import STM_WRITE_ROUTE_NOTE, VERSION, is_mcp_path
+from core_api.consumer import register_consumers
+from core_api.mcp_server import get_mcp_app, mcp_lifespan
+from core_api.middleware.ingest_body_size import IngestBodySizeMiddleware
+from core_api.middleware.per_tenant_concurrency import per_tenant_storage_slot
+from core_api.middleware.rate_limit import limiter
+from core_api.middleware.request_observation import RequestObservationMiddleware
+from core_api.middleware.request_timeout import (
+    _TIMEOUT_OPT_OUT_PATHS,
+    RequestTimeoutMiddleware,
+)
+from core_api.routes.agents import router as agents_router
+from core_api.routes.audit import router as audit_router
+from core_api.routes.conflicts import router as conflicts_router
+from core_api.routes.crystallizer import router as crystallizer_router
+from core_api.routes.documents import router as documents_router
+from core_api.routes.entities import router as entities_router
+from core_api.routes.evolve import router as evolve_router
+from core_api.routes.fleet import router as fleet_router
+from core_api.routes.health import router as health_router
+from core_api.routes.insights import router as insights_router
+from core_api.routes.interview import router as interview_router
+from core_api.routes.keystones import router as keystones_router
+from core_api.routes.keystones import versions_router as keystone_versions_router
+from core_api.routes.lifecycle import router as lifecycle_router
+from core_api.routes.memories import admin_memories_router
+from core_api.routes.memories import router as memories_router
+from core_api.routes.org_deletion import router as org_deletion_router
+from core_api.routes.plugin import plugin_bootstrap_router
+from core_api.routes.plugin import router as plugin_router
+from core_api.routes.reports import router as reports_router
+from core_api.routes.scheduler_lease import router as scheduler_lease_router
+from core_api.routes.settings import router as settings_router
+from core_api.routes.skills_inbox import router as skills_inbox_router
+from core_api.routes.stats import router as stats_router
+from core_api.routes.stm import router as stm_router
+from core_api.routes.telemetry import router as telemetry_router
+from core_api.tasks import cancel_all_tasks
+
+# CAURA-631: sentinel bucket for audit events that arrive without a
+# ``tenant_id`` field. Routed through the per-tenant flusher's
+# group-by step then explicitly skipped (events are unattributable, so
+# we'd be writing them to the wrong tenant's audit log otherwise).
+# Identity sentinel (``object()``) rather than a string so a tenant
+# whose actual ID happens to be a debug-style label can't accidentally
+# match it and get its events silently dropped.
+_UNKNOWN_TENANT_SENTINEL: object = object()
+
+_SECURITY_HEADERS = {
+    "strict-transport-security": "max-age=63072000; includeSubDomains; preload",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "referrer-policy": "strict-origin-when-cross-origin",
+    "content-security-policy": (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "img-src 'self' data: https://fastapi.tiangolo.com https://avatars.githubusercontent.com; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'"
+    ),
+}
+# Pre-encode once — ASGI headers are list[tuple[bytes, bytes]]
+_SECURITY_HEADERS_ENCODED = [(k.encode(), v.encode()) for k, v in _SECURITY_HEADERS.items()]
+_SECURITY_HEADER_KEYS = {k.encode() for k in _SECURITY_HEADERS}
+
+
+class SecurityHeadersMiddleware:
+    """Pure ASGI middleware — compatible with mounted raw ASGI apps like MCP."""
+
+    def __init__(self, app: ASGIApplication) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or is_mcp_path(scope["path"]):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                existing = [(k, v) for k, v in message.get("headers", []) if k not in _SECURITY_HEADER_KEYS]
+                message = {**message, "headers": [*existing, *_SECURITY_HEADERS_ENCODED]}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
+# Secrets that ship with a known placeholder and MUST be replaced in production.
+# Module scope rather than a local, so the property is testable: a test
+# parametrized over this mapping covers whatever is added next, instead of
+# re-asserting presence for jwt_secret alone and leaving the following entry to
+# be found the way this one was.
+_DANGEROUS_DEFAULTS = {
+    "jwt_secret": "change-me-in-production",
+}
+
+
+def _unwrap_secret(value):  # type: ignore[no-untyped-def]
+    """Return a ``SecretStr``-style wrapper's value, or ``value`` unchanged."""
+    return value.get_secret_value() if hasattr(value, "get_secret_value") else value
+
+
+def _blank_secret(value) -> bool:  # type: ignore[no-untyped-def]
+    """True when a secret is missing, empty, or only whitespace.
+
+    Unwraps FIRST, and that ordering is load-bearing for whitespace rather than
+    for emptiness: ``SecretStr("")`` is falsy (``__len__`` is the secret's
+    length), but ``SecretStr("   ")`` has length 3 and ``str()`` of it is the
+    mask ``'**********'`` — so BOTH halves of this predicate pass on the
+    wrapper and a whitespace secret sails through. ``SecretStr("x") == "x"`` is
+    False for the same reason, which bypassed the equality check below once
+    already.
+
+    Note ``str.strip()`` removes only ``str.isspace()`` characters, so a secret
+    of U+200B or a UTF-8 BOM still reads as non-blank. Left as-is deliberately:
+    it is the convention every guard here shares, and narrowing it in one place
+    would recreate the asymmetry this function has already been bitten by.
+    """
+    return not str(_unwrap_secret(value) or "").strip()
+
+
+def _validate_startup_settings(app_settings) -> None:  # type: ignore[no-untyped-def]
+    """Refuse to boot when a required safety control is missing.
+
+    Extracted from ``lifespan`` so these guards are reachable by tests. Buried in
+    the lifespan they were untestable in practice, which is why a block whose
+    entire job is to prevent unsafe production boots had no tests of its own.
+
+    Storage authentication is required in every environment because the storage
+    service enforces it unconditionally, and so is a shared event bus for deferred
+    mode, which fails the same way everywhere. Standalone mode and a missing perimeter
+    are refused in every hosted environment, ``sandbox`` included. The remaining
+    guards are production-only.
+    """
+    if _blank_secret(app_settings.core_storage_shared_secret):
+        raise RuntimeError("CORE_STORAGE_SHARED_SECRET is required for core-api")
+    # M-15: a deferred write publishes its embed and enrich requests for
+    # core-worker, and core-api subscribes to neither. On the in-process bus
+    # nothing receives them, so every memory would stay unembedded and
+    # unenriched with no error or log, in any environment. Only deferred mode
+    # consults the bus, so an inline boot builds nothing here.
+    if app_settings.deployment_mode == "deferred" and isinstance(get_event_bus(), InProcessEventBus):
+        raise RuntimeError(
+            "DEPLOYMENT_MODE=deferred needs core-worker on a shared event bus, but the event bus "
+            "is in-process (EVENT_BUS_BACKEND unset or inprocess): the embed and enrich requests "
+            "each write publishes would reach no subscriber. Set EVENT_BUS_BACKEND=pubsub with "
+            "core-worker subscribed, or DEPLOYMENT_MODE=inline."
+        )
+    if app_settings.environment == "development":
+        return
+    # Hosted from here: production, and ``sandbox``, which staging and every
+    # sandbox deployment run as (M-78). Both are reachable like production, so
+    # both refuse the two settings that leave the service open to anyone.
+    if app_settings.is_standalone:
+        raise RuntimeError(
+            f"IS_STANDALONE=true is not allowed when ENVIRONMENT={app_settings.environment}. "
+            "Set IS_STANDALONE=false for hosted deployments."
+        )
+    no_gateway_secret = _blank_secret(app_settings.gateway_shared_secret)
+    no_compat_key = _blank_secret(app_settings.memclaw_api_key)  # legacy-name-ok: compat alias field
+    if no_gateway_secret and no_compat_key:
+        # What production actually requires is A PERIMETER — not specifically the
+        # gateway one. ``CAURA_API_KEY`` is the other way to have one: when it
+        # is set, auth.py's "Path 2" either authenticates the request against
+        # that key or raises 401 for everything else, so "Path 4" below it is
+        # UNREACHABLE and there is no header-trust surface left to protect. That
+        # is the documented network-exposed OSS pattern, and such a deployment
+        # legitimately sets ENVIRONMENT=production for JSON logging and Sentry.
+        # Demanding a gateway secret it has no gateway for would be a boot
+        # failure with no security value.
+        #
+        # The X-Tenant-ID auth path (auth.py "Path 4") carries NO credential of
+        # its own — it trusts the gateway to have authenticated the caller and
+        # injected the identity headers. Its perimeter check reads
+        # ``if gw_secret and not compare_digest(...)``, which is a NO-OP when the
+        # secret is unset. So an unset secret does not weaken that path, it
+        # DISABLES it: anyone able to reach this service directly (its public
+        # run.app URL, a sidecar, anything inside the VPC) becomes any tenant by
+        # setting a header.
+        #
+        # Refusing to boot is deliberately louder than 401ing the path per
+        # request. A silently-open perimeter is indistinguishable from a working
+        # one from the outside — which is how it would reach production
+        # unnoticed in the first place — whereas a service that will not start
+        # gets caught at deploy.
+        raise RuntimeError(
+            "GATEWAY_SHARED_SECRET (or CAURA_API_KEY, legacy: MEMCLAW_API_KEY) "  # legacy-name-ok: taught as legacy alias
+            f"must be set when ENVIRONMENT={app_settings.environment}. With neither, the "
+            "X-Tenant-ID header-trust auth path accepts caller-supplied identity "
+            "headers from anyone who can reach this service directly. Set "
+            "GATEWAY_SHARED_SECRET to the same value the gateway injects as "
+            "X-Gateway-Secret, or set CAURA_API_KEY if this deployment is not "
+            "fronted by the gateway."
+        )
+    if app_settings.environment != "production":
+        # JWT_SECRET, ADMIN_API_KEY and SETTINGS_ENCRYPTION_KEY stay
+        # production-only, by decision: whether staging and the sandboxes set
+        # them lives in their Cloud Run state, outside this repo, and a guard
+        # that fails there takes the deployment down rather than warning.
+        return
+    if _os.getenv("TESTING") == "1":
+        # TESTING=1 registers the test-only ``/testing`` routes (time-warp
+        # rewrites memory timestamps), and the same variable is their runtime
+        # check, so one inherited from a CI image would leave them live (L-68).
+        raise RuntimeError(
+            "TESTING=1 is not allowed when ENVIRONMENT=production: it registers the test-only "
+            "/testing routes. Unset TESTING for production deployments."
+        )
+    if _blank_secret(app_settings.settings_encryption_key):
+        raise RuntimeError(
+            "SETTINGS_ENCRYPTION_KEY must be set when ENVIRONMENT=production. "
+            'Generate one with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
+        )
+    for var, bad_val in _DANGEROUS_DEFAULTS.items():
+        # Nothing in ``_DANGEROUS_DEFAULTS`` is SecretStr today (the only ones
+        # are platform_llm_api_key / platform_embedding_api_key); the unwrap is
+        # here for whatever gets added next. The example that used to be named
+        # here, postgres_password, no longer exists — core-api dropped its DB
+        # engine.
+        val = _unwrap_secret(getattr(app_settings, var, None))
+        # Strip ONCE and test both properties against the stripped value. Doing
+        # only the first half — presence on the stripped value, equality on the
+        # raw one — leaves the published placeholder booting production the
+        # moment it carries surrounding whitespace, and
+        # ``change-me-in-production\n`` is exactly what a file-mounted secret
+        # yields (``cat key >> .env``, a k8s ``stringData`` block scalar). That
+        # is the delivery path a left-in-place placeholder actually arrives by.
+        stripped = str(val or "").strip()
+        # Presence first, and for every entry. This loop compared against one
+        # literal only, so ``JWT_SECRET=""`` was not equal to the placeholder
+        # and production booted signing API tokens with an empty secret.
+        if not stripped:
+            raise RuntimeError(f"{var.upper()} must be set to a non-blank value for production")
+        if stripped == bad_val:
+            raise RuntimeError(f"{var.upper()} must be changed from default for production")
+    if _blank_secret(app_settings.admin_api_key):
+        raise RuntimeError("ADMIN_API_KEY must be set for production")
+
+
+async def _flush_one_tenant(tid: str, tevs: list[dict]) -> None:
+    """Write one tenant's slice of an audit batch — the flusher's only
+    ``per_tenant_storage_slot`` caller.
+
+    The flusher is a background loop, so no request budget is armed over
+    this acquire, and the slot queues unboundedly by design. Without a
+    budget of its own a tenant whose ``storage_write`` slots are saturated
+    parks here, and because ``_flush_audit_batch`` gathers every tenant of
+    the chunk, the WHOLE flush cycle waits with it: nothing drains, and
+    once ``audit_queue_max_size`` fills every tenant's events are dropped
+    at enqueue (oss-0927-m-04). ``audit_flush_slot_timeout_seconds`` caps
+    the acquire only; once the slot is held the budget is disarmed and the
+    POST is bounded by the storage client's own timeouts, so a write that
+    is already in flight is never cancelled into a double-counted loss.
+
+    The caller separates the sentinel bucket out before scheduling this
+    over real tenants only, so ``tid`` is always a real tenant ID.
+    """
+    budget = app_settings.audit_flush_slot_timeout_seconds
+    try:
+        async with asyncio.timeout(budget) as acquire_budget:
+            async with per_tenant_storage_slot("storage_write", tid):
+                acquire_budget.reschedule(None)
+                await get_storage_client().create_audit_logs_bulk(tevs)
+    except TimeoutError:
+        # Only the acquire can raise this here: the budget is disarmed the
+        # moment the slot is held, and a storage-client timeout surfaces as
+        # an httpx error, not ``TimeoutError``.
+        logger.error(
+            "audit batch flush for tenant=%s (events=%d) could not acquire a "
+            "storage_write slot within %ss; events lost from this tenant's "
+            "slice so the other tenants' flush is not held behind it",
+            tid,
+            len(tevs),
+            budget,
+        )
+        raise
+    except Exception:
+        logger.exception(
+            "audit batch flush failed for tenant=%s (events=%d); events lost from this tenant's slice",
+            tid,
+            len(tevs),
+        )
+        raise
+
+
+async def _shut_down(event_bus: EventBus, *, audit_queue, capability_usage_agg, usage_meter) -> None:
+    """core-api's shutdown steps, in order. Out of ``lifespan`` so the order
+    can be tested."""
+    # Each shutdown step is independent — a failure in one (a
+    # bus pull-loop close that raises, a tracked task whose
+    # cancellation hits a CancelledError swallow somewhere,
+    # an httpx pool already closed) must not skip the rest, or
+    # we leak the resources the later steps would have freed.
+    # Wrap each in its own try/except and continue; the
+    # executor.shutdown at the end always runs.
+    #
+    # Order matters: drain the audit queue BEFORE closing the
+    # storage client — the final flush goes through that client.
+    # Bus stop also happens before storage-client close because
+    # the bus's pull-loops may still be issuing storage calls
+    # mid-cancel.
+    # FIRST, ahead of every flush below: hand back this process's ephemeral
+    # broadcast subscriptions.
+    #
+    # Cloud Run allows 10s between SIGTERM and SIGKILL. The steps below are
+    # awaited SEQUENTIALLY and the first three carry 5s timeouts each, so on
+    # any shutdown where a queue has work the budget is gone before
+    # event_bus.stop() — which is where the delete used to live — is even
+    # reached. The process is killed, the subscription survives, and its
+    # expiration_policy holds project quota for a full day.
+    #
+    # That is not theory. core-api accumulated 6,571 orphaned subscriptions
+    # in staging against a live instance count in the low tens, exhausted
+    # the 10,000 subscriptions-per-project cap — which is shared with prod —
+    # and prod core-api then began failing to create its own subscription
+    # and degrading cross-process cache invalidation to the TTL.
+    # platform-auth-api, same library and same TTL, awaits its bus stop
+    # early and holds 2-6.
+    #
+    # This step needs nothing that the flushes below need, so it is cheap
+    # and cannot be starved by them. event_bus.stop() still calls it; this
+    # is an idempotent hoist, not a move.
+    shutdown_steps: list = [event_bus.release_broadcast_subscriptions()]
+    # The bus stops taking deliveries and settles the handlers in flight
+    # (M-09). core-api hosts the lifecycle pipeline consumers, and its pull
+    # loops used to take new runs until ``event_bus.stop()``, the sixth step.
+    # A run still going when the SIGKILL lands is never cancelled, so its audit
+    # row stays claimed for the 60-minute lease. Started now, before anything is
+    # awaited, so it settles alongside the release above and the task drain
+    # below rather than after them. Awaited before the flushes: handlers are
+    # producers too, and what they log must reach the audit queue.
+    consuming = asyncio.create_task(event_bus.stop_consuming())
+    # Background tasks drain BEFORE the queues that collect what they
+    # produce. They are producers: ``process_entity_extraction`` calls
+    # ``log_action`` (entity_extraction_worker.py) which enqueues onto the
+    # audit queue, and metered work calls ``usage_meter.record``. Draining
+    # them after those flushes meant a task that finished handed its audit
+    # event to a flusher that ``stop()`` had already set to None, and its
+    # counters to a buffer nothing would flush again — saving the work and
+    # dropping its trail.
+    #
+    # This also puts the drain where there is budget left to spend. The
+    # three 5s flushes below already over-run Cloud Run's 10s window on any
+    # shutdown with queued work, so as the last-but-one step this was
+    # reached with nothing remaining on exactly the shutdowns that motivated
+    # giving it a grace at all.
+    shutdown_steps.extend([cancel_all_tasks(), consuming])
+    if audit_queue is not None:
+        shutdown_steps.append(audit_queue.stop(timeout=5.0))
+    if capability_usage_agg is not None:
+        # Final flush before the storage client closes — same ordering
+        # rationale as the audit queue (the flush writes via the DB
+        # session, which must still be live).
+        shutdown_steps.append(capability_usage_agg.stop(timeout=5.0))
+    # Same ordering rationale: the final flush writes through the storage
+    # client, so it has to run before that client closes below. Without it
+    # a clean shutdown would discard up to one flush interval of counts.
+    shutdown_steps.append(usage_meter.stop(timeout=5.0))
+    shutdown_steps.extend(
+        [
+            event_bus.stop(),
+            get_storage_client().close(),
+        ]
+    )
+    for coro in shutdown_steps:
+        try:
+            await coro
+        except Exception:
+            logger.exception("error during shutdown step")
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # Re-route third-party loggers (uvicorn / fastmcp / mcp / slowapi) to the
+    # root handler now that they're all imported. ``configure_logging()`` at
+    # import time (above) already runs this routing, but those libraries are
+    # imported AFTER that call (slowapi / mcp_server below, uvicorn by the
+    # server) — so the import-time pass no-ops for them (it logs a "rerouting
+    # was a no-op" warning) and their records never reach the JSON/GCP handler.
+    # Most consequentially, the MCP SDK's "Error executing tool ..." tool-error
+    # lines were invisible in prod logs. The re-route is idempotent, so this
+    # post-import re-run from the ASGI lifespan startup safely routes them.
+    reroute_third_party_loggers()
+
+    # Validate before initializing providers or accepting any request.
+    _validate_startup_settings(app_settings)
+
+    # Increase default thread pool for concurrent LLM calls via asyncio.to_thread()
+    import asyncio as _aio
+    from concurrent.futures import ThreadPoolExecutor
+
+    executor = ThreadPoolExecutor(max_workers=100)
+    _aio.get_event_loop().set_default_executor(executor)
+
+    # Initialize Sentry error tracking if configured
+    if app_settings.sentry_dsn:
+        try:
+            import sentry_sdk
+
+            sentry_sdk.init(
+                dsn=app_settings.sentry_dsn,
+                environment=app_settings.environment,
+                traces_sample_rate=0.1,
+                profiles_sample_rate=0.1,
+            )
+            logger.info("Sentry initialized")
+        except ImportError:
+            logger.warning("sentry-sdk not installed, skipping Sentry init")
+
+    # CAURA-595: bridge ``settings.<KEY>`` credential values into
+    # ``os.environ`` so the shared ``common.llm._credentials`` and
+    # ``common.llm._platform`` modules — which read ``os.environ``
+    # directly so core-worker doesn't depend on pydantic-settings —
+    # see ``.env``-loaded values too. Must run BEFORE
+    # ``init_platform_providers()`` (which reads
+    # ``PLATFORM_LLM_API_KEY`` from ``os.environ``).
+    from core_api.config import bridge_credentials_to_environ
+
+    bridge_credentials_to_environ()
+
+    # Initialize platform default providers (Caura API keys for tenants without credentials)
+    # Placed after Sentry so init exceptions are captured.
+    from core_api.providers._platform import init_platform_providers
+
+    init_platform_providers()
+
+    async with mcp_lifespan():
+        # Standalone mode: initialise fixed tenant id
+        if app_settings.is_standalone:
+            from core_api.standalone import init_standalone
+
+            init_standalone()
+
+        # Backfill agent rows for any memories written before agent tracking.
+        # Fully storage-routed (backfill_agents → sc.backfill_from_memories), so
+        # no core-api DB session is opened here.
+        try:
+            from core_api.services.agent_service import backfill_agents
+
+            count = await backfill_agents()
+            if count:
+                print(f"[startup] Backfilled {count} agent(s) from memories")
+        except Exception as e:
+            print(f"[startup] Agent backfill skipped: {e}")
+
+        # Wire service hooks (audit). Recall tracking now routes directly through
+        # the storage client (increment_recall) at each call site; the on_recall
+        # hook was removed with core-api's repositories/DB pool.
+        from core_api.services.audit_service import log_action
+        from core_api.services.hooks import ServiceHooks, configure_hooks
+        from core_api.services.usage_meter import UsageMeter
+
+        # caura-ai/caura-enterprise#83. Wired unconditionally: the counters are
+        # written through core-api's own storage client, so there is no
+        # platform dependency to gate on, and a standalone deployment gets
+        # accurate usage numbers for free. It still enforces nothing — limits
+        # arrive out-of-band via ``x-org-read-only`` (see ``usage_service``).
+        usage_meter = UsageMeter()
+        usage_meter.start()
+        configure_hooks(ServiceHooks(audit_log=log_action, usage_meter=usage_meter.record))
+
+        # Anonymous daily heartbeat (docs/telemetry.md). ``install`` evaluates
+        # the policy, prints the ON/OFF boot line and starts the tracked loop
+        # only when the policy says on — off means no task, no HTTP client,
+        # no counter. Cancelled with the other tracked tasks on shutdown.
+        from core_api.heartbeat import install as install_heartbeat
+
+        install_heartbeat(app_settings)
+
+        # CAURA-628: bind + start the audit batch flusher. ``log_action``
+        # checks for an active queue and falls back to a synchronous
+        # POST when ``audit_queue_max_size = 0`` (kill-switch) or the
+        # queue isn't bound (early startup, tests).
+        audit_queue = None
+        if app_settings.audit_queue_max_size > 0:
+            from core_api.services.audit_queue import (
+                AuditEventQueue,
+                set_audit_queue,
+            )
+
+            async def _flush_audit_batch(events: list[dict]) -> None:
+                # Group by tenant + flush concurrently with per-tenant storage
+                # slot (cap=2) gating each group. Without the slot the flusher
+                # hoards storage-writer pool slots while ``/memories/bulk``
+                # requests queue, producing the 72% bulk_write 429 spike from
+                # loadtest 1777462612 (CAURA-631). Concurrent fan-out keeps
+                # flush latency bounded to the slowest tenant rather than
+                # serialising over them.
+                #
+                # Per-tenant failures don't abort sibling tenants;
+                # ``return_exceptions=True`` lets every group's outcome land,
+                # then we re-raise the last error and attach the actually-failed
+                # event count via ``failed_event_count`` so ``_drain_and_flush``
+                # can credit the surviving tenants to ``_flushed_count`` instead
+                # of marking the whole chunk lost.
+                by_tenant: dict[str | object, list[dict]] = {}
+                for ev in events:
+                    # ``.get()`` so a malformed event missing tenant_id can't
+                    # KeyError out the whole batch — bucket it under the
+                    # sentinel and skip the storage write for that bucket.
+                    tenant_id = ev.get("tenant_id") or _UNKNOWN_TENANT_SENTINEL
+                    by_tenant.setdefault(tenant_id, []).append(ev)
+
+                # Pop sentinel events (no tenant_id) before fan-out: log them
+                # once + skip the storage write, but don't include them in the
+                # gather. Removes the dead sentinel branch from
+                # ``_flush_one_tenant`` and keeps ``total_failed_events`` /
+                # ``len(tasks)`` accurate to "events that were actually
+                # attempted to write."
+                #
+                # Stash the count on the closure so ``_drain_and_flush`` can
+                # subtract it from ``_flushed_count`` after the call —
+                # otherwise dropped sentinel events would be silently
+                # credited as flushed, inflating the dashboard. Assigned
+                # unconditionally on every entry so a stale value from a
+                # previous call can't bleed through.
+                sentinel_evs = by_tenant.pop(_UNKNOWN_TENANT_SENTINEL, [])
+                _flush_audit_batch._sentinel_count = len(sentinel_evs)  # type: ignore[attr-defined]
+                if sentinel_evs:
+                    logger.warning(
+                        "audit batch contained %d events with no tenant_id; "
+                        "skipping write (events unattributable)",
+                        len(sentinel_evs),
+                    )
+
+                # Sentinel was already popped above, so every remaining
+                # key is a real tenant string. Runtime check (not
+                # ``assert``) so the guard fires under ``python -O`` too —
+                # surfaces a future bug that lets a non-string key sneak
+                # in instead of silently dropping that group's events.
+                if not all(isinstance(tid, str) for tid in by_tenant):
+                    raise RuntimeError("unexpected non-string tenant key in by_tenant after sentinel pop")
+                tasks: list[tuple[str, list[dict]]] = list(by_tenant.items())  # type: ignore[arg-type]
+                results = await asyncio.gather(
+                    *(_flush_one_tenant(tid, tevs) for tid, tevs in tasks),
+                    return_exceptions=True,
+                )
+
+                # Three buckets to handle every BaseException class without
+                # silent drops:
+                #   - ``cancel_errors``: ``asyncio.CancelledError`` (BaseException,
+                #     not Exception). Asyncio cancellation MUST propagate with
+                #     highest priority — silencing it under a co-occurring
+                #     regular exception breaks shutdown semantics.
+                #   - ``other_base``: ``SystemExit`` / ``KeyboardInterrupt`` /
+                #     future ``BaseExceptionGroup`` etc. Re-raise as-is for the
+                #     queue's outer handler — never silently drop.
+                #   - ``errors``: regular ``Exception`` subclasses. Carry the
+                #     actionable Sentry-grade traceback. Raised last.
+                cancel_errors = [r for r in results if isinstance(r, asyncio.CancelledError)]
+                errors = [r for r in results if isinstance(r, Exception)]
+                other_base = [
+                    r
+                    for r in results
+                    if isinstance(r, BaseException)
+                    and not isinstance(r, Exception)
+                    and not isinstance(r, asyncio.CancelledError)
+                ]
+
+                # Count actually-lost events across all failure buckets.
+                # ``_drain_and_flush`` reads ``failed_event_count`` from the
+                # raised exception to keep ``_flushed_count`` /
+                # ``_failed_count`` accounting accurate when only some
+                # tenants in the chunk fail.
+                total_failed_events = sum(
+                    len(tevs)
+                    for (_tid, tevs), r in zip(tasks, results, strict=True)
+                    if isinstance(r, BaseException)
+                )
+
+                # Priority order: cancel → other_base → errors. Cancellation
+                # wins so shutdown signals propagate even if a co-occurring
+                # storage error tries to mask them. ``failed_event_count`` is
+                # attached to every raise path so ``_drain_and_flush``'s
+                # accounting stays accurate regardless of which path fires.
+                if cancel_errors:
+                    e_cancel = cancel_errors[-1]
+                    e_cancel.failed_event_count = total_failed_events  # type: ignore[attr-defined]
+                    raise e_cancel
+                if other_base:
+                    e_base = other_base[-1]
+                    e_base.failed_event_count = total_failed_events  # type: ignore[attr-defined]
+                    raise e_base
+                if errors:
+                    # Single-tenant failure: re-raise the underlying error
+                    # directly so callers see the original storage-call
+                    # frame in Sentry without an extra wrapping layer.
+                    # Multi-tenant failure: wrap in ``ExceptionGroup`` so
+                    # every tenant's traceback is preserved (Sentry groups
+                    # them, incident replay sees them all). Without the
+                    # group the ``errors[-1]``-only path silently dropped
+                    # all but the last tenant's stack.
+                    if len(errors) == 1:
+                        last_error = errors[-1]
+                        last_error.failed_event_count = total_failed_events  # type: ignore[attr-defined]
+                        raise last_error
+                    eg = ExceptionGroup(
+                        f"audit batch flush failed for {len(errors)} tenants",
+                        errors,
+                    )
+                    eg.failed_event_count = total_failed_events  # type: ignore[attr-defined]
+                    raise eg
+
+            audit_queue = AuditEventQueue(
+                max_queue_size=app_settings.audit_queue_max_size,
+                flush_threshold=app_settings.audit_queue_flush_threshold,
+                flush_interval_seconds=app_settings.audit_queue_flush_interval_seconds,
+                flush_callable=_flush_audit_batch,
+            )
+            set_audit_queue(audit_queue)
+            await audit_queue.start()
+
+        # Capability-usage adoption counters: in-process aggregation
+        # flushed to ``capability_usage`` every
+        # ``capability_usage_flush_interval_seconds``. Disabled →
+        # ``record_usage()`` stays a no-op (the emitters never null-check).
+        capability_usage_agg = None
+        if app_settings.capability_usage_enabled:
+            from core_api.services.capability_usage import (
+                CapabilityUsageAggregator,
+                _default_flush,
+                set_aggregator,
+            )
+
+            capability_usage_agg = CapabilityUsageAggregator(
+                flush_interval_seconds=app_settings.capability_usage_flush_interval_seconds,
+                flush_callable=_default_flush,
+            )
+            set_aggregator(capability_usage_agg)
+            await capability_usage_agg.start()
+
+        # ``register_consumers`` must run before ``bus.start`` — the
+        # Pub/Sub backend spawns pull loops from the handler registry
+        # snapshot taken at start time, so a late ``subscribe`` would
+        # silently orphan the handler. Inprocess mode (tests, OSS
+        # standalone) makes ``start`` a no-op so this wiring is
+        # harmless there.
+        register_consumers()
+
+        event_bus = get_event_bus()
+
+        # Lifecycle Pub/Sub consumers split into two groups by where
+        # they need to run:
+        #   * Archive + purge (CAURA-655 / -656) — SQL-only. Subscribed
+        #     by core-worker on SaaS; only registered here in OSS
+        #     standalone where there's no separate worker process.
+        #   * Crystallize + entity-link (CAURA-657) — pipeline-machinery
+        #     consumers. ALWAYS registered here because the pipeline
+        #     code lives in core-api and isn't reachable from worker.
+        from common.events.lifecycle_handlers import (
+            register_archive_consumers,
+            register_pipeline_consumers,
+        )
+        from core_api.services.lifecycle_audit import make_storage_adapter
+
+        lifecycle_adapter = make_storage_adapter(get_storage_client())
+        register_pipeline_consumers(lifecycle_adapter)
+        if isinstance(event_bus, InProcessEventBus):
+            register_archive_consumers(lifecycle_adapter)
+
+        await event_bus.start()
+
+        yield
+
+        await _shut_down(
+            event_bus,
+            audit_queue=audit_queue,
+            capability_usage_agg=capability_usage_agg,
+            usage_meter=usage_meter,
+        )
+        executor.shutdown(wait=False)
+
+
+# CAP-01 / F6. Tag-level labelling for capabilities whose REST surface is not
+# what its presence in this spec implies. Only STM qualifies today: it is
+# advertised here, gated on a server setting hosted tenants cannot reach, and
+# has no DEDICATED REST write route. The per-operation text lives in
+# ``routes/stm.py``; this is what a reader sees in the docs sidebar before
+# they open an operation — which is why the sentence about the write path is
+# shared with that module rather than restated here. It used to be restated,
+# and said something untrue for longer than the copy that got corrected.
+OPENAPI_TAGS = [
+    {
+        "name": "stm",
+        "description": (
+            "**Plugin-only — not available over hosted REST.** Short-term "
+            "memory is served by the OpenClaw plugin. These operations are "
+            "gated on the server-side `USE_STM` setting, which is off in the "
+            "hosted deployment and is not per-tenant. "
+            f"{STM_WRITE_ROUTE_NOTE} Use `/memories` and `/search` for "
+            "durable memory."
+        ),
+    },
+]
+
+# SAFE-01. Stated once at the API level rather than on ~25 write operations,
+# for the same reason the 401/403 responses below are injected once: the same
+# fact written twenty-five times has twenty-five chances to go stale, and the
+# copy that gets forgotten is the one someone reads. The per-model half of the
+# contract is already machine-readable — a strict request schema carries
+# ``additionalProperties: false``, a permissive one does not — so this text
+# exists to say what that means and why the two kinds differ.
+_API_DESCRIPTION = """
+Governed shared memory for AI agent fleets.
+
+### Request bodies: writes are strict, searches are not
+
+**Write and mutation bodies reject fields they do not declare.** An
+unrecognised key returns `422` with the canonical error envelope, naming it in
+`error.message` and listing every offender as a dotted path in
+`error.details.unknown_fields`:
+
+```json
+{"error": {"code": "INVALID_ARGUMENTS",
+           "message": "unknown field 'contnet' is not permitted on this request body (at 'contnet')",
+           "details": {"unknown_fields": ["contnet"]}}}
+```
+
+Such a field used to be **silently discarded** — the write returned `201` and
+stored the row without it. Any request schema below carrying
+`additionalProperties: false` is strict.
+
+**Search, filter and query bodies still ignore unknown fields**, deliberately:
+a misspelled filter returns a visibly wrong result set, while a misspelled
+write field corrupts stored data invisibly. Only the second justifies a
+breaking change. `/search`, `/recall`, `/documents/query` and
+`/documents/search` stay permissive, as do the historical `AliasChoices`
+spellings on `/search` (`memory_type` ↔ `memory_type_filter`, `status` ↔
+`status_filter`).
+
+Two write bodies are also deliberately permissive: an unknown key inside a
+`POST /memories/bulk` **item** becomes that item's own `status="error"` row in
+the 207 rather than a 422 for the whole batch, and the plugin telemetry
+endpoints (`/fleet/heartbeat`, `/fleet/commands/{id}/result`) accept unknown
+keys because plugin and backend have no version handshake.
+"""
+
+app = FastAPI(
+    title="Caura",
+    version=VERSION,
+    description=_API_DESCRIPTION,
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
+    openapi_tags=OPENAPI_TAGS,
+    lifespan=lifespan,
+)
+
+
+# ── Error responses in the spec (C32 / API-05) ────────────────────────────
+#
+# Before this, 422 was the ONLY documented error response on the whole surface.
+# Every other failure — every 401, every 403 — was absent from the spec, so a
+# generated client had no type for the body it will certainly receive, and an
+# agent reading the spec offline could reasonably conclude those statuses do not
+# occur. They occur constantly: authentication and authorization are checked on
+# essentially every route.
+#
+# Injected once over the generated schema rather than declared per route.
+# ``responses={401: ..., 403: ...}`` on ~91 path operations is the same fact
+# written ninety-one times, and the copy that gets forgotten is the one that
+# matters. Existing per-route declarations win — this only fills gaps.
+_ERROR_ENVELOPE_REF = "CauraError"
+
+_ERROR_ENVELOPE_SCHEMA: dict = {
+    "type": "object",
+    "title": "CauraError",
+    "description": (
+        "Canonical error envelope. ``detail`` is the human-readable message and "
+        "is retained for backwards compatibility; ``error.code`` is the stable "
+        "machine-readable identifier and is what clients should branch on."
+    ),
+    "properties": {
+        "detail": {"type": "string", "description": "Human-readable message."},
+        "error": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": (
+                        "Stable UPPER_SNAKE identifier. Derived from the status "
+                        "code unless the raiser supplied a specific one — e.g. "
+                        "READ_ONLY_CREDENTIAL vs PLAN_LIMIT_READ_ONLY, which are "
+                        "both 403 and need different responses from the caller."
+                    ),
+                },
+                "message": {"type": "string"},
+                "details": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "description": "Optional structured context, e.g. remediation or existing_id.",
+                },
+            },
+            "required": ["code", "message"],
+        },
+    },
+    "required": ["detail", "error"],
+}
+
+# Status → description, for the statuses every authenticated route can return.
+_INJECTED_ERROR_RESPONSES: dict[str, str] = {
+    "401": "Authentication failed or was not supplied.",
+    "403": "Authenticated, but not permitted to perform this operation.",
+}
+
+
+def _openapi_with_error_responses() -> dict:
+    """Generate the spec, then document the errors every route can return."""
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        routes=app.routes,
+        tags=OPENAPI_TAGS,
+        servers=([{"url": app_settings.public_api_url.rstrip("/")}] if app_settings.public_api_url else None),
+    )
+    schema.setdefault("components", {}).setdefault("schemas", {})[_ERROR_ENVELOPE_REF] = (
+        _ERROR_ENVELOPE_SCHEMA
+    )
+    ref = {"$ref": f"#/components/schemas/{_ERROR_ENVELOPE_REF}"}
+    for path_item in schema.get("paths", {}).values():
+        for method, operation in path_item.items():
+            if method not in {"get", "put", "post", "delete", "patch"}:
+                continue
+            responses = operation.setdefault("responses", {})
+            for status, description in _INJECTED_ERROR_RESPONSES.items():
+                if status in responses:
+                    continue  # a route that documented its own says it better
+                responses[status] = {
+                    "description": description,
+                    "content": {"application/json": {"schema": ref}},
+                }
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _openapi_with_error_responses  # type: ignore[method-assign]
+
+# slowapi reads limiter + handler from app.state; decorators in
+# middleware/rate_limit.py consult this at request time. There is no
+# SlowAPIMiddleware — the per-route decorators do the injecting, into the
+# endpoint's ``response: Response`` parameter, which is why every
+# rate-limited handler must declare one (D14; enforced by
+# tests/test_d14_rate_limited_response_param.py). With headers_enabled=True
+# that puts X-RateLimit-Limit/Remaining/Reset + Retry-After on SUCCESS
+# responses too, so clients can back off before hitting 429.
+app.state.limiter = limiter
+
+
+async def _json_rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    # Custom handler so 429 bodies match the rest of the API's error
+    # envelope: top-level `detail` for back-compat plus the canonical
+    # `error: {code, message, details?}` field. Re-runs slowapi's header
+    # injector so X-RateLimit-* + Retry-After still land on the response.
+    from core_api.errors import make_error_payload
+
+    detail_str = f"Rate limit exceeded: {exc.detail}. Try again later."
+    body = {"detail": detail_str, **make_error_payload("RATE_LIMITED", detail_str)}
+    response = JSONResponse(body, status_code=429)
+    # Inject X-RateLimit headers only when the limit was actually evaluated. A
+    # swallowed storage error (see _key_func) leaves view_rate_limit None; skip
+    # the private _inject_headers call entirely rather than depending on slowapi's
+    # None-handling for OUR call site. (On the 429 path it's normally set — a 429
+    # means a limit was hit — so this is defence in depth.)
+    view_rate_limit = getattr(request.state, "view_rate_limit", None)
+    if view_rate_limit is not None:
+        response = request.app.state.limiter._inject_headers(response, view_rate_limit)
+    return response
+
+
+app.add_exception_handler(RateLimitExceeded, _json_rate_limit_handler)
+
+
+# ── Canonical error envelope ────────────────────────────────────────
+# Every error response carries a top-level ``detail`` (legacy/back-compat)
+# AND a canonical ``error: {code, message, details?}`` envelope. New
+# clients should read ``error.code`` for machine-readable dispatch;
+# existing clients reading ``detail`` keep working.
+#
+# Callers that need a specific error code can raise:
+#     raise HTTPException(status_code=404, detail={"code": "MEMORY_NOT_FOUND",
+#                                                  "message": "...",
+#                                                  "details": {...}})
+# When ``detail`` is a string, the code is auto-derived from the status
+# via core_api.errors.STATUS_TO_CODE.
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    from core_api.errors import code_for_status, make_error_payload
+
+    raw = exc.detail
+    if isinstance(raw, dict) and "code" in raw and "message" in raw:
+        code = str(raw["code"])
+        message = str(raw["message"])
+        details = raw.get("details") if isinstance(raw.get("details"), dict) else None
+        legacy_detail: object = message
+    else:
+        code = code_for_status(exc.status_code)
+        message = str(raw) if raw is not None else ""
+        details = None
+        legacy_detail = raw  # keep original shape (string, list, dict-without-code) for back-compat
+
+    body = {"detail": legacy_detail, **make_error_payload(code, message, details)}
+    return JSONResponse(body, status_code=exc.status_code, headers=exc.headers)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def starlette_http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """Give the router's own 404 the envelope every other error already has.
+
+    The handler above covers ``fastapi.HTTPException`` — everything a route
+    raises. It does not cover the 404 Starlette's router raises for a path that
+    matched no route at all, which is a different class and so arrived at the
+    caller as a bare ``{"detail": "Not Found"}``: no code, and a shape nothing
+    else on this surface uses. A client branching on ``error.code`` got nothing
+    from the one response it is most likely to meet while finding its way
+    around (ax-0917-m-13 hit it guessing ``/documents/{collection}/{doc_id}``).
+
+    A 404 here also means something specific — "no such route", not "no such
+    row" — so it carries ``NO_SUCH_ROUTE`` rather than ``NOT_FOUND``. A caller
+    that cannot tell those apart retries against a path that will never exist,
+    or concludes its data is gone when only its URL was wrong.
+
+    And since the server knows every route it serves, the response names the
+    nearest ones. The guess is the question; an unadorned 404 answers only
+    "not that" and leaves the caller to guess again.
+    """
+    from core_api.errors import make_error_payload
+    from core_api.route_suggestions import route_table, suggest_routes
+
+    if exc.status_code != 404 or request.scope.get("route") is not None:
+        # Anything the router raised that is not an unmatched path keeps the
+        # generic mapping; only the unmatched case has a route to suggest.
+        return await http_exception_handler(request, exc)  # type: ignore[arg-type]
+
+    path = request.scope.get("path", "")
+    details: dict = {"path": path, "method": request.method}
+    suggestions = suggest_routes(path, route_table(app))
+    if suggestions:
+        details["did_you_mean"] = suggestions
+
+    message = f"No route matches {request.method} {path}."
+    if suggestions:
+        message += " Closest registered routes are in details.did_you_mean."
+
+    body = {
+        "detail": exc.detail,  # back-compat: the old bare shape is preserved
+        **make_error_payload("NO_SUCH_ROUTE", message, details),
+    }
+    return JSONResponse(body, status_code=404, headers=getattr(exc, "headers", None))
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Replace FastAPI's default 422 body with our envelope.
+
+    FastAPI's default returns ``{"detail": [{loc, msg, type, ...}, ...]}``.
+    We keep that ``detail`` array verbatim for back-compat AND surface
+    the canonical envelope. The aggregated message joins each error's
+    ``msg`` for callers that want a single human-readable string.
+
+    ``exc.errors()`` may include non-JSON-safe values (e.g. ``ctx``
+    contains Pydantic's underlying ``ValueError`` instance for
+    ``value_error`` types). ``jsonable_encoder`` flattens those before
+    we hand off to ``JSONResponse``.
+
+    SAFE-01 — unknown fields on write bodies. Every write request model is
+    ``extra="forbid"`` (``core_api.schemas.STRICT_WRITE_BODY``), so a
+    misspelled key now lands here as a pydantic ``extra_forbidden`` error.
+    Pydantic's own ``msg`` for those is the field-less "Extra inputs are not
+    permitted", which would make the envelope's aggregated ``message`` say
+    nothing about WHICH key was wrong — the caller would be told their write
+    failed and left to diff the payload against the docs to find out why. So
+    those entries get a message naming the field, and the offending names are
+    also lifted into ``details.unknown_fields`` for programmatic clients. The
+    ``detail`` array keeps pydantic's verbatim entries (``loc`` already carries
+    the field name there) because it is the back-compat surface.
+    """
+    from fastapi.encoders import jsonable_encoder
+
+    from core_api.errors import make_error_payload
+
+    errs = jsonable_encoder(exc.errors())
+
+    unknown_fields: list[str] = []
+    messages: list[str] = []
+    for e in errs:
+        if e.get("type") == "extra_forbidden":
+            # ``loc`` is ("body", "<field>") — or deeper for a nested model /
+            # list item, e.g. ("body", "items", 3, "<field>"). Report the leaf
+            # as the name and the dotted path so a nested typo is locatable.
+            loc = [str(part) for part in e.get("loc", []) if str(part) != "body"]
+            name = loc[-1] if loc else "<unknown>"
+            path = ".".join(loc) or name
+            unknown_fields.append(path)
+            messages.append(f"unknown field '{name}' is not permitted on this request body (at '{path}')")
+        else:
+            messages.append(e.get("msg", ""))
+
+    summary = "; ".join(messages) or "validation error"
+    details: dict = {"errors": errs}
+    if unknown_fields:
+        details["unknown_fields"] = unknown_fields
+    body = {
+        "detail": errs,  # original FastAPI shape
+        **make_error_payload("INVALID_ARGUMENTS", summary, details=details),
+    }
+    return JSONResponse(body, status_code=422)
+
+
+# Request observation + capability-usage adoption signal. Registered FIRST so
+# it ends up INNERMOST — directly wrapping the router (only Starlette's pure-ASGI
+# ExceptionMiddleware sits between). This placement is load-bearing: it must read
+# ``scope["route"]`` (the matched route template) on the way back out, and
+# ``SlowAPIMiddleware`` is a ``BaseHTTPMiddleware`` that runs the downstream app
+# in a separate task — a route set inside it does NOT reliably propagate back out
+# to an outer middleware. Sitting inside SlowAPI guarantees the template is
+# readable. Trade-off: it no longer wraps RequestTimeout/SlowAPI, so 504s/429s
+# aren't observed — fine, those requests didn't execute a capability anyway.
+app.add_middleware(RequestObservationMiddleware)
+
+app.add_middleware(SlowAPIMiddleware)
+
+if app_settings.is_standalone:
+    from core_api.middleware.standalone_tenant import StandaloneTenantMiddleware
+
+    app.add_middleware(StandaloneTenantMiddleware)
+
+# PR #9: reject oversized ingest requests before FastAPI parses the body.
+# Registered before RequestTimeout so Starlette places it INSIDE the request
+# budget: a slow chunked upload cannot hold the body-counting loop forever.
+# Both sit inside SecurityHeaders/CORS so 413/504 responses carry those headers.
+app.add_middleware(IngestBodySizeMiddleware)
+app.add_middleware(
+    RequestTimeoutMiddleware,
+    timeout_seconds=app_settings.request_timeout_seconds,
+)
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in app_settings.cors_origins.split(",") if o.strip()],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch-all for non-HTTPException failures. Returns 500 with both
+    the back-compat ``detail`` field AND the canonical ``error`` envelope.
+    Includes the exception's message and ``error_type`` only in development:
+    a hosted ``sandbox`` is reachable like production, and the message can
+    carry internal hostnames or URLs (M-78). The log keeps the full exception.
+    """
+    from core_api.errors import make_error_payload
+
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    expose = app_settings.environment == "development"
+    detail = str(exc) if expose else "Internal Server Error"
+    details: dict = {"path": request.url.path}
+    if expose:
+        details["error_type"] = type(exc).__name__
+    content: dict = {
+        "detail": detail,
+        "path": request.url.path,
+        **make_error_payload("INTERNAL_ERROR", detail, details=details),
+    }
+    if expose:
+        content["error_type"] = type(exc).__name__
+    return JSONResponse(status_code=500, content=content)
+
+
+@app.exception_handler(StoragePointerRejectedError)
+async def storage_pointer_rejected_handler(
+    request: Request, exc: StoragePointerRejectedError
+) -> JSONResponse:
+    """A write named a ``subject_entity_id`` / ``supersedes_id`` /
+    ``evidence_memory_id`` that is not a row of the caller's tenant: 422.
+
+    The caller supplied the id, so this is a request it can correct — unlike
+    the permanent refusal below, which is ours. Storage refuses absent and
+    foreign ids with the same answer, and so does this.
+    """
+    from core_api.errors import code_for_status, make_error_payload
+
+    message = str(exc)
+    body = {"detail": message, **make_error_payload(code_for_status(422), message, exc.fields or None)}
+    return JSONResponse(status_code=422, content=body)
+
+
+@app.exception_handler(PermanentStorageWriteError)
+async def permanent_storage_write_handler(request: Request, exc: PermanentStorageWriteError) -> JSONResponse:
+    """A write storage refused permanently: 500, and explicitly not retryable.
+
+    The counterpart to ``upstream_http_error_handler`` below, and the reason
+    this exists as its own type. That handler answers every unhandled upstream
+    5xx with "503, retry" — correct for a dependency blip, and exactly inverted
+    for a failure that reproduces byte-for-byte. Three bulk callers (the MCP
+    write tool, ``ingest_service``, ``_insert_children_or_degrade``) do not
+    catch storage errors themselves, so without this they would land there and
+    be told to retry something that can never succeed.
+
+    500 rather than 503: there is nothing to wait for. The routes that own an
+    HTTP contract may still answer more specifically — ``/memories/bulk`` adds
+    the ``X-Bulk-Attempt-Id`` advice — and this is the floor under everyone
+    else.
+    """
+    from core_api.errors import make_error_payload
+
+    logger.error(
+        "permanent storage write refusal on %s %s: %s",
+        request.method,
+        request.url.path,
+        exc,
+    )
+    message = f"{exc}. Retrying this write unchanged cannot succeed."
+    body = {
+        "detail": message,
+        **make_error_payload(permanent_failure.PERMANENT_WRITE_FAILURE_CODE, message, exc.fields or None),
+    }
+    return JSONResponse(status_code=500, content=body)
+
+
+@app.exception_handler(httpx.HTTPStatusError)
+async def upstream_http_error_handler(request: Request, exc: httpx.HTTPStatusError) -> JSONResponse:
+    """Map an unhandled upstream (storage-api etc.) 5xx/429 to a retryable
+    503 instead of letting it reach the catch-all as an ``INTERNAL_ERROR``
+    500 "unhandled exception".
+
+    A dependency returning 5xx/429 is a transient infrastructure blip, not a
+    bug in this request — surfacing it as 503 lets the caller back off and
+    retry. Prod 2026-07: a single storage-writer 503 on POST /fleet/heartbeat
+    bubbled through ``_post``'s ``raise_for_status`` as an unhandled 500 and
+    opened an Error-Tracking issue; the plugin should have just retried the
+    next tick.
+
+    A 4xx from an upstream is a bug in OUR request shape (genuinely
+    unexpected), so it must surface exactly as before this handler existed —
+    re-raise it unchanged rather than swallowing it into a response, so it
+    reaches the catch-all as a 500 (and callers that deliberately let a
+    storage 4xx propagate, e.g. the bulk-write atomicity path, keep seeing the
+    raw ``HTTPStatusError``). ``response`` is a required, non-Optional field
+    on ``HTTPStatusError``, so it's always present.
+    """
+    from core_api.errors import code_for_status, make_error_payload
+
+    status = exc.response.status_code
+    if status < 500 and status != 429:
+        raise exc
+
+    logger.warning(
+        "upstream %s on %s %s → 503 (retryable)",
+        status,
+        request.method,
+        request.url.path,
+    )
+    message = "Upstream dependency unavailable; retry."
+    body = {"detail": message, **make_error_payload(code_for_status(503), message)}
+    return JSONResponse(status_code=503, content=body)
+
+
+app.include_router(health_router, prefix="/api/v1")
+app.include_router(memories_router, prefix="/api/v1")
+app.include_router(admin_memories_router, prefix="/api/v1")
+app.include_router(entities_router, prefix="/api/v1")
+app.include_router(audit_router, prefix="/api/v1")
+app.include_router(settings_router, prefix="/api/v1")
+app.include_router(agents_router, prefix="/api/v1")
+app.include_router(fleet_router, prefix="/api/v1")
+app.include_router(documents_router, prefix="/api/v1")
+app.include_router(reports_router, prefix="/api/v1")
+# Skill Factory Phase 2 — HITL Skills Inbox. Routes flag-gated at
+# request time via ``org_settings.skills_factory.enabled``; non-opted-in
+# tenants receive 403 SKILLS_FACTORY_DISABLED, ensuring zero behavior
+# change until they explicitly enable the feature.
+app.include_router(skills_inbox_router, prefix="/api/v1")
+app.include_router(keystones_router, prefix="/api/v1")
+app.include_router(keystone_versions_router, prefix="/api/v1")
+# Rename compatibility (2026-08-14): the keystones REST surface
+# shipped under the old brand prefix and customer scripts call it. The
+# canonical path is now the brand-neutral /api/v1/keystones (matching every
+# other route); the old prefix remains accepted, hidden from the schema.
+app.include_router(
+    keystones_router,
+    prefix="/api/v1/memclaw",  # legacy-name-floor: floor
+    include_in_schema=False,
+)
+app.include_router(crystallizer_router, prefix="/api/v1")
+app.include_router(plugin_router, prefix="/api/v1")
+# Bootstrap aliases — see plugin.py:plugin_bootstrap_router for rationale.
+app.include_router(plugin_bootstrap_router, prefix="/api")
+app.include_router(stats_router, prefix="/api/v1")
+app.include_router(telemetry_router, prefix="/api/v1")
+app.include_router(stm_router, prefix="/api/v1")
+app.include_router(insights_router, prefix="/api/v1")
+app.include_router(interview_router, prefix="/api/v1")
+app.include_router(evolve_router, prefix="/api/v1")
+app.include_router(conflicts_router, prefix="/api/v1")
+app.include_router(lifecycle_router, prefix="/api/v1")
+app.include_router(scheduler_lease_router, prefix="/api/v1")
+app.include_router(org_deletion_router, prefix="/api/v1")
+
+# Test-only endpoints (time-warp, etc.) — only registered when TESTING=1
+if _os.getenv("TESTING") == "1":
+    from core_api.routes.testing import router as testing_router
+
+    app.include_router(testing_router, prefix="/api/v1")
+
+# Mount at /mcp; the SDK app's internal Route("/") handles the canonical /mcp/.
+# Bare /mcp (no trailing slash) doesn't match Mount's regex, so the parent
+# router would issue a 307 — streaming MCP clients (e.g. Anthropic's
+# remote-MCP integration) hang on the initialize handshake when a redirect
+# precedes the upgrade. The shim below forwards /mcp into the same ASGI
+# app in-process so both paths serve identically without a wire redirect.
+_mcp_asgi_app = get_mcp_app()
+app.mount("/mcp", _mcp_asgi_app)
+
+
+class _MCPNoSlashShim:
+    """Forward /mcp into the mounted MCP app in-process (no HTTP redirect)."""
+
+    # slowapi.middleware introspects ``handler.__name__`` per request — without
+    # this attribute on the instance, every /mcp call 500s with AttributeError.
+    __name__ = "_mcp_no_slash_shim"
+
+    def __init__(self, inner: ASGIApplication) -> None:
+        self._inner = inner
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        new_scope = dict(scope)
+        new_scope["path"] = "/"
+        new_scope["raw_path"] = b"/"
+        new_scope["root_path"] = scope.get("root_path", "") + "/mcp"
+        await self._inner(new_scope, receive, send)
+
+
+from starlette.routing import Route as _StarletteRoute
+
+app.router.routes.append(
+    _StarletteRoute(
+        "/mcp",
+        endpoint=_MCPNoSlashShim(_mcp_asgi_app),
+        methods=["GET", "POST", "DELETE", "OPTIONS"],
+    )
+)
+
+
+# CAURA-602: turn a silent regression into a startup crash. The
+# request-timeout middleware skips a hardcoded path-allowlist; if a router prefix
+# or path ever moves and the allowlist isn't updated to match, the silent-create
+# class would re-emerge with no error. Verify at import time that every opt-out
+# path is a registered route.
+#
+# Read the paths from the OpenAPI schema rather than walking ``app.routes``:
+# FastAPI 0.137 changed ``include_router(prefix=...)`` to mount the router as an
+# opaque ``_IncludedRouter`` (path=None, no public ``.routes``), so the prefixed
+# paths are no longer top-level ``APIRoute.path`` entries — which is exactly what
+# silently broke this guard when 0.137 shipped. ``app.openapi()`` is the stable,
+# public surface and lists the prefixed paths under both old (flatten) and new
+# (mount) FastAPI.
+#
+# The schema is NOT the whole served surface, though, so this guard constrains
+# what may go in the opt-out set: an opt-out path must be schema-visible. Four
+# operations are served and undocumented — the PERMANENT legacy keystones
+# alias, registered with ``include_in_schema=False`` immediately after the
+# canonical ``keystones_router`` above (three operations), and the trailing-slash
+# ``GET /api/v1/skills-inbox/`` in ``routes/skills_inbox.py``. Naming any of
+# them here would raise below even though the route exists.
+#
+# (An earlier revision of this comment claimed "every core-api route is
+# include_in_schema=True, so none is hidden from this check". It was true when
+# written in #364, 2026-06-15, and stopped being true twice: #582 on
+# 2026-07-20 added the trailing-slash inbox route, then #782 on 2026-08-14
+# added the alias. Worth noting which way that went — the first falsification
+# came from a different file, so nothing a reviewer of #582 was looking at
+# would have pointed here. That is the argument for the claim being narrow
+# enough to check, which is what the paragraph above now aims at.)
+#
+# DELIBERATELY not fixed by unioning the schema with a walk of ``app.routes``.
+# The walk needs the private ``_IncludedRouter`` internals this comment exists
+# to warn about, and putting them in import-time app construction trades a
+# false RuntimeError for a service that will not boot on the next FastAPI
+# upgrade — a worse failure for a case with no live bug: all three current
+# entries are documented. The realistic way to reach it is a timeout opt-out on
+# ``/keystones``, since ``_is_opted_out`` matches exactly and the alias is a
+# distinct path that would need its own entry. If that day comes, exempt the
+# canonical path and handle the alias in ``_is_opted_out`` rather than widening
+# this guard.
+_registered_paths = set(app.openapi().get("paths", {}))
+for _opt_out in _TIMEOUT_OPT_OUT_PATHS:
+    if _opt_out not in _registered_paths:
+        raise RuntimeError(
+            f"RequestTimeoutMiddleware opt-out path {_opt_out!r} is not in the "
+            "OpenAPI schema. Either the route was renamed/removed or "
+            "_TIMEOUT_OPT_OUT_PATHS in middleware/request_timeout.py is stale — "
+            "both are silent-create regressions waiting to happen. If instead "
+            "the route exists but is registered include_in_schema=False (the "
+            "legacy keystones alias, or GET /api/v1/skills-inbox/), this guard "
+            "cannot see it: opt out of the canonical path instead."
+        )
+
+
+_static = Path(__file__).resolve().parent.parent.parent / "static"
+if _static.is_dir():
+    app.mount("/static", StaticFiles(directory=str(_static)), name="static")
+
+# Frontend is served by separate containers (site + app-frontend).
+# Nginx gateway handles path-based routing to the correct service.

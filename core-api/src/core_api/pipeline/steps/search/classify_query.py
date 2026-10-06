@@ -1,0 +1,727 @@
+"""ClassifyQuery — classify incoming query into a retrieval strategy.
+
+Examines the query tokens against the entity full-text index.  When entity
+matches are found the step MAY short-circuit to an *entity_lookup* strategy
+(graph-expanded, scored by hop distance) so downstream embedding and scored
+search can be skipped — but only when the linked-memory pool can fill the
+caller's ``top_k``.  That route replaces scoring rather than re-ranking it, so
+an under-filled pool falls through instead and the entity hits are applied as a
+hop boost over real scores (H-03).  A query carrying a temporal hint
+(``temporal_window`` / ``date_range_filter``) declines the short-circuit the
+same way: the hard date filter and freshness handling live in the scored
+search this route skips, so honouring the hint requires falling through.
+Otherwise the query is routed to keyword or semantic search based on the
+adaptive FTS weight.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import types
+from datetime import datetime
+from uuid import UUID
+
+from core_api.clients.storage_client import get_storage_client
+from core_api.constants import (
+    ENTITY_LOOKUP_MAX_MATCHES,
+    FTS_WEIGHT_BOOSTED,
+    GRAPH_HOP_BOOST,
+    GRAPH_MAX_BOOSTED_MEMORIES,
+    GRAPH_MAX_EXPANDED_ENTITIES,
+)
+from core_api.middleware.per_tenant_concurrency import per_tenant_storage_slot
+from core_api.pipeline.context import PipelineContext
+from core_api.pipeline.step import StepResult
+from core_api.pipeline.steps.search.retrieval_types import (
+    RetrievalPlan,
+    RetrievalStrategy,
+)
+from core_api.schemas import EntityLinkOut
+from core_api.services.entity_tokens import extract_entity_tokens
+
+_GRAPH_HOP_BOOST_FALLBACK = GRAPH_HOP_BOOST[max(GRAPH_HOP_BOOST)]
+
+# RECENT_CONTEXT's default row budget. Applies only when the caller did not
+# name ``top_k`` on the request (see the RECENT_CONTEXT branch below).
+_RECENT_CONTEXT_TOP_K_CAP = 5
+
+_RECENT_CONTEXT_RE = re.compile(
+    r"\b(what was i|what did i|my recent|my latest"
+    r"|most recent|latest updates?|recent updates?"
+    r"|what happened recently|catch me up"
+    r"|what have i missed|what did we)\b",
+    re.IGNORECASE,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Step
+# ---------------------------------------------------------------------------
+
+
+class ClassifyQuery:
+    @property
+    def name(self) -> str:
+        return "classify_query"
+
+    async def execute(self, ctx: PipelineContext) -> StepResult | None:
+        query: str = ctx.data["query"]
+        search_params: dict = ctx.data["search_params"]
+        tenant_id: str = ctx.data["tenant_id"]
+        fleet_ids: list[str] | None = ctx.data.get("fleet_ids")
+        fleet_ids = fleet_ids or None  # normalise [] → None for consistent fleet filtering
+        caller_agent_id: str | None = ctx.data.get("caller_agent_id")
+        caller_tenant_id: str | None = ctx.data.get("caller_tenant_id")
+        filter_agent_id: str | None = ctx.data.get("filter_agent_id")
+        memory_type_filter: str | None = ctx.data.get("memory_type_filter")
+        status_filter: str | None = ctx.data.get("status_filter")
+        valid_at = ctx.data.get("valid_at")
+        readable_tenant_ids: list[str] | None = ctx.data.get("readable_tenant_ids")
+        graph_max_hops: int = search_params["graph_max_hops"]
+        top_k: int = search_params["top_k"]
+
+        # ``search.entity_retrieval`` org setting (default True — absent key on
+        # any internal caller means "enabled", so behaviour is unchanged). When
+        # off, skip the entity block entirely: no entity FTS, no graph
+        # expansion, and no ENTITY_LOOKUP short-circuit, so the query falls
+        # through to the temporal / recent-context / keyword / semantic cascade
+        # below. ``ParallelEmbedAndEntityBoost`` reads the same flag and skips
+        # hop-boosting, making this the single switch for query-time entity and
+        # graph retrieval. Deliberately independent of ``graph_expand``
+        # (``search.graph_retrieval``), which only bounds expansion once an
+        # entity has already matched.
+        entity_retrieval: bool = ctx.data.get("entity_retrieval", True)
+
+        # ``search.graph_retrieval`` org setting (default True). Entity lookup
+        # stays on — the settings contract is that only ``entity_retrieval``
+        # can switch that off — but with this flag off the matched entities
+        # must not be graph-expanded: no ``expand_graph`` roundtrip, hop-0
+        # seeds only, mirroring ``_entity_boost_via_storage``'s gate. Both
+        # ``_expand_per_fleet`` call sites below honour it via
+        # ``_hops_for_seeds``, which also keeps the ``_classified_entity_hops``
+        # stash hop-0 so the boost step's ``precomputed_hops`` path cannot
+        # smuggle expanded hops past its own ``graph_expand`` gate.
+        graph_expand: bool = ctx.data.get("graph_expand", True)
+
+        # C27 — resolved once here and handed to BOTH entity-FTS and the memory
+        # load below. It used to be read inline at the ``_collect_memories``
+        # call only, which is how ``_entity_fts`` came to be the one entity-FTS
+        # caller in the tree that never sent it (oss-0922-m-02): the sibling in
+        # ``parallel_embed_entity_boost`` forwards it, the storage route
+        # defaults it False when absent, so strict tenants silently got
+        # permissive entity matching HERE and strict matching everywhere else.
+        strict_fleet_scoping: bool = bool(ctx.data.get("strict_fleet_scoping"))
+
+        tokens = extract_entity_tokens(query) if entity_retrieval else []
+
+        if not entity_retrieval:
+            logger.info(
+                "classify_query: entity retrieval disabled by org setting or request entity_boost=false (tenant=%s)",
+                tenant_id,
+            )
+
+        if tokens:
+            try:
+                sc = get_storage_client()
+                matched_ids = await self._entity_fts(
+                    sc,
+                    tokens,
+                    tenant_id,
+                    fleet_ids,
+                    strict_fleet_scoping=strict_fleet_scoping,
+                )
+
+                # CAURA-722 — record the count HERE, before the over-broad
+                # branch below empties ``matched_ids``. Reading it later would
+                # report 0 for the decline, which is the one value that must
+                # not be confused with "FTS matched nothing" — those two send
+                # the follow-up work to different teams (threshold tuning vs
+                # entity extraction/linking).
+                #
+                # Set unconditionally rather than under ``if diagnostic``: it
+                # is one ``len()``, and gating it would put a second
+                # diagnostic-only branch in a hot path for no measurable gain.
+                # Exposure stays gated at the route.
+                ctx.data["entity_matches"] = len(matched_ids)
+
+                # CAURA-698: over-broad match → not a "name a specific entity"
+                # query. The precision argument for entity_lookup breaks down
+                # at high match counts: graph expansion + memory linking
+                # against a dense entity index return broadly-related-but-
+                # low-relevance results, and the rest of the pipeline (vector
+                # scoring, FTS rank, freshness) is skipped under the short-
+                # circuit so the noise can't be re-filtered. Bail to the
+                # keyword/semantic cascade instead.
+                if matched_ids and len(matched_ids) > ENTITY_LOOKUP_MAX_MATCHES:
+                    logger.info(
+                        "classify_query: entity_lookup short-circuit declined "
+                        "(%d matches > threshold %d), falling through",
+                        len(matched_ids),
+                        ENTITY_LOOKUP_MAX_MATCHES,
+                    )
+                    # The same over-broad match must not be re-derived by
+                    # ParallelEmbedAndEntityBoost and used for hop-boosting:
+                    # with N >> GRAPH_MAX_BOOSTED_MEMORIES sibling entities all
+                    # at hop 0, the boost degenerates into an arbitrary-50
+                    # lottery that buries rows pure scoring ranks first
+                    # (S1 @K=10000: 11/25 vs rank-1 on unboosted score).
+                    ctx.data["entity_match_declined"] = True
+                    matched_ids = []
+
+                # A temporal hint must not be silently dropped: the hard
+                # ``date_range_filter`` and the ``temporal_window`` freshness
+                # handling are applied only by ExecuteScoredSearch, and the
+                # entity_lookup short-circuit skips that step (and
+                # PostFilterResults) entirely — so a dated query ("what did
+                # Alice decide two weeks ago") would return linked memories
+                # from ANY date, with nothing recording that the constraint
+                # was discarded. Decline the short-circuit and fall through to
+                # the temporal / scored-search cascade, which applies both.
+                # Ordered AFTER the over-broad decline: an over-broad match on
+                # a dated query must still suppress hop-boosting (and must not
+                # pay for expanding a >threshold seed set here).
+                #
+                # Unlike over-broad, the entity match itself is good relevance
+                # signal — so ``entity_match_declined`` is NOT set; expand now
+                # and stash the hops so ParallelEmbedAndEntityBoost hop-boosts
+                # the scored results without re-deriving FTS + expansion.
+                if matched_ids and (
+                    ctx.data.get("temporal_window") is not None or ctx.data.get("date_range_filter")
+                ):
+                    entity_hops = await self._hops_for_seeds(
+                        sc,
+                        matched_ids,
+                        tenant_id,
+                        fleet_ids,
+                        graph_max_hops,
+                        graph_expand=graph_expand,
+                    )
+                    ctx.data["_classified_entity_hops"] = entity_hops
+                    # Distinct wording from the other declines — same
+                    # greppability contract as the fallthrough messages below.
+                    logger.info(
+                        "classify_query: entity_lookup declined — temporal hint present "
+                        "(window=%s, date_range=%s), falling through with hop boost",
+                        ctx.data.get("temporal_window"),
+                        ctx.data.get("date_range_filter"),
+                    )
+                    matched_ids = []
+
+                if matched_ids:
+                    entity_hops = await self._hops_for_seeds(
+                        sc,
+                        matched_ids,
+                        tenant_id,
+                        fleet_ids,
+                        graph_max_hops,
+                        graph_expand=graph_expand,
+                    )
+
+                    filtered_rows = await self._collect_memories(
+                        sc,
+                        entity_hops,
+                        tenant_id,
+                        top_k,
+                        query=query,
+                        fleet_ids=fleet_ids,
+                        caller_agent_id=caller_agent_id,
+                        caller_tenant_id=caller_tenant_id,
+                        filter_agent_id=filter_agent_id,
+                        memory_type_filter=memory_type_filter,
+                        status_filter=status_filter,
+                        valid_at=valid_at,
+                        readable_tenant_ids=readable_tenant_ids,
+                        strict_fleet_scoping=strict_fleet_scoping,
+                        pool_report=ctx.data,
+                    )
+
+                    # H-03: the short-circuit REPLACES scoring rather than
+                    # re-ranking it, so it is only defensible while the entity
+                    # pool can answer the request on its own. Below top_k it made
+                    # the result strictly worse than never matching an entity:
+                    # memories outside the link set were unreachable at ANY top_k,
+                    # and the pool is itself cut to GRAPH_MAX_BOOSTED_MEMORIES
+                    # before content loads, so the relevant memory could be
+                    # dropped before top_k was even applied.
+                    #
+                    # ``filtered_rows`` is already ``rows[:top_k]``, so this can
+                    # only ever be equality — the real gate is the pre-load pool
+                    # check in _collect_memories, and this re-checks it because
+                    # visibility filtering there can still return short. Keep the
+                    # two in step if _collect_memories ever gains an overfetch
+                    # bound, or this silently becomes always-true.
+                    #
+                    # The truthiness term is not redundant: it keeps a zero-row
+                    # pool from short-circuiting were top_k ever 0.
+                    if filtered_rows and len(filtered_rows) >= top_k:
+                        plan = RetrievalPlan(
+                            strategy=RetrievalStrategy.ENTITY_LOOKUP,
+                            matched_entity_ids=matched_ids,
+                            skip_embedding=True,
+                            skip_scored_search=True,
+                        )
+                        # min_similarity is not applied to entity_lookup results:
+                        # these rows are retrieved by graph traversal (hop boost)
+                        # rather than vector similarity, so vec_sim is None and the
+                        # cosine threshold is not meaningful here.
+                        # PostFilterResults will SKIP via its guard.
+                        ctx.data["filtered_rows"] = filtered_rows
+                        ctx.data["retrieval_plan"] = plan
+                        logger.info(
+                            "classify_query: entity_lookup (%d entities, pool filled top_k=%d)",
+                            len(matched_ids),
+                            top_k,
+                        )
+                        return None
+                    # Distinct wording from the over-broad decline logged above,
+                    # deliberately: the two have opposite downstream effects (that
+                    # one sets entity_match_declined to SUPPRESS hop-boosting, this
+                    # one must not), so ops has to be able to grep them apart. Same
+                    # reasoning as parallel_embed_entity_boost's distinct reasons.
+                    # Four reachable declines, four messages — ordered so each is
+                    # reached only in its own state. An empty result is ambiguous
+                    # on its own (never loaded vs loaded and wholly filtered), so
+                    # _collect_memories reports both the pool size and whether it
+                    # got as far as the load.
+                    pool_size = ctx.data.pop("_entity_pool_size", None)
+                    pool_loaded = ctx.data.pop("_entity_pool_loaded", False)
+                    if filtered_rows:
+                        # Pool looked adequate before the load and came back short
+                        # anyway — visibility filtering (caller_agent_id / status /
+                        # valid_at) dropped rows. This is the case the post-load
+                        # re-check exists for, so it must not be reported as the
+                        # empty one.
+                        logger.info(
+                            "classify_query: entity_lookup declined as under-filled after "
+                            "visibility filtering (%d rows < top_k=%d), falling through",
+                            len(filtered_rows),
+                            top_k,
+                        )
+                    elif pool_loaded:
+                        # Links existed and the load ran, but visibility filtering
+                        # (caller_agent_id / status / valid_at) dropped every row.
+                        # A permission or lifecycle cause, not a graph one.
+                        logger.info(
+                            "classify_query: entity_lookup declined — loaded a pool of %d "
+                            "but visibility filtering dropped every row, falling through",
+                            pool_size or 0,
+                        )
+                    elif pool_size:
+                        logger.info(
+                            "classify_query: entity_lookup declined as under-filled "
+                            "(pool %d < top_k=%d), falling through",
+                            pool_size,
+                            top_k,
+                        )
+                    else:
+                        logger.info("classify_query: entity matched but no linked memories, falling through")
+                    # Preserve entity_hops so _entity_boost_pipeline can skip
+                    # re-expansion on the keyword/semantic fallthrough path.
+                    ctx.data["_classified_entity_hops"] = entity_hops
+            except Exception:
+                logger.warning(
+                    "classify_query: entity lookup failed, falling back to search",
+                    exc_info=True,
+                )
+
+        # TEMPORAL: ExtractTemporalHint already set temporal_window upstream.
+        temporal_window = ctx.data.get("temporal_window")
+        if temporal_window is not None:
+            overrides = {
+                "freshness_decay_days": max(temporal_window.days, 1),
+                "freshness_floor": 0.3,
+            }
+            plan = RetrievalPlan(
+                strategy=RetrievalStrategy.TEMPORAL,
+                search_param_overrides=overrides,
+            )
+            ctx.data["retrieval_plan"] = plan
+            logger.info(
+                "classify_query: temporal (window=%dd)",
+                temporal_window.days,
+            )
+            return None
+
+        # RECENT_CONTEXT: recency-intent keywords.
+        if _RECENT_CONTEXT_RE.search(query):
+            overrides: dict = {
+                "freshness_decay_days": 7,
+                "freshness_floor": 0.2,
+            }
+            # SIDE-57 — the 5-row cap is a default for "what did I just do"
+            # queries, not a ceiling on the caller. A request that named
+            # ``top_k`` explicitly (``top_k_explicit``, set by the route from
+            # the body's ``model_fields_set``) gets what it asked for: before
+            # this, ``top_k=150`` silently came back as 5 rows whenever the
+            # query happened to contain "most recent" / "what did i". The cap
+            # still applies when the budget came from a default (request
+            # default, agent profile, tenant default), which is the case it
+            # was written for.
+            resolved_top_k = search_params["top_k"]
+            if not ctx.data.get("top_k_explicit"):
+                overrides["top_k"] = min(resolved_top_k, _RECENT_CONTEXT_TOP_K_CAP)
+                if overrides["top_k"] < resolved_top_k:
+                    # SIDE-59 — recorded only when the cap actually cut the
+                    # budget; the /search route surfaces it as a response
+                    # header so it is no longer invisible outside diagnostic.
+                    ctx.data["strategy_top_k_cap"] = overrides["top_k"]
+            plan = RetrievalPlan(
+                strategy=RetrievalStrategy.RECENT_CONTEXT,
+                search_param_overrides=overrides,
+            )
+            ctx.data["retrieval_plan"] = plan
+            logger.info("classify_query: recent_context")
+            return None
+
+        # No entity / temporal / recency match — keyword vs semantic search.
+        if search_params["fts_weight"] >= FTS_WEIGHT_BOOSTED:
+            plan = RetrievalPlan(strategy=RetrievalStrategy.KEYWORD_SEARCH)
+            logger.info("classify_query: keyword_search (fts_weight=%.2f)", search_params["fts_weight"])
+        else:
+            plan = RetrievalPlan(strategy=RetrievalStrategy.SEMANTIC_SEARCH)
+            logger.info("classify_query: semantic_search (fts_weight=%.2f)", search_params["fts_weight"])
+
+        ctx.data["retrieval_plan"] = plan
+        return None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _hops_for_seeds(
+        self,
+        sc: object,
+        seed_ids: list[UUID],
+        tenant_id: str,
+        fleet_ids: list[str] | None,
+        graph_max_hops: int,
+        *,
+        graph_expand: bool,
+    ) -> dict[UUID, tuple[int, float]]:
+        """Expand *seed_ids* per fleet, or return them as hop-0 when expansion is off.
+
+        Expansion failure degrades the same way: ``_expand_per_fleet`` falls
+        back to the hop-0 seed set when every fleet's call fails, so callers
+        are guaranteed a non-empty dict for a non-empty seed set either way.
+
+        The gate mirrors ``_entity_boost_via_storage`` exactly
+        (``graph_expand and graph_max_hops > 0`` → expand, else hop-0 seeds
+        with neutral weight), so ``search.graph_retrieval`` means the same
+        thing on the ENTITY_LOOKUP short-circuit as it does on the hop-boost
+        path — matched entities stay retrievable, their graph neighbourhood
+        does not. The hop-0 dict also flows into
+        ``ctx.data["_classified_entity_hops"]`` on the temporal-decline path,
+        which is what keeps the boost step's ``precomputed_hops`` input honest:
+        that input bypasses the boost step's own gate by design (it exists to
+        avoid re-deriving FTS + expansion), so the gating must happen here,
+        where the hops are produced.
+        """
+        if not (graph_expand and graph_max_hops > 0):
+            return dict.fromkeys(seed_ids, (0, 1.0))
+        return await self._expand_per_fleet(
+            sc,
+            seed_ids,
+            tenant_id,
+            fleet_ids,
+            graph_max_hops,
+            use_union=True,
+        )
+
+    @staticmethod
+    async def _expand_per_fleet(
+        sc: object,
+        seed_ids: list[UUID],
+        tenant_id: str,
+        fleet_ids: list[str] | None,
+        max_hops: int,
+        *,
+        use_union: bool = True,
+    ) -> dict[UUID, tuple[int, float]]:
+        """Call expand_graph per fleet in parallel, merge by keeping lowest hop."""
+        ids_to_expand = fleet_ids if fleet_ids else [None]
+
+        results = await asyncio.gather(
+            *(
+                sc.expand_graph(
+                    {
+                        "seed_entity_ids": [str(eid) for eid in seed_ids],
+                        "tenant_id": tenant_id,
+                        "fleet_id": fid,
+                        "max_hops": max_hops,
+                        "use_union": use_union,
+                    }
+                )
+                for fid in ids_to_expand
+            ),
+            return_exceptions=True,
+        )
+
+        merged: dict[UUID, tuple[int, float]] = {}
+        for partial in results:
+            if isinstance(partial, BaseException):
+                logger.warning("expand_graph failed for a fleet: %s", partial)
+                continue
+            # Storage returns {entity_id_str: {"hop": int, "weight": float}, ...}
+            # (See core-storage-api/.../routers/entities.py expand_graph route.)
+            # Positional indexing here used to ``KeyError: 0`` on every call,
+            # silently killing the ENTITY_LOOKUP short-circuit. CAURA-684.
+            for eid_str, hop_weight in partial.items():
+                eid = UUID(eid_str)
+                hop, weight = hop_weight["hop"], hop_weight["weight"]
+                if (
+                    eid not in merged
+                    or hop < merged[eid][0]
+                    or (hop == merged[eid][0] and weight > merged[eid][1])
+                ):
+                    merged[eid] = (hop, weight)
+
+        # oss-0814-l-05: an empty merge for a non-empty seed set means NO call
+        # succeeded — a successful expand_graph response always contains the
+        # seeds themselves at hop 0 / weight 1.0 (entity_expand_graph seeds its
+        # result dict with them before traversing), and every per-fleet call is
+        # given the full seed list, so a single surviving fleet keeps them all
+        # (which is why partial failure needs no case of its own here).
+        # Returning ``{}`` discarded the already-resolved entity-FTS matches
+        # along with the expansion: ``_collect_memories`` had no entities to
+        # load links for (reported, misleadingly, as "entity matched but no
+        # linked memories"), and the ``_classified_entity_hops`` stash handed
+        # ParallelEmbedAndEntityBoost an empty dict — which its
+        # ``precomputed_hops is not None`` check treats as authoritative, so it
+        # did not re-derive FTS either and hop-boost contributed nothing.
+        # Degrade to the hop-0 seed set instead — the same shape as the
+        # ``graph_expand`` off gate in ``_hops_for_seeds`` — so the direct
+        # matches stay retrievable and only the (unavailable) graph
+        # neighbourhood is lost.
+        if seed_ids and not merged:
+            logger.warning(
+                "expand_graph failed for all fleets; degrading to %d hop-0 seed entities",
+                len(seed_ids),
+            )
+            return dict.fromkeys(seed_ids, (0, 1.0))
+        return merged
+
+    @staticmethod
+    async def _entity_fts(
+        sc: object,
+        tokens: list[str],
+        tenant_id: str,
+        fleet_ids: list[str] | None,
+        *,
+        strict_fleet_scoping: bool = False,
+    ) -> list[UUID]:
+        """Full-text search against the entity index via storage client.
+
+        ``strict_fleet_scoping`` rides with ``fleet_ids`` and only inside that
+        branch, because it narrows the fleet predicate rather than adding one:
+        ``entity_fts_search`` applies ``_fleet_scope_clause`` only when fleets
+        were named, so sending the flag without them would be inert on the
+        wire and misleading in a request log. Same shape as the sibling caller
+        in ``parallel_embed_entity_boost``.
+        """
+        data = {
+            "tokens": tokens,
+            "tenant_id": tenant_id,
+        }
+        if fleet_ids:
+            data["fleet_ids"] = fleet_ids
+            if strict_fleet_scoping:
+                data["strict_fleet_scoping"] = True
+        result = await sc.fts_search_entities(data)
+        return [UUID(eid) for eid in result]
+
+    @staticmethod
+    async def _collect_memories(
+        sc: object,
+        entity_hops: dict[UUID, tuple[int, float]],
+        tenant_id: str,
+        top_k: int,
+        *,
+        query: str = "",
+        fleet_ids: list[str] | None = None,
+        caller_agent_id: str | None = None,
+        caller_tenant_id: str | None = None,
+        filter_agent_id: str | None = None,
+        memory_type_filter: str | None = None,
+        status_filter: str | None = None,
+        valid_at: datetime | None = None,
+        readable_tenant_ids: list[str] | None = None,
+        pool_report: dict | None = None,
+        strict_fleet_scoping: bool = False,
+    ) -> list[types.SimpleNamespace]:
+        """Load memories linked to graph-expanded entities, scored by hop distance."""
+        all_entity_ids = list(entity_hops.keys())
+
+        # Cap entity count to bound the query size.
+        if len(all_entity_ids) > GRAPH_MAX_EXPANDED_ENTITIES:
+            all_entity_ids = sorted(
+                all_entity_ids,
+                key=lambda eid: (entity_hops[eid][0], -entity_hops[eid][1]),
+            )[:GRAPH_MAX_EXPANDED_ENTITIES]
+
+        # Get memory-entity links from storage client.
+        # Returns list of {"memory_id", "entity_id", "role"} dicts.
+        raw_links = await sc.get_memory_ids_by_entity_ids(
+            [str(eid) for eid in all_entity_ids],
+            tenant_id,
+        )
+
+        # Sort by hop distance so closest entities are processed first.
+        all_links = sorted(
+            raw_links,
+            key=lambda r: entity_hops.get(UUID(r["entity_id"]), (999, 0.0))[0],
+        )
+
+        # Best (lowest hop → highest boost) per memory + collect entity links.
+        # ``memory_match_count`` tracks how many DIRECTLY-MATCHED (hop-0) query
+        # entities each memory links to — the pre-load relevance signal that
+        # survives the fan-out cap below.
+        memory_boost: dict[str, float] = {}
+        memory_match_count: dict[str, int] = {}
+        memory_entity_links: dict[str, list[EntityLinkOut]] = {}
+        for link in all_links:
+            mem_id, ent_id_str, role = link["memory_id"], link["entity_id"], link.get("role")
+            ent_id = UUID(ent_id_str)
+            if ent_id not in entity_hops:
+                continue
+            hop_dist, rel_weight = entity_hops[ent_id]
+            boost = GRAPH_HOP_BOOST.get(hop_dist, _GRAPH_HOP_BOOST_FALLBACK) * rel_weight
+            if mem_id not in memory_boost or boost > memory_boost[mem_id]:
+                memory_boost[mem_id] = boost
+            if hop_dist == 0:
+                memory_match_count[mem_id] = memory_match_count.get(mem_id, 0) + 1
+            memory_entity_links.setdefault(mem_id, []).append(EntityLinkOut(entity_id=ent_id, role=role))
+
+        if not memory_boost:
+            return []
+
+        # Cap to prevent popular-entity fan-out. A30: a hub entity (e.g. a bare
+        # "john smith" linking 100+ memories) floods the pool, and a cap by
+        # near-uniform hop-boost alone drops the gold BEFORE the query-overlap
+        # rerank (below) can see it. Rank the cap by how many of the query's
+        # matched entities each memory links to FIRST (a "X's manager" gold
+        # links to both the person hub AND the "manager" role → count 2, vs 1
+        # for sibling facts about other attributes), with hop-boost as the
+        # tiebreak. This collapses the pool to the relevant subset regardless of
+        # hub size; the discriminator (e.g. "#0000") is then resolved by
+        # _query_overlap after load.
+        if len(memory_boost) > GRAPH_MAX_BOOSTED_MEMORIES:
+            memory_ids_sorted = sorted(
+                memory_boost,
+                key=lambda mid: (memory_match_count.get(mid, 0), memory_boost[mid]),
+                reverse=True,
+            )[:GRAPH_MAX_BOOSTED_MEMORIES]
+            memory_boost = {mid: memory_boost[mid] for mid in memory_ids_sorted}
+
+        # H-03: stop here when the pool cannot fill top_k. The caller only takes
+        # the exclusive route when it can, and the row build below can never
+        # produce more rows than ``memory_boost`` has entries — so an under-sized
+        # pool cannot pass that gate whatever the load returns. Loading anyway
+        # spent a per-tenant storage permit and pulled full rows (embedding and
+        # tsvector included) for a result the caller discards. Reporting the
+        # pool size lets the caller say why it declined, since ``[]`` alone
+        # cannot distinguish "under-filled" from "no linked memories at all"
+        # (the ``not memory_boost`` return above).
+        #
+        # One-directional on purpose. The converse is NOT decidable here: the
+        # load applies visibility filters (caller_agent_id / status / valid_at)
+        # and rows whose memory did not come back are dropped, so a pool that
+        # looks adequate can still return short. That is why the caller re-checks
+        # after the load rather than trusting this count.
+        if len(memory_boost) < top_k:
+            if pool_report is not None:
+                pool_report["_entity_pool_size"] = len(memory_boost)
+            return []
+
+        # CAURA-687: load memories by ID via the dedicated short-circuit
+        # endpoint. Pre-CAURA-687 this POSTed to /memories/scored-search
+        # with a ``memory_ids`` key + ``entity_lookup: True`` flag that
+        # route never read; storage hard-indexed body["embedding"], 500'd,
+        # and the broad except below swallowed it. The path silently fell
+        # through to keyword/semantic on every entity-token query.
+        # ``valid_at`` / ``readable_tenant_ids`` are forwarded so this
+        # short-circuit's visibility behaviour matches the scored-search
+        # fallthrough exactly — drift is a cross-tenant leak risk.
+        # top_k is intentionally NOT forwarded: storage returns ALL matching
+        # IDs (capped client-side at GRAPH_MAX_BOOSTED_MEMORIES = 50), and
+        # the user-facing top_k is applied below AFTER sorting by hop boost.
+        # A server-side LIMIT here would discard high-boost rows non-
+        # deterministically because the storage query has no ORDER BY.
+        search_data: dict = {
+            "tenant_id": tenant_id,
+            "memory_ids": list(memory_boost.keys()),
+            "fleet_ids": fleet_ids,
+            "caller_agent_id": caller_agent_id,
+            "caller_tenant_id": caller_tenant_id,
+            "filter_agent_id": filter_agent_id,
+            "memory_type_filter": memory_type_filter,
+            "status_filter": status_filter,
+            # C27 — the ENTITY_LOOKUP short-circuit bypasses scored search
+            # entirely, so it needs the scope flag in its own right; inheriting
+            # it only on the scored path would leave this route permissive.
+            "strict_fleet_scoping": strict_fleet_scoping,
+        }
+        if valid_at is not None:
+            search_data["valid_at"] = str(valid_at)
+        # Forward readable_tenant_ids whenever the caller's authorised set
+        # differs from home-tenant-only. The explicit comparison (rather
+        # than `len > 1`) handles the edge case where a single-element
+        # list names a tenant other than ``tenant_id``: silently dropping
+        # it would degrade to home-tenant reads with no error or log.
+        if readable_tenant_ids and readable_tenant_ids != [tenant_id]:
+            search_data["readable_tenant_ids"] = readable_tenant_ids
+        # Record that the load ran, and against what size of pool. Without this
+        # the caller cannot tell "no links at all" from "links existed, the load
+        # ran, and visibility filtering dropped every row" — both arrive as an
+        # empty list, and reporting the second as the first would send on-call
+        # looking for a graph problem when the cause is a permission filter.
+        if pool_report is not None:
+            pool_report["_entity_pool_size"] = len(memory_boost)
+            pool_report["_entity_pool_loaded"] = True
+        # Per-tenant storage bulkhead (CAURA-602 follow-up), same key as
+        # scored-search on purpose: both are storage-reader roundtrips
+        # drawing on the same per-tenant pool budget. The slot is held only
+        # across this roundtrip and released on exit, so when this path
+        # falls through, ``ExecuteScoredSearch`` takes its own slot around
+        # its own roundtrip — the two are sequential and one logical search
+        # never holds two slots at once. (C10 used to set
+        # ``_storage_slot_acquired`` on ctx here so the downstream scored
+        # search skipped its slot as a "don't charge twice" dedup; the slot
+        # is an in-flight cap, not a charge, and the skip exempted the
+        # fall-through's scored_search roundtrip from the cap entirely —
+        # retired by audit oss-0814-l-06.)
+        async with per_tenant_storage_slot("storage_search", tenant_id):
+            memories = await sc.load_memories_by_ids(search_data)
+
+        # Build result rows with boost scores.
+        memories_by_id = {m["id"]: m for m in memories}
+
+        rows = [
+            types.SimpleNamespace(
+                Memory=types.SimpleNamespace(**memories_by_id[mid]),
+                score=boost,
+                vec_sim=None,
+                entity_links=memory_entity_links.get(mid, []),
+            )
+            for mid, boost in memory_boost.items()
+            if mid in memories_by_id
+        ]
+        # Re-rank the candidate pool by lexical overlap with the query before
+        # trimming to top_k. entity_lookup matches greedily and hop-boost is
+        # near-uniform, so the exact-entity memory can be diluted below
+        # token-sharing siblings; this prefers rows whose content shares more of
+        # the query's tokens, with hop-boost as the tiebreak.
+        q_tokens = set(extract_entity_tokens(query)) if query else set()
+
+        def _query_overlap(row: types.SimpleNamespace) -> float:
+            if not q_tokens:
+                return 0.0
+            content = getattr(row.Memory, "content", "") or ""
+            c_tokens = set(extract_entity_tokens(content))
+            return len(q_tokens & c_tokens) / len(q_tokens)
+
+        rows.sort(key=lambda r: (_query_overlap(r), r.score), reverse=True)
+        return rows[:top_k]

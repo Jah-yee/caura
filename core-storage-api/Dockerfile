@@ -1,0 +1,83 @@
+# Dockerfile for Core Storage API service
+# PostgreSQL CRUD service for Caura core tables
+
+# Optional Datadog serverless-init source (CAURA-0000 observability POC).
+# SaaS builds pass --build-arg DD_APM_ENABLED=true to pull in Datadog's
+# serverless-init binary; OSS / on-prem / local builds leave it false so the
+# binary is never fetched (BuildKit prunes the unreferenced stage) and never
+# lands in the image. Runtime activation is further gated by
+# docker-entrypoint.sh on DD_API_KEY.
+ARG DD_APM_ENABLED=false
+FROM datadog/serverless-init:1@sha256:f4943347f155505156ba5f594317ea64b59678b3a6522e8c0993581af20956ff AS dd-bin
+FROM python:3.12-slim AS dd-apm-true
+COPY --from=dd-bin /datadog-init /dd/datadog-init
+FROM python:3.12-slim AS dd-apm-false
+RUN mkdir -p /dd
+FROM dd-apm-${DD_APM_ENABLED} AS dd-apm-src
+
+FROM python:3.12-slim AS builder
+
+WORKDIR /app
+
+# System deps for asyncpg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq-dev gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python deps FROZEN + hash-verified from the committed lock (CAURA-000):
+# uv export keeps uv.lock's pins + per-package hashes, so the image is
+# reproducible and every wheel is verified (require-hashes mode). Prevents the
+# silent dep float that broke prod 2026-06-14.
+COPY --from=ghcr.io/astral-sh/uv:0.9.18 /uv /usr/local/bin/uv
+COPY core-storage-api/pyproject.toml core-storage-api/uv.lock core-storage-api/README.md* ./core-storage-api/
+# Dummy src so the project metadata resolves during export.
+RUN mkdir -p core-storage-api/src/core_storage_api && touch core-storage-api/src/core_storage_api/__init__.py
+# DD_APM_ENABLED pulls in the ddtrace tracer via the ``datadog`` extra; only the
+# SaaS build sets it, so OSS / on-prem images carry no Datadog Python code.
+ARG DD_APM_ENABLED=false
+RUN EXTRAS=""; \
+    if [ "$DD_APM_ENABLED" = "true" ]; then EXTRAS="--extra datadog"; fi; \
+    uv export --frozen --no-dev $EXTRAS --no-emit-project \
+      --directory core-storage-api -o /tmp/reqs.txt \
+    && uv pip install --system --no-cache -r /tmp/reqs.txt
+
+# Copy actual source
+COPY common/ /app/common/
+COPY core-storage-api/src/ /app/core-storage-api/src/
+
+
+# ── Production image ──
+FROM python:3.12-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --shell /bin/bash appuser
+
+WORKDIR /app
+
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder --chown=appuser:appuser /app /app
+
+# common/ is a plain package — make it importable via PYTHONPATH
+ENV PYTHONPATH="/app/core-storage-api/src:/app"
+ENV PYTHONUNBUFFERED=1
+ENV ENVIRONMENT=production
+
+# Datadog APM (opt-in; see top-of-file dd-apm stage + docker-entrypoint.sh).
+# /app/dd is empty unless built with DD_APM_ENABLED=true.
+COPY --from=dd-apm-src --chown=appuser:appuser /dd /app/dd
+COPY --chown=appuser:appuser core-storage-api/docker-entrypoint.sh /app/docker-entrypoint.sh
+
+USER appuser
+
+EXPOSE 8002
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+# Launch via common.serve (not the uvicorn CLI directly) so the multiprocess
+# supervisor/parent configures structlog before starting — otherwise its
+# lifecycle lines ("Started parent process", "Received SIGTERM", ...) bypass
+# the JSON pipeline and land in Datadog as status:error. See common/serve.py.
+CMD ["python", "-m", "common.serve", "core_storage_api.app:app", "--settings", "core_storage_api.config:settings", "--host", "0.0.0.0", "--port", "8002", "--workers", "2", "--timeout-keep-alive", "65"]

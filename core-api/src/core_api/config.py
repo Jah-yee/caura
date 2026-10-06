@@ -1,0 +1,1031 @@
+import logging
+import tempfile
+from pathlib import Path
+from typing import Any, Literal, Self
+
+from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
+from pydantic_settings import BaseSettings
+
+from common.embedding._registry import DEFAULT_LOCAL_EMBEDDING_MODEL
+from common.provider_names import DEFAULT_EMBEDDING_PROVIDER
+from common.storage_auth import read_shared_secret_file
+
+logger = logging.getLogger(__name__)
+
+# The infrastructure request ceiling every route budget must fit under:
+# nginx ``proxy_read_timeout`` and the Cloud Run service are both pinned
+# at 120s (CAURA-623). A route budget above this is dead config — the
+# platform severs the connection first while the handler keeps burning
+# provider spend. If the platform timeout is ever raised, update this
+# constant in the same change.
+PLATFORM_REQUEST_CEILING_SECONDS = 120.0
+
+
+# Postgres connection settings. Canonical env var names follow the
+# official ``postgres`` Docker image conventions (POSTGRES_USER,
+# POSTGRES_PASSWORD, POSTGRES_DB) so the same ``.env`` works for both
+# the database container and the app. Legacy ``ALLOYDB_*`` aliases are
+# accepted for back-compat and will be dropped in a future major.
+class Settings(BaseSettings):
+    # NOTE: core-api holds no DB connection — all database access goes through
+    # core-storage-api over HTTP (rule 6440b9a6). The former ``postgres_*`` /
+    # ``db_pool_*`` settings + ``database_url`` were removed with the engine.
+    api_key: str | None = None  # legacy, deprecated
+    admin_api_key: str | None = None
+    # A file holding the admin key, read only when ``admin_api_key`` is unset or
+    # blank (M-109): the compose stack generates one so its bundled scheduler can
+    # reach the admin endpoints. An operator's ADMIN_API_KEY wins.
+    admin_api_key_file: str = ""
+    # Optional: when set, all non-admin requests must present this key. Both
+    # spellings are accepted as INPUTS; ``_prefer_the_new_api_key_name`` below
+    # collapses them onto the second field, the only one downstream code reads —
+    # the first is None whenever the operator set the old name.
+    #
+    # Deliberately NOT ``AliasChoices``: that resolves to the first alias that is
+    # DEFINED, and the empty string counts. A deploy template carrying an
+    # unfilled ``CAURA_API_KEY=`` next to a working old name would resolve to
+    # ``""``, and auth.py's ``if mclaw_key:`` would skip the whole Path-2
+    # perimeter without a word. For a secret, blank and unset mean the same
+    # thing, so first-NON-EMPTY is the only safe rule.
+    caura_api_key: str | None = None
+    memclaw_api_key: str | None = None  # legacy-name-ok: rule 3 dual-read alias
+    # Perimeter secret shared with the enterprise gateway. When set, the
+    # header-trust auth path (X-Tenant-ID) additionally requires a matching
+    # ``X-Gateway-Secret`` header — so a caller who reaches core-api directly
+    # (bypassing the gateway via its public run.app URL) cannot impersonate a
+    # tenant by setting identity headers itself. Unset (OSS/standalone/dev) = no-op.
+    gateway_shared_secret: str | None = None
+    # fake | openai | local. The default is the shared constant so this
+    # field can never drift from ``_resolve_provider_name``'s env fallback
+    # again (they disagreed once — "openai" here vs "fake" there — and
+    # tenant-config-less paths silently persisted fake vectors).
+    embedding_provider: str = DEFAULT_EMBEDDING_PROVIDER
+    # C38 — model for ``embedding_provider="local"`` (sentence-transformers).
+    # MUST emit VECTOR_DIM dimensions; the provider now refuses a mismatch at
+    # load rather than failing later at INSERT.
+    #
+    # ``common/embedding/_registry.py`` reads ``LOCAL_EMBEDDING_MODEL`` from
+    # ``os.environ`` directly, because that registry is shared with core-worker
+    # and must not import a service's config. ``bridge_credentials_to_environ``
+    # exports this field there: on a bare-metal run nothing else puts a
+    # ``.env`` value into the environment (M-18).
+    #
+    # Default from the shared constant for the reason ``embedding_provider``
+    # above gives: two copies of one literal is how they disagreed last time.
+    local_embedding_model: str = DEFAULT_LOCAL_EMBEDDING_MODEL
+    # Per-deploy control for where embedding + LLM enrichment run.
+    #
+    # - ``"inline"`` (default): both embed + enrich run on the request
+    #   path. Response includes LLM-derived fields (title, summary,
+    #   tags, retrieval_hint) and ``CheckSemanticDuplicate`` runs
+    #   against a real embedding. OSS-friendly — no worker fleet
+    #   required. ``write_mode="strong"`` always forces this regardless
+    #   of the deploy mode (CAURA-229 contract preserved by PR #151).
+    # - ``"deferred"``: row persists with ``embedding=NULL`` + schema-
+    #   default ``memory_type`` / ``weight`` / ``status``. Write
+    #   publishes ``Topics.Memory.EMBED_REQUESTED`` and
+    #   ``ENRICH_REQUESTED``; ``core-worker`` consumes both, runs the
+    #   provider calls, and PATCHes the row. Search tolerates NULL
+    #   embeddings via the FTS fallback (PR #150). Clients that need
+    #   the LLM fields re-fetch after the back-channel ``ENRICHED``
+    #   event lands. SaaS prod shape — sub-2s p99 SLA.
+    #
+    # F3 history: replaces the legacy ``embed_on_hot_path`` +
+    # ``enrich_on_hot_path`` pair. Phase 1 introduced this field as a
+    # derived alias; Phase 2 migrated 18 call sites to read it via the
+    # ``inline_embedding`` / ``inline_enrichment`` helpers; Phase 3
+    # (this revision) deleted the legacy flags + derivation validator.
+    deployment_mode: Literal["inline", "deferred"] = "inline"
+    # Reserved-agent-id write guard (`main` identity fix). Bare `agent_id="main"`
+    # is the plugin's unset default; many installs collapse onto it. Phase 1:
+    #   allow  → legacy behavior / instant rollback
+    #   warn   → attribute as today but log `reserved_agent_write` (observe)
+    #   reject → 409 with guidance; MCP may supply a unique agent_id, while REST
+    #     credentials verified as reserved main must be re-provisioned
+    # Roll out warn → (measure) → reject. The bare-`main` delete gates on reject.
+    reserved_agent_id_policy: Literal["allow", "warn", "reject"] = "warn"
+    # Phase 2 (spoof hardening): bind REST writes to the verified credential
+    # identity. Legacy credentials still stamped with reserved ``main`` follow
+    # ``reserved_agent_id_policy``: allow/warn keep accepting ANY non-placeholder
+    # body agent_id for migration, so spoof hardening is incomplete for that
+    # population until reject. ``false`` is an emergency rollback.
+    bind_write_identity_to_auth: bool = True
+    # Outer cap on the inline embed+enrich gather in ParallelEmbedEnrich.
+    # Was hardcoded at 20.0 — too tight under load once embedding moved
+    # off the hot path (CAURA-594) and enrichment LLM became the sole
+    # occupant. 35s leaves headroom for nano-class LLM tail latency
+    # (typical p95 ~6-12s, plus 2 retries x 1s linear backoff) without
+    # breaching the 45s outer request budget. Must stay below
+    # ``request_timeout_seconds`` so this fires first.
+    #
+    # That derivation counts ONE request per attempt, which only became
+    # true with ``LLM_PROVIDER_MAX_RETRIES``: the SDK's own default of 2
+    # made an attempt up to three requests, each with the per-request
+    # budget below, plus its own exponential backoff — so the worst case
+    # exceeded this ceiling on the first attempt rather than the third.
+    enrichment_inline_timeout_seconds: float = 35.0
+    # Per-call timeout passed to the AsyncOpenAI client (covers both LLM
+    # enrichment and embedding providers). Without an explicit value the
+    # SDK rides httpx's default — long enough that a single hung upstream
+    # call eats the whole enrichment budget silently. 25s gives the
+    # provider room to respond while still leaving budget for one retry
+    # under the inline ceiling. Per REQUEST, not per attempt — see
+    # ``LLM_PROVIDER_MAX_RETRIES`` for why that distinction mattered.
+    openai_request_timeout_seconds: float = 25.0
+    openai_api_key: str | None = None
+    anthropic_api_key: str | None = None
+    openrouter_api_key: str | None = None
+    atlascloud_api_key: str | None = None
+    gemini_api_key: str | None = None
+    # none | fake | openai | openrouter | gemini — NOT anthropic, see
+    # ``_reject_anthropic_structured_output``.
+    entity_extraction_provider: str = "openai"
+    entity_extraction_model: str = "gpt-5.4-nano"
+    # E3 — reasoning-effort for the contradiction judge's LLM calls.
+    # Valid values are MODEL-SPECIFIC (gpt-5.4 family, wet-tested:
+    # "none" | "low" | "medium" | "high" | "xhigh"; some models take
+    # "minimal" instead of "none") — verify against the configured
+    # entity_extraction_model before setting, because an unsupported
+    # value 400s on every call and call_with_fallback silently degrades
+    # the judge to abstention. The judge is bounded classification work,
+    # so a low tier bounds hidden reasoning-token spend (billed as
+    # output) without changing which candidates are considered; use the
+    # per-call tokens_reasoning log field to compare tiers in dollars.
+    # None (the default) sends no parameter at all — REQUIRED for
+    # non-reasoning models, which reject the parameter outright.
+    contradiction_reasoning_effort: str | None = None
+    # C2 — the contradiction judge historically read the ENTITY-EXTRACTION
+    # provider/model config, so an operator who moved entity extraction to a
+    # cheaper or different model silently moved the contradiction judge with
+    # it, and could not tune the two independently. These override the
+    # entity-extraction values for contradiction judging only; empty keeps
+    # the historical behaviour exactly.
+    contradiction_provider: str = ""
+    contradiction_model: str = ""
+    # Default for the ``search.entity_retrieval`` org setting: query-time entity
+    # lookup + graph search. A tenant override wins; this is the fleet-wide
+    # fallback so an operator can disable entity/graph reads on a whole box
+    # (env / compose override) without editing every tenant's settings.
+    # Read-side only — the write path keeps building the entity graph.
+    entity_retrieval_enabled: bool = True
+    use_llm_for_memory_creation: bool = True
+    sentry_dsn: str = ""  # Set to enable Sentry error tracking
+    # Anonymous daily heartbeat from self-hosted servers (docs/telemetry.md).
+    # ``off`` / ``0`` / ``false`` disables it; so do DO_NOT_TRACK, CI, an
+    # enterprise gateway secret and platform providers (see
+    # core_api.heartbeat.policy). The URL override exists for tests and for
+    # operators pointing the beat at their own collector; plain http is
+    # refused unless the host is localhost.
+    caura_telemetry: str = "on"
+    caura_telemetry_url: str = "https://telemetry.caura.ai/api/telemetry/heartbeat"
+    # Per-container directory the uvicorn workers coordinate through (a leader
+    # lock, per-worker client counters, the leader's status) so a container
+    # sends ONE beat per cycle however many workers it runs and every worker
+    # answers GET /telemetry the same way. Created 0700 on first use. Empty
+    # switches coordination off (one beat per worker); an unwritable path
+    # falls back to the same with a WARNING at boot.
+    caura_telemetry_state_dir: str = str(Path(tempfile.gettempdir()) / "caura-heartbeat")
+    redis_url: str = ""  # e.g. redis://localhost:6379/0. Empty = in-memory fallback.
+    cors_origins: str = "http://localhost:3000"
+    # Extra origins the installer endpoints (``/install-plugin``,
+    # ``/install-skill``) may bake into a generated script via ``api_url``,
+    # comma-separated, e.g. ``https://caura.example.com``. The origin that
+    # served the request is always allowed; set this only when a proxy hides
+    # the public host from this service. Anything else is refused, because
+    # the script sends the installer's API key to that URL and runs code it
+    # downloads from there.
+    installer_allowed_api_urls: str = ""
+    # Request-wide budget enforced by RequestTimeoutMiddleware. 45s fits
+    # comfortably under the 120s gateway/Cloud Run cap (CAURA-623 raised
+    # the nginx ``proxy_read_timeout`` from 60s to 120s; the staging
+    # core-api Cloud Run service is also pinned to 120s at the platform
+    # level), so a hung handler cannot keep a request slot past this.
+    #
+    # Residual risk: asyncio.timeout cancels the coroutine task but cannot
+    # cancel sync threads started via asyncio.to_thread (Vertex / Gemini
+    # provider SDKs). A hung provider holds its ThreadPoolExecutor slot
+    # past the 504; size max_workers (lifespan in app.py) with that in
+    # mind. Real fix is CAURA-594/595 (hot-path offload).
+    #
+    # Must stay >= BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS in constants.py
+    # so the inner cap can actually fire before the outer one.
+    request_timeout_seconds: float = 45.0
+    # Bulk-only request budget (CAURA-602). The blanket 45s cap above
+    # cancelled in-flight ``/memories/bulk`` calls *after* storage had
+    # already committed, surfacing as silent creates on retry. Bulk
+    # routes opt out of the global middleware (see ``app.py``) and
+    # enforce this longer budget themselves; the per-attempt unique
+    # constraint on ``memories.client_request_id`` makes a 504-here
+    # retry-safe at the row level. p95 today is ~42s under load, so
+    # 90s is roughly 2x headroom while staying 30s below the 120s
+    # Cloud Run platform timeout (CAURA-623 — earlier comment cited
+    # the 300s unconfigured default before the platform service was
+    # pinned at 120s).
+    bulk_request_timeout_seconds: float = 90.0
+    # Cross-link discovery budget, and the same race the bulk cap above
+    # exists to settle. ``POST /entities/discover-cross-links`` had NO
+    # application-level cap, so its only limit was the writer's 120s Cloud
+    # Run request timeout -- EQUAL to the storage client's 120s httpx read.
+    # The storage client's own docstring calls that out: "Equal values would
+    # 50/50 race." Whichever fired first, the caller learned nothing; the
+    # 2026-09-18 staging failure recorded exactly `ReadTimeout('')`, an empty
+    # string where the reason should be, ten times over.
+    #
+    # 100s sits below BOTH 120s limits, so this cancellation wins and the
+    # failure names the tenant and the budget it exceeded. It does not make
+    # slow runs succeed -- the smaller CROSS_LINK_MEMORY_BATCH_SIZE and the
+    # entity-link hour split do that. It makes them legible.
+    cross_link_request_timeout_seconds: float = 100.0
+    # Interview-submit budget (Interviewer Phase 1). The route runs the
+    # full map-reduce LLM interview SYNCHRONOUSLY — a realistic window
+    # (400 events, ~4 chunks) measured ~63s in the real-LLM pilot, so the
+    # blanket 45s cap 504'd every full window. The route opts out of the
+    # middleware (like bulk) and enforces this budget itself; a 504 here
+    # is retry-safe end-to-end: the watermark only advances after the
+    # bulk write commits, the plugin never prunes on error, and the
+    # deterministic attempt id dedups any rows that did land.
+    #
+    # 90s matches bulk's 30s headroom under the 120s platform ceiling
+    # (``PLATFORM_REQUEST_CEILING_SECONDS``) — a larger value is dead
+    # config behind Cloud Run/nginx, which sever the connection at 120s
+    # while the server keeps interviewing (and burning provider spend).
+    # If a window can't fit, shrink it (INTERVIEW_SUBMIT_MAX_EVENTS) or
+    # move the interview off the request path (async, Phase 1.1) — and
+    # raise the platform timeout BEFORE raising this budget (the
+    # startup validator enforces the ceiling).
+    interview_request_timeout_seconds: float = 90.0
+    # Per-``tools/call`` budget on the MCP transport (oss-0924-h-02).
+    #
+    # ``RequestTimeoutMiddleware`` skips ``/mcp`` on purpose — the mount
+    # serves long-lived streaming responses and a blanket cancel would
+    # cut them — so until this existed a ``tools/call`` had NO
+    # server-side deadline at all. That is not merely a missing feature:
+    # ``per_tenant_storage_slot`` justifies its UNBOUNDED acquire queue
+    # with "the outer request budget already caps total wall time", and
+    # ``caura_recall`` reaches that exact semaphore through
+    # ``search_memories``. The invariant the code asserts was true on
+    # REST and false on the surface agents actually use. This budget is
+    # what makes it true on both, which is why it is a restoration
+    # rather than a new policy.
+    #
+    # Scoped to ONE tool dispatch, not to the mount: the SSE/streamable
+    # response that carries the session is untouched, so the reason the
+    # middleware skips ``/mcp`` does not apply here.
+    #
+    # 90s, matching ``bulk_request_timeout_seconds`` rather than the 45s
+    # hot-path ``request_timeout_seconds``, because the MCP surface
+    # serves the union of both shapes: ``caura_write`` with a batch calls
+    # ``create_memories_bulk`` directly (mcp_server.py), with none of the
+    # bulk ROUTE's own ``asyncio.wait_for`` around it, and ``caura_doc``
+    # ingest is comparable. At 45s this budget would cancel MCP work that
+    # REST grants 90s — shedding load in the name of restoring a cap,
+    # which is the one thing this change is not for. 90s also keeps
+    # bulk's and interview's 30s headroom under the 120s platform ceiling
+    # (``PLATFORM_REQUEST_CEILING_SECONDS``), above which a budget is
+    # dead config: nginx / Cloud Run sever the connection first. The
+    # startup validator enforces that ceiling.
+    mcp_request_timeout_seconds: float = 90.0
+    # Async interview submit (#665). When True (default), the submit route
+    # persists the masked window as a durable ``interview_jobs`` doc,
+    # advances the watermark, and returns 200 ``accepted`` immediately;
+    # synthesis runs off the request path (fire-and-forget task + the
+    # hourly scheduler sweep). False is the escape hatch back to the
+    # legacy inline path, whose 60-90s synthesis intermediate proxies
+    # (on-prem nginx default 60s) 504'd mid-flight while the server
+    # committed anyway.
+    interview_async_submit: bool = True
+    # Max synthesis attempts per persisted interview job before it is
+    # parked as ``failed_permanent`` instead of retried by the sweep (#665).
+    interview_job_max_attempts: int = 3
+    # Per-phase cap on the storage roundtrip inside
+    # ``create_memories_bulk`` (CAURA-599). Embedding and enrichment
+    # already enforce their own 30s caps; storage was the only phase
+    # without one, so a hung storage call ate the full
+    # ``bulk_request_timeout_seconds`` umbrella before the 504 path
+    # fired. The bulk path runs embed and enrich SEQUENTIALLY (embed
+    # at memory_service.py:984, then enrich at the gather a few lines
+    # below), so worst-case time before storage starts is
+    # ``BULK_EMBEDDING_TIMEOUT + BULK_ENRICHMENT_TOTAL_TIMEOUT`` = 60s.
+    # With a 90s umbrella that leaves 30s for storage, so 25s here
+    # gives a 5s slack the validator enforces. Sized to fit the
+    # observed p99 storage roundtrip (~3-5s under load) with ~5x
+    # headroom for slow tails. The ``per_tenant_storage_slot`` acquire
+    # is unbounded — this is the only deadline on the storage phase
+    # itself.
+    storage_bulk_timeout_seconds: float = 25.0
+    # ``Retry-After`` header value (in seconds) on the 503 returned when
+    # the storage call hits a network-level error (DNS, connect refused,
+    # pool exhaustion not surfaced as TimeoutException). 5s is a balance
+    # between letting the upstream recover and not stalling the client
+    # for too long; tunable via env var so an operator can widen it
+    # during a sustained outage to avoid thundering-herd retries.
+    storage_network_error_retry_after_seconds: int = 5
+    # Audit-event queue tunables (CAURA-628). The queue replaces the
+    # legacy per-event audit POST with batched flushes, removing the
+    # cross-tenant table-lock contention that surfaced as the residual
+    # noisy-neighbor-write signal after the LLM-pool fix in #34 and
+    # the dead-index drop in #35.
+    #
+    # ``audit_queue_max_size``: per-process queue cap. With ~200 bytes
+    # per event, 10000 events fits in ~2 MiB. Sized well over realistic
+    # storm rate so the queue only fills if storage-api is degraded;
+    # overflow triggers a structured warning + drop counter rather
+    # than blocking the request hot path.
+    #
+    # ``audit_queue_flush_threshold``: events accumulated → flush
+    # immediately. 50 keeps the average batch comfortable for one
+    # multi-row INSERT without stalling steady-state low-volume
+    # tenants behind a long flush cadence.
+    #
+    # ``audit_queue_flush_interval_seconds``: maximum staleness for
+    # any single event before it lands in storage. 1s matches the
+    # CAURA-627 scoping recommendation; the audit_list endpoint may
+    # see up to that delay for the most recent events, which is
+    # acceptable for the post-hoc analysis paths that consume it.
+    #
+    # Setting ``audit_queue_max_size = 0`` disables the queue entirely
+    # — ``log_action`` then falls through to the legacy synchronous
+    # POST. Useful as an incident-time kill-switch without a redeploy.
+    audit_queue_max_size: int = 10000
+    audit_queue_flush_threshold: int = 50
+    audit_queue_flush_interval_seconds: float = 1.0
+    # Cap on the audit flusher's wait for one tenant's ``storage_write``
+    # slot (oss-0927-m-04). The flusher is a background loop, so no
+    # request budget sits over that acquire, and it gathers every tenant
+    # of a chunk: without this, one tenant with saturated storage slots
+    # holds the whole flush cycle, the queue stops draining, and at
+    # ``audit_queue_max_size`` every tenant's events drop at enqueue.
+    # On expiry only that tenant's slice is lost (logged, counted in
+    # ``failed_count``). Caps the acquire only — the storage POST that
+    # follows is bounded by the storage client's own timeouts. 10s is
+    # ten flush intervals: long enough to ride out a burst of that
+    # tenant's own writes holding the slot, short enough that the other
+    # tenants' events wait seconds rather than a whole request budget.
+    audit_flush_slot_timeout_seconds: float = 10.0
+    # Capability-usage adoption counters (services/capability_usage.py).
+    # In-process aggregation flushed to the ``capability_usage`` table on
+    # this interval — the data behind the per-capability / per-transport /
+    # per-org adoption report. Set ``capability_usage_enabled = False`` to
+    # turn off recording (the aggregator is never started, record_usage()
+    # becomes a no-op).
+    capability_usage_enabled: bool = True
+    capability_usage_flush_interval_seconds: float = 15.0
+    # Rate limits applied per-route via slowapi decorators
+    # (middleware/rate_limit.py). Syntax: "<count>/<period>" where period
+    # is second | minute | hour | day.
+    # Mirrors the nginx gateway shape (write_zone 10/s, api_zone 30/s)
+    # but keyed by API key rather than IP.
+    rate_limit_write: str = "10/second"
+    # Bulk write fans out to BULK_MAX_ITEMS=100 memories per request, so a
+    # stricter request-level cap keeps the effective memory-write ceiling
+    # aligned with the single-write path (2/s * 100 = 200/s vs 10/s single).
+    rate_limit_write_bulk: str = "2/second"
+    rate_limit_search: str = "30/second"
+    # Per-tenant in-flight concurrency caps (see
+    # ``middleware/per_tenant_concurrency.py`` for full rationale).
+    # Per-instance state — fleet-wide cap is roughly
+    # ``cap * max_instances``. Sized to absorb routine per-tenant
+    # fan-out (the harness's microbench phase issues ~10-30 concurrent
+    # search/list ops) while still tripping under a genuine storm.
+    per_tenant_search_concurrency: int = 32
+    per_tenant_write_concurrency: int = 16
+    # Per-tenant cap on concurrent embedding-backend (TEI) calls. Gates
+    # only the single-flight cold-miss leader in
+    # ``memory_service._get_or_cache_embedding`` (cache hits / in-flight
+    # joiners take no slot), so one hot tenant's search storm can't
+    # occupy the whole embedding service and starve other tenants
+    # (noisy-neighbor-search). Current TEI capacity assumptions live in
+    # ``common.embedding.constants``; with cap N on M core-api instances a
+    # single tenant holds at most ``N * M`` of those, leaving headroom
+    # for everyone else. Tighter than ``per_tenant_search_concurrency``
+    # on purpose: a tenant may have many searches in flight but only a
+    # few concurrent cold embeds. Fast-fails 429 like the other
+    # route-entry caps rather than queueing behind TEI.
+    per_tenant_embed_concurrency: int = 6
+    # Deeper bulkhead at the storage roundtrip itself
+    # (CAURA-602 follow-up). Smaller than the route-entry caps above
+    # because each request only holds the storage slot for the actual
+    # roundtrip (~500ms-3s), not for the whole embed/enrich/storage
+    # cycle. Sizing target: ``per_tenant_storage_write_concurrency *
+    # max_instances`` should sit comfortably below the storage-writer
+    # pool size (10/instance x 11 = 110 fleet-wide today) so a single
+    # tenant can't park more than ~20% of pool slots. Acquire is
+    # unbounded — a saturated tenant queues here while the CALLER's
+    # budget caps total wait time: the request budget on request paths,
+    # ``audit_flush_slot_timeout_seconds`` on the background audit
+    # flusher. The full roster is on ``per_tenant_storage_slot``.
+    per_tenant_storage_write_concurrency: int = 2
+    per_tenant_storage_search_concurrency: int = 4
+    # Fail-fast budget when the cap is exhausted. Long enough to absorb
+    # a benign race between two near-simultaneous arrivals; short
+    # enough that real exhaustion fails before the request hits the
+    # worker.
+    per_tenant_acquire_timeout_seconds: float = 0.05
+    # Process-wide cap on concurrently RUNNING contradiction-detection
+    # passes (A19). Every trigger — write, bulk fan-out, back-channel
+    # consumers, post-entity-extraction — schedules detection as an
+    # unbounded fire-and-forget task, so the caps above bound how fast
+    # writes are ADMITTED but nothing bounds how many detections then
+    # run at once: 8 concurrent 100-item bulks leave ~1,600 detection
+    # coroutines racing the moment they commit. Each pass holds up to
+    # ``_ENTITY_CTX_FANOUT_LIMIT`` (8) storage connections during its
+    # Path C context fetch and one LLM judge call for seconds, on the
+    # SAME storage pool (200 conns, 5s pool budget) and provider quota
+    # the foreground request path uses — a big enough burst turns into
+    # foreground PoolTimeouts and judge abstains (#821), i.e. dropped
+    # detections. Global rather than per-tenant because the resources
+    # being protected are process-global; detection is post-commit
+    # background work, so excess passes QUEUE (never shed) and drain in
+    # FIFO order. Sizing: 16 x 8 = 128 worst-instant storage conns
+    # (< 200 with headroom for foreground), 16 concurrent judge calls
+    # is below the enrichment path's accepted worst case (CAURA-627),
+    # and at a ~2s batch judge that sustains ~8 detections/s per
+    # process — comfortably above one saturated tenant's admitted
+    # write rate. Matches ``per_tenant_write_concurrency`` on purpose:
+    # one process keeps pace with one saturated tenant.
+    contradiction_detection_concurrency: int = 16
+    # Idempotency-Key inbox TTL. 24h matches Stripe's default and is
+    # longer than any realistic client retry budget. Cached responses
+    # older than this are treated as absent and the request re-runs.
+    idempotency_ttl_seconds: int = 86400
+    # TTL for pending claims (rows with ``is_pending=True`` waiting for
+    # the handler to call ``record()``). MUST be much shorter than
+    # ``idempotency_ttl_seconds``: a crashed/timed-out handler leaves the
+    # row pending; without a short TTL it would soft-ban the key for the
+    # full 24h. The expired-row reclaim path in ``idempotency_claim``
+    # auto-recovers stuck pending rows once this TTL elapses. Sized
+    # generously above realistic handler latency (single write <2s, bulk
+    # write <60s, search <2s).
+    idempotency_pending_ttl_seconds: int = 90
+    environment: Literal["development", "production", "sandbox"] = "development"
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    # JSON output by default so Cloud Logging picks up severity/message.
+    # Local developers can set LOG_FORMAT_JSON=false for structlog's
+    # coloured ConsoleRenderer.
+    log_format_json: bool = True
+    # On-prem deployments set this to /var/log/caura/core-api/core-api.log so
+    # logs land on disk too (daily-rotated, 5-day retention). Empty = stdout only.
+    log_file: str = ""
+    # Default False: standalone=True bypasses tenant auth, so it must be an explicit opt-in.
+    is_standalone: bool = False
+    # A55 contradiction-engine seam. False (default) => legacy detector call
+    # sites (today's behaviour, unchanged). True => route contradiction
+    # detection through ContradictionEngine.evaluate_async. Phase 1 the two
+    # paths are behaviourally identical (the engine delegates to the same
+    # detector); the flag exists so the old arch can be retired later.
+    contradiction_engine_enabled: bool = False
+    # A55 1d — when True, the detector additionally writes a memory_conflicts
+    # classification record for each confirmed conflict (via the resolver).
+    # Additive: it never changes the status/supersedes effect, so retrieval is
+    # unaffected. Default False; enable to start populating conflict records.
+    contradiction_write_conflict_record: bool = False
+    # A58 — Path D (basis invalidation) in SHADOW mode: after Path A, one
+    # bridge LLM call proposes <=3 other predicates of the same subject whose
+    # practical basis the new memory may have broken; <=2 invalidation-judge
+    # calls produce verdicts that are LOGGED ONLY (``path_d_shadow`` lines).
+    # No status is ever written under this flag — it exists to measure the
+    # Type-II base rate + precision on real corpora before A59 builds the
+    # enforcing path (``unsafe`` status). Skipped when the new memory has no
+    # resolved subject_entity_id.
+    basis_invalidation_shadow: bool = False
+    # A59 — Type-II state materialization, subject-local and batch (runs in the
+    # nightly crystallizer, not per write). SHADOW ONLY at this setting: one
+    # LLM call per CHANGED multi-memory subject proposes which of that
+    # subject's own memories stopped being safe current defaults and what
+    # should stand instead; proposals are validated deterministically and
+    # emitted as an auditable report section. Nothing is written to memories.
+    # Precision is scored by hand off that section before a write mode is
+    # built (the A58 spike could not be scored because its verdicts only went
+    # to logs). Default off.
+    type_ii_materializer_shadow: bool = False
+    core_storage_api_url: str = "http://localhost:8002"
+    core_storage_shared_secret: SecretStr = Field(default=SecretStr(""), repr=False, exclude=True)
+    core_storage_shared_secret_file: str = ""
+
+    @model_validator(mode="after")
+    def resolve_core_storage_shared_secret(self) -> Self:
+        if not self.core_storage_shared_secret.get_secret_value():
+            self.core_storage_shared_secret = SecretStr(
+                read_shared_secret_file(self.core_storage_shared_secret_file)
+            )
+        return self
+
+    @model_validator(mode="after")
+    def resolve_admin_api_key(self) -> Self:
+        # Blank as well as unset: .env.example ships ``ADMIN_API_KEY=``.
+        if not self.admin_api_key and self.admin_api_key_file:
+            self.admin_api_key = read_shared_secret_file(
+                self.admin_api_key_file, env_name="ADMIN_API_KEY_FILE"
+            )
+        return self
+
+    # Enterprise SaaS splits core-storage-api into writer + reader Cloud Run
+    # services (CAURA-591 Part B). When this is set, the storage client
+    # routes GET + tagged-read POST calls here instead of ``core_storage_api_url``;
+    # empty keeps today's single-service behaviour (OSS + pre-split deploys).
+    core_storage_read_url: str = ""
+    # Public base URL of THIS API as callers reach it (e.g. https://api.caura.ai).
+    # When set, the OpenAPI spec gains a ``servers`` block so generated clients
+    # and agents resolve relative paths correctly; empty emits no servers block.
+    public_api_url: str = ""
+    settings_encryption_key: str = ""  # Required in production (Fernet key)
+    jwt_secret: str = "change-me-in-production"  # Required in production
+    use_stm: bool = False
+    # D13 — meter /recall and MCP caura_recall against the "recall" counter
+    # instead of "search". Off by default because the recalls counter feeds
+    # plan enforcement (`_is_over_plan_limits` → x-org-read-only → 403 on
+    # write routes): flipping this makes the per-plan recall cap computable
+    # for the first time, so enabling it is a deliberate billing decision,
+    # not a deploy side effect. Off = the historical (miscounted) behavior.
+    meter_recall_as_recall: bool = False
+    # Meter the MCP batch write (``caura_write(items=[...])``) against the
+    # write counter, one unit per item, as REST's ``POST /memories/bulk``
+    # already does. ON since caura-ai/caura#1638 — before that this path
+    # charged NOTHING, so the same tenant writing the same N memories was
+    # billed differently depending on the transport it happened to use.
+    #
+    # WHAT ENABLING IT COSTS A TENANT TODAY: quota, and nothing else. An
+    # earlier revision of this comment said "crossing it bites on REST FIRST",
+    # because over-plan mode is computed from these counters, stamped as
+    # ``x-org-read-only``, and turned into a 403 on ~22 REST write routes. Every
+    # link in that chain is real EXCEPT THE ONE THAT WOULD START IT.
+    #
+    # Metering only records: ``allowed`` has no reader in core-api (see
+    # ``usage_service._meter``), so the meter itself refuses nothing.
+    # Enforcement arrives via ``x-org-read-only``, whose org half is
+    # ``organizations.is_read_only`` in caura-enterprise. The only writer of
+    # that flag to True is the Paddle ``subscription.canceled`` downgrade
+    # (``platform-admin-api/routers/billing.py``). Usage does decide INSIDE
+    # that event — over the free tier, or unverifiable, sets it — but nothing
+    # evaluates usage OUTSIDE it: no periodic sweep, no request-time check, and
+    # the ``check-read-only`` endpoint returns early unless the org is ALREADY
+    # flagged and only ever writes ``False``. It exists to LIFT the lock.
+    #
+    # So a tenant that grows over its plan on a healthy subscription is never
+    # flagged, and turning this on cannot by itself refuse anybody. That is a
+    # hole in the enforcement chain, not a licence to treat these counters as
+    # decorative — the moment anything sets the flag from usage, this flag
+    # decides whether MCP-first tenants were ever measured. Reversible by env
+    # without a redeploy.
+    meter_mcp_bulk_writes: bool = True
+    # Refuse MCP writes when the org is over its plan limit, as the ~22 REST
+    # write routes already do. Off by default, and this is the sharpest of the
+    # three flags above it: the other two change what is COUNTED, this one
+    # changes what is ALLOWED. Flipping it takes away a capability tenants have
+    # today — an over-plan org that can currently write over MCP stops being
+    # able to — so it is a deliberate, announced change, not a deploy side
+    # effect. Off = observe and log only (``_check_plan_limit``).
+    #
+    # It is a flag rather than a straight code change so the rollout is
+    # reversible without a redeploy: enable it, watch
+    # ``mcp_plan_limit_refused``, and turn it off again if the blast radius is
+    # wrong. A code-only change would need a rollback to undo.
+    #
+    # Read ``_check_plan_limit``'s docstring before enabling. A quiet
+    # observation log is STILL NOT evidence that nothing will be refused, but
+    # the reason changed with caura-ai/caura#1638 and the old one is gone:
+    # ``meter_mcp_bulk_writes`` above is now ON, so the batch path does move the
+    # counters over-plan mode is computed from, and MCP-first tenants are no
+    # longer invisible to them.
+    #
+    # WHAT REPLACES IT IS WORSE. Nothing stamps an org read-only from usage
+    # growth at all — see that flag's comment for the verification. So the
+    # observation log is quiet for reasons that have nothing to do with how many
+    # tenants are over plan, and enabling THIS would enforce against a signal
+    # almost nobody can currently receive. Settle what should set the flag
+    # before reading the log as a blast radius. See caura-ai/caura#1205.
+    enforce_mcp_plan_limits: bool = False
+    stm_backend: str = "memory"  # memory | redis
+    stm_notes_ttl: int = 86400  # 24h
+    stm_bulletin_ttl: int = 172800  # 48h
+
+    # Platform default providers — Caura's own API keys for tenants without credentials.
+    # Set these in enterprise deployments; leave empty for OSS self-hosted.
+    platform_llm_provider: str = ""  # "vertex" | "openai" | "" (disabled)
+    platform_llm_model: str = ""  # e.g. "gemini-3.1-flash-lite-preview"
+    platform_llm_api_key: SecretStr = SecretStr("")  # OpenAI LLM: API key
+    platform_llm_gcp_project_id: str = ""  # Vertex: GCP project
+    platform_llm_gcp_location: str = ""  # Vertex: region
+    platform_embedding_provider: str = ""  # "openai" | "" (disabled)
+    platform_embedding_api_key: SecretStr = SecretStr("")  # OpenAI: API key for embeddings
+    platform_embedding_model: str = ""  # e.g. "text-embedding-3-small"
+
+    @model_validator(mode="after")
+    def _prefer_the_new_api_key_name(self) -> "Settings":
+        """Collapse the two accepted spellings onto the field auth.py reads.
+
+        First non-empty wins, new name first — so the old spelling keeps working
+        forever and a blank new one can never shadow it.
+        """
+        self.memclaw_api_key = self.caura_api_key or self.memclaw_api_key  # legacy-name-ok: rule 3 alias
+        return self
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _normalize_log_level(cls, v: Any) -> Any:
+        # Pydantic's Literal check rejects invalid values with a clear error
+        # after we return — this validator only needs to uppercase so env
+        # vars like LOG_LEVEL=debug are accepted.
+        return v.upper() if isinstance(v, str) else v
+
+    @field_validator(
+        "per_tenant_search_concurrency",
+        "per_tenant_write_concurrency",
+        "per_tenant_embed_concurrency",
+        "per_tenant_storage_write_concurrency",
+        "per_tenant_storage_search_concurrency",
+        "contradiction_detection_concurrency",
+    )
+    @classmethod
+    def _concurrency_cap_must_be_positive(cls, v: int, info: ValidationInfo) -> int:
+        # ``asyncio.Semaphore(0)`` is valid Python but every ``acquire()``
+        # blocks forever: the route-entry caps would 429 every request, the
+        # unbounded storage slots and the detection gate would stall until
+        # the caller's budget expires. 0 is not a disable switch — reject at
+        # config load so the misconfig surfaces at startup (core-worker
+        # rejects its storage-write cap the same way).
+        if v < 1:
+            raise ValueError(f"{info.field_name} must be >= 1; 0 would block every acquire of that cap")
+        return v
+
+    @model_validator(mode="after")
+    def _validate_timeout_ordering(self) -> "Settings":
+        # Local import avoids a circular: constants → common.constants,
+        # but this file is imported by constants.py's dependents.
+        from common.embedding.constants import (
+            EMBEDDING_BUDGET_MARGIN_S,
+            EMBEDDING_GATE_TIMEOUT_SECONDS,
+        )
+        from core_api.constants import (
+            BULK_EMBEDDING_TIMEOUT_SECONDS,
+            BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS,
+            BULK_STRONG_EMBED_TIMEOUT_SECONDS,
+            PROBE_TIMEOUT_SECONDS,
+            STORAGE_CONNECT_TIMEOUT_SECONDS,
+            STORAGE_READ_TIMEOUT_SECONDS,
+        )
+
+        if self.request_timeout_seconds < BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS:
+            raise ValueError(
+                f"request_timeout_seconds ({self.request_timeout_seconds}s) must be >= "
+                f"BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS ({BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS}s) "
+                "so the inner enrichment cap can fire before the outer request budget."
+            )
+        if self.enrichment_inline_timeout_seconds >= self.request_timeout_seconds:
+            raise ValueError(
+                f"enrichment_inline_timeout_seconds ({self.enrichment_inline_timeout_seconds}s) "
+                f"must be < request_timeout_seconds ({self.request_timeout_seconds}s) so the "
+                "inline embed+enrich cap fires before the outer request budget."
+            )
+        if self.bulk_request_timeout_seconds < BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS:
+            # Bulk runs its own budget, so the same inner-fires-first
+            # rule has to hold here. If enrichment can't finish under
+            # the bulk budget, the only safe outcome is a 504 with the
+            # per-attempt-id retry path.
+            raise ValueError(
+                f"bulk_request_timeout_seconds ({self.bulk_request_timeout_seconds}s) "
+                f"must be >= BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS "
+                f"({BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS}s)."
+            )
+        if self.interview_request_timeout_seconds > PLATFORM_REQUEST_CEILING_SECONDS:
+            # A budget past the platform ceiling can never fire — the
+            # gateway/Cloud Run severs the connection first while the
+            # handler keeps interviewing. Catch the misconfig at startup.
+            raise ValueError(
+                f"interview_request_timeout_seconds "
+                f"({self.interview_request_timeout_seconds}s) must be <= "
+                f"PLATFORM_REQUEST_CEILING_SECONDS "
+                f"({PLATFORM_REQUEST_CEILING_SECONDS}s); raise the platform "
+                "timeout (nginx proxy_read_timeout / Cloud Run) and update "
+                "the constant before raising this budget."
+            )
+        if self.audit_flush_slot_timeout_seconds <= 0:
+            # ``asyncio.timeout(0)`` expires before the first acquire can
+            # succeed, so every tenant's slice would be dropped on every
+            # flush — a budget that silently turns audit ingestion off.
+            raise ValueError(
+                f"audit_flush_slot_timeout_seconds "
+                f"({self.audit_flush_slot_timeout_seconds}s) must be > 0; "
+                "set audit_queue_max_size = 0 to bypass the queue instead."
+            )
+        if self.mcp_request_timeout_seconds > PLATFORM_REQUEST_CEILING_SECONDS:
+            # Same rule as interview's, for the same reason: past the
+            # platform ceiling the budget can never fire, because the
+            # gateway severs the connection while the tool keeps running.
+            # Worth enforcing here specifically — this budget exists to make
+            # a cap that the code already CLAIMS actually exist, so a value
+            # that cannot fire would restore the claim in config and leave
+            # ``per_tenant_storage_slot``'s docstring lying exactly as before.
+            raise ValueError(
+                f"mcp_request_timeout_seconds "
+                f"({self.mcp_request_timeout_seconds}s) must be <= "
+                f"PLATFORM_REQUEST_CEILING_SECONDS "
+                f"({PLATFORM_REQUEST_CEILING_SECONDS}s); raise the platform "
+                "timeout (nginx proxy_read_timeout / Cloud Run) and update "
+                "the constant before raising this budget."
+            )
+        binding_ceiling = min(PLATFORM_REQUEST_CEILING_SECONDS, STORAGE_READ_TIMEOUT_SECONDS)
+        if self.cross_link_request_timeout_seconds >= binding_ceiling:
+            # ``>=``, not ``>`` as the interview check above uses, and the
+            # difference is the whole point of this budget rather than a
+            # slip. That budget only has to FIT under the ceiling; this one
+            # has to WIN against it. Cross-link discovery is an outbound call
+            # this process cancels itself, so at equality the two timers race
+            # -- and that race is the defect being fixed: the storage client's
+            # own docstring records the same lesson from CAURA-602 ("equal
+            # values would 50/50 race"), and on 2026-09-18 a staging batch lost
+            # it fifty times, each one surfacing as ``ReadTimeout('')`` with no
+            # tenant, no budget and nothing to act on.
+            #
+            # ``min`` because the budget must fire before whichever ceiling
+            # binds first. The two are equal today; if one is raised alone the
+            # check follows the other, which is exactly the misconfiguration
+            # that would otherwise pass review as "we raised the timeout".
+            raise ValueError(
+                f"cross_link_request_timeout_seconds "
+                f"({self.cross_link_request_timeout_seconds}s) must be < "
+                f"{binding_ceiling}s -- the lower of "
+                f"STORAGE_READ_TIMEOUT_SECONDS ({STORAGE_READ_TIMEOUT_SECONDS}s) "
+                f"and PLATFORM_REQUEST_CEILING_SECONDS "
+                f"({PLATFORM_REQUEST_CEILING_SECONDS}s). At or above it the "
+                "step's own cancellation stops winning the race and the "
+                "failure goes back to an opaque ReadTimeout; raise the "
+                "ceiling that binds before raising this budget."
+            )
+        if (
+            self.storage_bulk_timeout_seconds
+            + BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS
+            + BULK_EMBEDDING_TIMEOUT_SECONDS
+            >= self.bulk_request_timeout_seconds
+        ):
+            # The per-phase storage cap (CAURA-599) must fire before the
+            # umbrella. The bulk path runs embed (line 984 in
+            # memory_service.py) THEN enrich (line 1018) THEN storage
+            # SEQUENTIALLY, so worst-case wall-clock before storage even
+            # starts is ``embed + enrich``. Checking ``storage <
+            # bulk_request`` alone would admit configs where
+            # ``embed + enrich + storage > bulk_request`` and the
+            # umbrella silently fires first, defeating the per-phase
+            # cleanup.
+            raise ValueError(
+                f"storage_bulk_timeout_seconds ({self.storage_bulk_timeout_seconds}s) "
+                f"+ BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS "
+                f"({BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS}s) "
+                f"+ BULK_EMBEDDING_TIMEOUT_SECONDS "
+                f"({BULK_EMBEDDING_TIMEOUT_SECONDS}s) must be < "
+                f"bulk_request_timeout_seconds "
+                f"({self.bulk_request_timeout_seconds}s) so the storage-phase "
+                f"cap fires before the umbrella."
+            )
+        if EMBEDDING_GATE_TIMEOUT_SECONDS >= BULK_STRONG_EMBED_TIMEOUT_SECONDS:
+            # The opportunistic ``write_mode="strong"`` embed must be able to
+            # outwait the concurrency gate. The gate timeout sits deliberately
+            # below callers' deadlines so a saturated gate surfaces as
+            # attributable backpressure rather than an anonymous caller timeout;
+            # invert that and every gate-saturated strong write is reported as a
+            # generic embed failure instead. Checked here because the gate value
+            # is read from an env var at import, so the ordering is an operator's
+            # to break, not a constant's.
+            raise ValueError(
+                f"EMBEDDING_GATE_TIMEOUT_SECONDS ({EMBEDDING_GATE_TIMEOUT_SECONDS}s) must be < "
+                f"BULK_STRONG_EMBED_TIMEOUT_SECONDS ({BULK_STRONG_EMBED_TIMEOUT_SECONDS}s) so a "
+                "saturated embedding gate stays attributable on the opportunistic "
+                "bulk strong-embed path. Lower the gate timeout, or raise "
+                "BULK_STRONG_EMBED_TIMEOUT_SECONDS (keeping it under "
+                "BULK_EMBEDDING_TIMEOUT_SECONDS)."
+            )
+        if BULK_STRONG_EMBED_TIMEOUT_SECONDS - EMBEDDING_BUDGET_MARGIN_S <= EMBEDDING_GATE_TIMEOUT_SECONDS:
+            # The gate check above is necessary but no longer sufficient. The
+            # embed layer now caps the provider call at
+            # ``budget_s - EMBEDDING_BUDGET_MARGIN_S`` — a bound that sits
+            # INSIDE the window the gate's own timeout lives in — so a margin
+            # large enough to pull that cap under the gate timeout means the
+            # budget cap always fires first and a gate-saturation event is
+            # reported as a generic "embed exceeded its budget" instead of the
+            # gate's dedicated warning. That inverts precisely the attribution
+            # the check above exists to guarantee, and it would do so silently.
+            #
+            # Both operands are env-overridable, so like the gate ordering this
+            # is an operator's to break rather than a constant's. Defaults leave
+            # real room: 8 - 1 = 7 > 5.
+            raise ValueError(
+                f"BULK_STRONG_EMBED_TIMEOUT_SECONDS ({BULK_STRONG_EMBED_TIMEOUT_SECONDS}s) minus "
+                f"EMBEDDING_BUDGET_MARGIN_S ({EMBEDDING_BUDGET_MARGIN_S}s) must be > "
+                f"EMBEDDING_GATE_TIMEOUT_SECONDS ({EMBEDDING_GATE_TIMEOUT_SECONDS}s), so a "
+                "saturated embedding gate still reports itself rather than being "
+                "pre-empted by the embed budget cap. Lower EMBEDDING_BUDGET_MARGIN_S, "
+                "lower the gate timeout, or raise BULK_STRONG_EMBED_TIMEOUT_SECONDS "
+                "(keeping it under BULK_EMBEDDING_TIMEOUT_SECONDS)."
+            )
+        if BULK_STRONG_EMBED_TIMEOUT_SECONDS >= BULK_EMBEDDING_TIMEOUT_SECONDS:
+            # The other half of the bound the message above already tells the
+            # operator to respect. The derived default clamps here, so only an
+            # explicit env override can reach this — and it must not, twice over:
+            # an opportunistic embed allowed to run as long as a required one stops
+            # being opportunistic and can hold a whole batch for that budget, for
+            # one item's opt-in; and the additive ordering check above assumes the
+            # embed phase never exceeds BULK_EMBEDDING_TIMEOUT_SECONDS, so letting
+            # it through would silently invalidate that proof rather than just
+            # degrade this path.
+            raise ValueError(
+                f"BULK_STRONG_EMBED_TIMEOUT_SECONDS ({BULK_STRONG_EMBED_TIMEOUT_SECONDS}s) must be < "
+                f"BULK_EMBEDDING_TIMEOUT_SECONDS ({BULK_EMBEDDING_TIMEOUT_SECONDS}s): the "
+                "opportunistic bulk strong-embed budget cannot exceed the required embed cap, "
+                "which the storage-phase ordering check above is proved against."
+            )
+        if PROBE_TIMEOUT_SECONDS <= STORAGE_CONNECT_TIMEOUT_SECONDS:
+            # A dependency probe must outlive ONE attempt of the call it makes,
+            # or it reports a healthy dependency as unreachable. These were both
+            # 5.0: equal, so the probe's ``wait_for`` and the transport's connect
+            # ceiling raced, and the probe could absorb none of the five connect
+            # retries ``CONNECT_PHASE_MAX_ATTEMPTS`` grants it. In prod that
+            # returned ``storage: unreachable`` on ~0.8% of probes while storage
+            # was answering the very same call in ~30ms — the abandoned request,
+            # shielded by ``_cancel_safe``, completed 200 about 10ms after the
+            # probe had already given up. A third party (Better Stack Uptime)
+            # polls this endpoint, so the false alarms left the estate.
+            #
+            # Checked here rather than only in a test because the probe's callers
+            # are operator-facing surfaces and this ordering is the kind that gets
+            # broken by tuning one number in isolation — the same rationale as the
+            # gate ordering above.
+            raise ValueError(
+                f"PROBE_TIMEOUT_SECONDS ({PROBE_TIMEOUT_SECONDS}s) must be > "
+                f"STORAGE_CONNECT_TIMEOUT_SECONDS ({STORAGE_CONNECT_TIMEOUT_SECONDS}s), or the "
+                "/health storage probe times out before its own transport has finished a "
+                "single connect attempt and reports a healthy dependency as unreachable. "
+                "Raise PROBE_TIMEOUT_SECONDS, or lower the storage connect ceiling."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _remap_deprecated_vertex(self) -> "Settings":
+        """Graceful fallback for deprecated tenant-tier ``vertex`` provider.
+
+        Vertex is now platform-tier only. If a deployment still has
+        ``EMBEDDING_PROVIDER=vertex`` or ``ENTITY_EXTRACTION_PROVIDER=vertex``
+        from a pre-migration env file, remap to ``openai`` at startup rather
+        than crashing on the first request through ``get_*_provider``.
+
+        String literals (``"vertex"`` / ``"openai"``) are used here rather
+        than ``ProviderName`` members because this validator runs during
+        ``settings = Settings()`` at module-bottom import time, and importing
+        ``core_api.providers._names`` triggers ``core_api.providers.__init__``
+        which imports back from ``core_api.config`` — a circular. StrEnum
+        equality means the comparison still works for any future enum-aware
+        callers.
+        """
+        if self.embedding_provider == "vertex":
+            logger.warning(
+                "EMBEDDING_PROVIDER=vertex is no longer supported (CAURA-333: "
+                "Vertex embeddings never passed output_dimensionality and were "
+                "rejected by pgvector's 1024-dim column). Remapping to 'openai'."
+            )
+            object.__setattr__(self, "embedding_provider", "openai")
+            # A user coming from Vertex likely has no OPENAI_API_KEY — without a
+            # key memories are stored without embeddings, so semantic search
+            # finds nothing new. Escalate.
+            if not self.openai_api_key and not self.platform_embedding_provider:
+                logger.error(
+                    "EMBEDDING_PROVIDER was remapped from 'vertex' to 'openai', but "
+                    "OPENAI_API_KEY is unset and PLATFORM_EMBEDDING_PROVIDER is not "
+                    "configured. Memories will be stored without embeddings (keyword "
+                    "search only). Set OPENAI_API_KEY or configure "
+                    "PLATFORM_EMBEDDING_PROVIDER=openai to restore embeddings."
+                )
+        if self.entity_extraction_provider == "vertex":
+            logger.warning(
+                "ENTITY_EXTRACTION_PROVIDER=vertex is no longer supported as a "
+                "tenant-facing provider. Remapping to 'openai'. Configure platform-tier "
+                "Vertex via PLATFORM_LLM_PROVIDER instead."
+            )
+            object.__setattr__(self, "entity_extraction_provider", "openai")
+            # Less catastrophic than fake embeddings (LLM enrichment degrades
+            # to heuristics) but still worth flagging prominently.
+            if not self.openai_api_key and not self.platform_llm_provider:
+                logger.error(
+                    "ENTITY_EXTRACTION_PROVIDER was remapped from 'vertex' to 'openai', "
+                    "but OPENAI_API_KEY is unset and PLATFORM_LLM_PROVIDER is not "
+                    "configured. LLM enrichment will use FakeLLMProvider. Set "
+                    "OPENAI_API_KEY or configure PLATFORM_LLM_PROVIDER to restore "
+                    "enrichment."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_anthropic_structured_output(self) -> "Settings":
+        """Refuse ``ENTITY_EXTRACTION_PROVIDER=anthropic`` at startup.
+
+        oss-0915-m-01. This provider drives enrichment, entity extraction and
+        the contradiction judge — all structured-output (``complete_json``)
+        calls — and Anthropic's OpenAI-compatible endpoint 400s on every one of
+        them (``ANTHROPIC_JSON_UNSUPPORTED`` in the OpenAI provider has the two
+        error shapes). At runtime that degraded to the fake provider while
+        writes reported success, so a crash here is the kinder failure.
+        String literal for the same circular-import reason as
+        ``_remap_deprecated_vertex``.
+        """
+        if self.entity_extraction_provider == "anthropic":
+            raise ValueError(
+                "ENTITY_EXTRACTION_PROVIDER=anthropic is not supported: "
+                "enrichment, entity extraction and contradiction detection use "
+                "structured JSON output, which Anthropic's OpenAI-compatible "
+                "endpoint rejects (HTTP 400 on every call). Set "
+                "ENTITY_EXTRACTION_PROVIDER to openai, openrouter or gemini."
+            )
+        return self
+
+    @property
+    def inline_embedding(self) -> bool:
+        """True iff the resolved deployment mode runs embedding inline."""
+        return self.deployment_mode == "inline"
+
+    @property
+    def inline_enrichment(self) -> bool:
+        """True iff the resolved deployment mode runs enrichment inline."""
+        return self.deployment_mode == "inline"
+
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+
+
+settings = Settings()
+
+
+def bridge_credentials_to_environ() -> None:
+    """Copy ``settings.X`` credential values into ``os.environ``.
+
+    pydantic-settings reads ``.env`` files into the ``Settings``
+    instance but does NOT export those values back into
+    ``os.environ``. ``common.llm._credentials`` and
+    ``common.llm._platform`` (CAURA-595 extraction) read
+    ``os.environ`` directly — by design, so core-worker can use them
+    without depending on pydantic-settings.
+
+    Without this bridge, a developer with ``OPENAI_API_KEY=sk-...`` in
+    ``.env`` (the documented local-dev shape) would silently get
+    ``FakeLLMProvider`` for all enrichment / entity-extraction /
+    contradiction-detection LLM calls; same for the platform-tier
+    singletons configured by ``PLATFORM_*`` settings. The bridge runs
+    once during the FastAPI lifespan startup before
+    ``init_platform_providers()``.
+
+    Idempotent: only sets keys that aren't already in ``os.environ``,
+    so an explicit shell export wins over the ``.env`` value (matches
+    pydantic-settings' own precedence: env > ``.env``).
+    """
+    import os
+
+    bridges: dict[str, str] = {
+        # Tenant-tier provider keys read by ``common.llm._credentials``.
+        "OPENAI_API_KEY": settings.openai_api_key or "",
+        "ANTHROPIC_API_KEY": settings.anthropic_api_key or "",
+        "OPENROUTER_API_KEY": settings.openrouter_api_key or "",
+        "ATLASCLOUD_API_KEY": settings.atlascloud_api_key or "",
+        "GEMINI_API_KEY": settings.gemini_api_key or "",
+        # Default provider + model used by ``common.enrichment.service``.
+        "ENTITY_EXTRACTION_PROVIDER": settings.entity_extraction_provider or "",
+        "ENTITY_EXTRACTION_MODEL": settings.entity_extraction_model or "",
+        # Embedding provider and local model, read from ``os.environ`` by
+        # ``common.embedding`` (M-18): the provider by every embedder with no
+        # tenant config (the nightly entity backfill, the query-embedding cache
+        # key), the local model by the registry for every caller. Unbridged, a
+        # bare-metal ``.env`` that picked ``local`` embedded memories with it and
+        # those callers with the default provider: two vector spaces.
+        "EMBEDDING_PROVIDER": settings.embedding_provider or "",
+        "LOCAL_EMBEDDING_MODEL": settings.local_embedding_model or "",
+        # OpenAI client timeout used by ``common.llm.constants``.
+        "OPENAI_REQUEST_TIMEOUT_SECONDS": str(settings.openai_request_timeout_seconds),
+        # Platform-tier singletons read by ``common.llm._platform``.
+        "PLATFORM_LLM_PROVIDER": settings.platform_llm_provider or "",
+        "PLATFORM_LLM_MODEL": settings.platform_llm_model or "",
+        "PLATFORM_LLM_API_KEY": (
+            settings.platform_llm_api_key.get_secret_value() if settings.platform_llm_api_key else ""
+        ),
+        "PLATFORM_LLM_GCP_PROJECT_ID": settings.platform_llm_gcp_project_id or "",
+        "PLATFORM_LLM_GCP_LOCATION": settings.platform_llm_gcp_location or "",
+        # Platform-tier EMBEDDING singleton read by ``common.embedding._platform``
+        # (OSS 08/14 M-28). The docstring above has always claimed this bridge
+        # covers "the platform-tier singletons configured by ``PLATFORM_*``
+        # settings"; only the LLM half was ever here, so a deployment that put
+        # ``PLATFORM_EMBEDDING_PROVIDER=openai`` in ``.env`` — the documented
+        # shape — had it loaded into ``Settings`` and never exported, leaving
+        # ``_build_platform_embedder`` to read "" and hand back no platform
+        # embedder at all. The fallback is silent and its failure mode is the
+        # expensive kind: vectors that embed and persist fine, in the wrong
+        # space, discoverable only as bad recall.
+        "PLATFORM_EMBEDDING_PROVIDER": settings.platform_embedding_provider or "",
+        "PLATFORM_EMBEDDING_MODEL": settings.platform_embedding_model or "",
+        "PLATFORM_EMBEDDING_API_KEY": (
+            settings.platform_embedding_api_key.get_secret_value()
+            if settings.platform_embedding_api_key
+            else ""
+        ),
+        # ``PLATFORM_EMBEDDING_BASE_URL`` and ``PLATFORM_EMBEDDING_TRUNCATE_TO_DIM``
+        # are read by the same builder but have no ``Settings`` field to bridge
+        # from, so they stay env-only. Left alone deliberately: inventing
+        # settings for them is a config-surface change, not this fix, and the
+        # three above are the ones ``.env.example`` documents.
+    }
+    for env_name, value in bridges.items():
+        if value and not os.environ.get(env_name):
+            os.environ[env_name] = value

@@ -1,0 +1,905 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, dev]
+
+env:
+  PYTHON_VERSION: "3.13"
+  UV_VERSION: "0.9.26"
+
+jobs:
+  evidence-registry:
+    name: Evidence registry
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned JSON Schema validator
+        run: python3 -m pip install --disable-pip-version-check -r scripts/requirements-evidence.txt
+
+      - name: Validate claims and generated benchmark copy
+        run: python3 scripts/evidence_registry.py --check
+
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: caura
+          POSTGRES_USER: caura
+          POSTGRES_PASSWORD: changeme
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U caura"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js (for plugin version-sync + type-check)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Install reviewer sandbox and smoke-test pinned CLI (no API calls)
+        run: bash .github/scripts/install_review_sandbox.sh
+
+      - name: Check plugin version-sync (gen-version.sh → src/version.ts)
+        # Fails fast if plugin/src/version.ts has drifted from
+        # plugin/package.json's "version" field — i.e., someone bumped
+        # package.json but didn't run scripts/gen-version.sh, or hand-
+        # edited version.ts. The drift-prevention guarantee documented
+        # in scripts/gen-version.sh is enforced here.
+        run: cd plugin && npm run check:version
+
+      - name: Type-check + build plugin (tsc)
+        # Compiles the plugin with its own tsconfig so a dependency bump that
+        # breaks the build (e.g. a TypeScript major that changes @types
+        # resolution) can't merge while looking green. The version-sync check
+        # above runs no compiler; `client-typescript-ci.yml` is path-scoped to
+        # the client SDK, not /plugin — so without this step the plugin has no
+        # type-check gate in CI.
+        run: cd plugin && npm ci && npm run build
+
+      - name: Run plugin tests (node:test)
+        # The plugin had 423 tests and CI ran NONE of them. The step above
+        # proves it compiles; nothing proved it behaves. `client-typescript-ci.yml`
+        # is path-scoped to clients/typescript, so its `npm test` never touched
+        # /plugin — which is how the caura_tune identity bug (F5) reached a
+        # release: `tool-definitions.ts` shipped a literal "unknown-agent"
+        # fallback that a two-line test would have caught.
+        #
+        # `npm ci` is not repeated — the build step above installed into the
+        # same workspace, and `npm test` re-runs tsc itself via `pretest`.
+        run: cd plugin && npm test
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5.4.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        # core-operations is installed for its own ruff/mypy/pytest steps
+        # below. Before it was listed here those steps passed only because
+        # core-api's dependency list happens to be a superset of
+        # core-operations' runtime deps — an undeclared coupling that would
+        # have broken confusingly the first time core-operations grew a
+        # dependency core-api lacks. Resolution cost of adding it: one extra
+        # package (119 vs 118).
+        #
+        # core-worker likewise, and for a sharper reason: it had NO CI at all —
+        # not installed, linted, type-checked or tested by any workflow — while
+        # being the production write path in deferred/SaaS mode. It owns
+        # ``handle_embed_request`` (essentially all production embedding), the
+        # embed-backfill sweep consumer and the enrich consumer. The cost of
+        # that gap is not hypothetical: caura#786 shipped embedding provenance
+        # through every write path EXCEPT core-worker's, which would have left
+        # every production row permanently at ``unknown_provenance``; it was
+        # caught by human review because no automated check covered the tree.
+        run: |
+          uv venv .venv
+          source .venv/bin/activate
+          uv pip install -e core-storage-api/[dev] -e core-api/[dev] -e core-operations/[dev] -e core-worker/[dev]
+          echo "$VIRTUAL_ENV/bin" >> $GITHUB_PATH
+
+      # --- Broker↔cloud API-versioning gate (Gate C / Phase 1, deliverables A+B) ---
+      # core-api/openapi.broker.json is the FROZEN v1 contract for the
+      # broker-facing gateway operations that caura-daemon calls against Caura
+      # cloud. The authoritative list is BROKER_OPERATIONS in
+      # core-api/scripts/gen_broker_openapi.py — deliberately not duplicated
+      # here, because this comment listed four endpoints while the broker had
+      # grown to eight, and a list in a comment is exactly what goes stale.
+      # It is a subset of the full ~91-path
+      # OpenAPI surface, with info normalized to the frozen contract version so
+      # it changes ONLY when a broker endpoint's shape changes. Regenerate with
+      # `python core-api/scripts/gen_broker_openapi.py` and commit the result;
+      # breaking changes require a deliberate contract bump per the RFC
+      # (see core-api/scripts/README.md).
+      - name: Broker OpenAPI baseline is current (freeze v1)
+        # Regenerates the broker-contract subset from the live app and fails if
+        # the committed baseline is stale vs the code on this branch.
+        run: uv run python core-api/scripts/gen_broker_openapi.py --check
+        env:
+          # core_api is installed editable above; `.` puts the repo root on the
+          # path for the `common` package (mirrors the test/migration steps).
+          PYTHONPATH: core-api/src:core-storage-api/src:.
+
+      - name: Broker OpenAPI has no breaking change vs main
+        # oasdiff compares main's committed baseline (base) against this branch's
+        # baseline (revision) and fails on any BREAKING change (removed path or
+        # param, new required request field, narrowed type, ...). oasdiff is
+        # pinned to the tufin/oasdiff Docker image by tag; `--fail-on ERR` is
+        # required for a non-zero exit on breaking changes. On the very first
+        # merge main has no baseline yet — the gate detects that and skips.
+        run: |
+          set -euo pipefail
+          # this repo (caura-ai/caura) is public, so anonymous fetch works even though
+          # actions/checkout ran with persist-credentials: false.
+          git fetch --no-tags --depth=1 origin main
+          if git cat-file -e origin/main:core-api/openapi.broker.json 2>/dev/null; then
+            work="$RUNNER_TEMP/oasdiff"
+            mkdir -p "$work"
+            git show origin/main:core-api/openapi.broker.json > "$work/base.json"
+            cp core-api/openapi.broker.json "$work/revision.json"
+            # Pinned by digest (not just the mutable :v1.26.0 tag) so a retagged
+            # image can't silently exit 0 and hollow out the gate.
+            docker run --rm -v "$work:/specs:ro" \
+              tufin/oasdiff:v1.26.0@sha256:95a3f551ebecb6fd0fed3ff0f078bba3d51b66b379c4ca811370652d7e4d0cef \
+              breaking /specs/base.json /specs/revision.json --fail-on ERR
+          else
+            echo "No broker baseline on main yet (first-merge bootstrap) — skipping breaking-change gate."
+          fi
+
+      - name: Run Ruff linter (core-api)
+        run: uv run ruff check core-api/src/ core-api/tests/
+
+      - name: Run Ruff linter (core-storage-api)
+        run: uv run ruff check core-storage-api/src/
+
+      - name: Run Ruff linter (core-storage-api tests)
+        # The test tree was unlinted for as long as it was un-run; both halves
+        # of that blind spot close together or it just drifts again.
+        run: uv run ruff check core-storage-api/tests/
+
+      - name: Run Ruff linter (common)
+        # common/ had NO ruff config above it (no ruff.toml, no root
+        # pyproject.toml), so ruff fell back to built-in DEFAULTS here — the rule
+        # set was "whatever the installed ruff version ships," and it changed
+        # under us on the 0.16.0 bump. common/ruff.toml pins it (#684).
+        #
+        # DO NOT add ``--config common/ruff.toml``. #685 did, reasoning that
+        # naming the config made the step immune to discovery changes; it instead
+        # broke every per-file-ignore silently. Those patterns are relative to the
+        # config's own directory under discovery (so ``llm/retry.py`` means
+        # ``common/llm/retry.py``), but ``--config`` resolves them against the CWD
+        # instead — from the repo root nothing matches, all per-file-ignores
+        # become inert, and the step fails on exactly the findings they exempt.
+        # Discovery is also what enterprise's equivalent step uses, which matters
+        # because the config is byte-identical across both repos (#696).
+        run: uv run ruff check common/
+
+      - name: Run Ruff linter (core-operations)
+        # Paired with the test step below: an unlinted tree drifts, and this one
+        # was both unlinted and unrun. core-operations/pyproject.toml declares
+        # its own line-length = 110, matching core-api and core-storage-api
+        # rather than common/'s 88, so the format check below is safe to gate.
+        run: uv run ruff check core-operations/src/ core-operations/tests/
+
+      - name: Run Ruff linter (core-worker)
+        # Same pairing as core-operations above — an unlinted tree drifts, and
+        # this one was unlinted AND unrun despite being the deferred-mode
+        # production write path. core-worker/pyproject.toml declares its own
+        # line-length = 110, matching core-api / core-storage-api / core-operations
+        # rather than common/'s 88, so the format check below is safe to gate.
+        run: uv run ruff check core-worker/src/ core-worker/tests/
+
+      - name: Run Ruff linter (scripts)
+        # scripts/ was linted by NOTHING here, the same gap #684 closed for
+        # common/ and #1000 closed for TYPES in this very tree (mypy
+        # --config-file scripts/mypy.ini scripts/, further down this file). Lint
+        # was the half left open: no ruff scope covered scripts/, so the only
+        # gate was the pre-commit hook, which runs per CHANGED FILE. A ruff bump
+        # then plants findings in files nobody is touching, and they surface as
+        # a blocked commit for whoever edits one next, for unrelated reasons —
+        # what happened on enterprise #981, worked around with --no-verify.
+        #
+        # scripts/ruff.toml pins the rule set, byte-for-byte the select/ignore
+        # lists of caura-enterprise/scripts/ruff.toml so a script moving between
+        # the repos is not linted differently.
+        #
+        # DO NOT add ``--config scripts/ruff.toml``: per-file-ignores are
+        # relative to the config's own directory under discovery and to the CWD
+        # under ``--config``, so naming it makes every one inert and the step
+        # fails on exactly the findings they exempt. That is #685, in full, and
+        # this file already carries the warning under the common/ step.
+        run: uv run ruff check scripts/
+
+      - name: Run Ruff linter (root tests)
+        # 392 files, the largest tree in the repo that no ruff scope covered.
+        # tests/ruff.toml carries common/ruff.toml's rule set — NOT scripts/',
+        # whose S/BLE/EXE/FURB/PLW additions are worth their noise in a tree
+        # that shells out to gcloud and are mostly noise in test code. Same
+        # ``--config`` warning as above.
+        run: uv run ruff check tests/
+
+      - name: Run Ruff formatter check (core-api)
+        run: uv run ruff format --check core-api/src/ core-api/tests/
+
+      - name: Run Ruff formatter check (core-storage-api)
+        run: uv run ruff format --check core-storage-api/src/
+
+      - name: Run Ruff formatter check (core-storage-api tests)
+        run: uv run ruff format --check core-storage-api/tests/
+
+      - name: Run Ruff formatter check (core-operations)
+        run: uv run ruff format --check core-operations/src/ core-operations/tests/
+
+      - name: Run Ruff formatter check (core-worker)
+        run: uv run ruff format --check core-worker/src/ core-worker/tests/
+
+      - name: Run Ruff formatter check (scripts)
+        # Both trees are format-clean as of this commit: 13 of 31 files here and
+        # 179 of 392 under tests/ were reformatted in the same change, because
+        # ``ruff format`` has no per-file suppression — only ``exclude``, and a
+        # 179-entry exclude list is worse than the reformat it avoids.
+        #
+        # line-length is 88 in both configs, MEASURED as the minimum-churn value
+        # rather than assumed: at 110 the reformat would touch 29 files here and
+        # 297 under tests/, because these files were written by ``ruff format``
+        # at its default width and a wider limit tells it to JOIN lines that are
+        # correctly wrapped today.
+        #
+        # legacy_name_ratchet.py and do_not_touch_sentinel.py are byte-identical
+        # fleet-wide and were NOT reformatted — they were already clean at 88,
+        # which is part of why 88 is the right pin. They are still checked here.
+        run: uv run ruff format --check scripts/
+
+      - name: Run Ruff formatter check (root tests)
+        run: uv run ruff format --check tests/
+
+      - name: Run Ruff formatter check (vendored common/ files at ruff defaults)
+        # This list mirrors the policy=identical entries of caura-enterprise's
+        # scripts/vendored_files_manifest.json — the source of truth; keep in sync.
+        # Enterprise CI format-checks the vendored copies at ruff DEFAULTS (88 cols),
+        # so gate them here too or a merge turns enterprise CI red until a reflow
+        # lands (full story: the vendoring note in common/structlog_config.py's
+        # docstring). ``--isolated`` pins default behavior regardless of any ruff
+        # config in scope — which now includes common/ruff.toml (added in #684),
+        # so this step is deliberately unaffected by it. Still NOT all of common/:
+        # only the policy=identical files owe byte-parity to enterprise. Note
+        # common/ruff.toml also sets line-length = 88, so the two agree today;
+        # ``--isolated`` is what guarantees they cannot silently diverge.
+        run: uv run ruff format --check --isolated common/__init__.py common/structlog_config.py common/serve.py
+
+      - name: Guard against raw-string MCP error returns (audit B4 / CAURA-000 #147)
+        # MCP tool handlers must build error envelopes via ``_error_response(...)``
+        # so ``_with_latency`` can flip ``CallToolResult.isError = True``. Raw
+        # ``"Error: ..."`` / ``"Error (NNN): ..."`` returns slip past the
+        # JSON-shape detector and reach the client as ``isError=False`` —
+        # the exact regression we keep closing. Fail CI if any reappear.
+        run: |
+          # Match both double- and single-quoted forms, with optional f-string
+          # prefix. ``grep -n`` prefixes each hit with ``LINE:`` so the
+          # comment-skip filter anchors on ``^[0-9]+:\s*#``.
+          if grep -nE '[f]?"Error(:| \()' core-api/src/core_api/mcp_server.py | grep -vE '^[0-9]+:\s*#'; then
+            echo "::error::Raw-string MCP error return found (double-quote). Use _error_response(code, message) instead — see tests/test_mcp_iserror_propagation.py."
+            exit 1
+          fi
+          if grep -nE "[f]?'Error(:| \()" core-api/src/core_api/mcp_server.py | grep -vE '^[0-9]+:\s*#'; then
+            echo "::error::Raw-string MCP error return found (single-quote). Use _error_response(code, message) instead — see tests/test_mcp_iserror_propagation.py."
+            exit 1
+          fi
+
+      - name: Guard against stringified exception details (C29)
+        # ``HTTPException.detail`` is sometimes ``{code, message, details}`` now
+        # (``common.duplicate_memory.core_api_detail``). ``str()`` on that shape
+        # renders a Python dict repr — braces, quotes and all — straight into a
+        # message a model reads, and neither git nor mypy sees anything wrong:
+        # the types line up, the tests that assert on prose still pass, and the
+        # damage only shows in what the caller is told.
+        #
+        # This is aimed at the merge window specifically. Work already in flight
+        # was written when every detail was a string, so a rebase can
+        # reintroduce ``str(e.detail)`` with no conflict marker to warn anyone.
+        # ``_detail_text`` / ``_detail_code`` handle both shapes.
+        run: |
+          if grep -nE 'str\((e|exc)\.detail\)' core-api/src/core_api/mcp_server.py | grep -vE '^[0-9]+:\s*#'; then
+            echo "::error::Stringified exception detail found. Details may be structured — use _detail_text(...) / _detail_code(...) instead."
+            exit 1
+          fi
+
+      - name: Tenant-scope gate (storage routes + SQL layer)
+        # Two advisories this month were the same defect: GHSA-xw4x-jwf5-8m9h
+        # validated the tenant a request NAMED and never checked it against the
+        # row it ADDRESSED, and GHSA-wgvw-28pq-jc36's primitive was an optional
+        # ``tenant_id`` filter on ``POST /memories/bulk-get``. Neither is a
+        # property of one endpoint — the tenancy invariant was held up across
+        # the whole storage surface by convention, and a lapse in it is not a
+        # syntax error, not a type error and not a test failure.
+        #
+        # The gate enumerates every route (from the live app, so a router
+        # registered in a loop still counts) and every public PostgresService
+        # method (from its signature, which is exact), and fails when one that
+        # takes no binding tenant scope is not accounted for in
+        # core-storage-api/tenant_scope_allowlist.json. ``--base`` makes the
+        # allowlist a ratchet: it may shrink, it may not grow.
+        #
+        # In this job rather than its own because it imports the app, and this
+        # job already installed it — a standalone job would re-run the whole uv
+        # install to save a few seconds of work.
+        #
+        # The fetch is its own rather than borrowed from the broker gate above:
+        # depending on an earlier step's side effect is how a gate silently
+        # stops ratcheting when steps get reordered.
+        #
+        # ``+$BASE:refs/remotes/origin/$BASE`` rather than a bare branch name.
+        # Without a destination, ``git fetch`` is only guaranteed to write
+        # FETCH_HEAD — it updates ``refs/remotes/origin/<branch>`` only if the
+        # configured ``remote.origin.fetch`` refspec happens to cover it, and
+        # actions/checkout configures a narrow one on ``pull_request``.
+        # Measured on this branch: the fetch logs ``main -> FETCH_HEAD`` and
+        # nothing else, so the ``origin/main`` the next line asks for is
+        # whatever the checkout left behind rather than what was just fetched.
+        # It resolves today, so the gate has been comparing against a real ref —
+        # but "resolves because of how a different action is configured" is not
+        # something this step should rest on. The explicit destination makes the
+        # ref this step's own output.
+        #
+        # The base is ``github.base_ref`` — the branch this PR actually targets
+        # — not a hardcoded ``main``. This workflow triggers on
+        # ``branches: [main, dev]``, and the ratchet's whole claim is that the
+        # comparison is "exactly this PR's contribution"; against a fixed
+        # ``main``, a PR into a diverged ``dev`` would see that branch's
+        # already-reviewed entries as ones it added itself and fail with "the
+        # allowlist grew" for a diff that never touched it. No ``dev`` branch
+        # exists today, so this is defensive rather than a live fix — the
+        # sibling ratchets on this file (``legacy_name_ratchet.py``, the broker
+        # OpenAPI check) still hardcode ``main`` and have the same latent gap.
+        # ``base_ref`` is always set here because the workflow is
+        # ``pull_request``-only; if that ever changes, the empty refspec fails
+        # the step, and the gate's own unresolvable-base check fails it too —
+        # both loud, neither a silent pass.
+        # ``base_ref`` arrives through ``env`` rather than a ``${{ }}`` inside the
+        # script. The value is constrained to ``main``/``dev`` by the trigger, so
+        # this is not exploitable as written — but expression interpolation into
+        # a shell body is the shape zizmor and CodeQL flag, and the reason they
+        # flag it regardless of the specific context is that the pattern gets
+        # copied to one that IS attacker-controlled. Through ``env`` the value is
+        # data to the shell instead of text pasted into the program.
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch --no-tags --depth=1 origin "+${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          uv run python scripts/tenant_scope_gate.py --base "origin/${BASE_REF}"
+
+      # The four steps below check each service against common/ as well as
+      # against its own src/, because every service pyproject now carries
+      # ``mypy_path = "src:.."`` — ``..`` being the repo root, where common/
+      # lives. Before that, ``common.*`` resolved to nothing, and
+      # ``ignore_missing_imports = true`` (which every service sets, and needs)
+      # turned that silence into Any rather than an error. So the step below was
+      # a gate over 200 files that could not see a single one of the ~40
+      # common/ symbols they import.
+      #
+      # What it cost: ``core_api.services.forge.*`` is deliberately opted back
+      # IN to the type gate (``ignore_errors = false``, one of few carve-outs
+      # from the broad ``core_api.services.*`` exemption), and this step still
+      # reported "no issues found in 200 source files" while
+      # ``forge/cron_handler.py`` imported ``LLMRequest`` from ``common.llm`` —
+      # a name that has never existed there — and called ``call_with_fallback``
+      # with a signature it has never had. The forge distill cron raised
+      # RuntimeError on every tick and had never once run; the error blamed a
+      # missing provider chain, so it read as a misconfiguration. Repaired in
+      # #955. Being inside a gated tree proved nothing, and that is the
+      # assumption worth distrusting.
+      #
+      # The setting is in each pyproject rather than an env var here on purpose:
+      # a ``MYPYPATH`` set only on these steps would leave the local
+      # ``mypy src/``, the contributor's IDE, and any future pre-commit hook
+      # disagreeing with the gate — which is the shape of the failure this
+      # closes, not a fix for it.
+      - name: Run mypy (core-api)
+        run: cd core-api && uv run mypy src/
+
+      - name: Run mypy (core-storage-api)
+        run: cd core-storage-api && uv run mypy src/
+
+      - name: Run mypy (core-operations)
+        # core-operations/pyproject.toml carries a full [tool.mypy] block and
+        # mypy as a dev dep, same as its two siblings above; only the CI step
+        # was missing.
+        run: cd core-operations && uv run mypy src/
+
+      - name: Run mypy (core-worker)
+        # core-worker/pyproject.toml already carries a [tool.mypy] block with
+        # ``mypy_path = "src"`` and mypy as a dev dep — the config was there all
+        # along, nothing ever ran it.
+        run: cd core-worker && uv run mypy src/
+
+      - name: Run mypy (common/)
+        # common/ was type-checked by NOTHING before this step. Each mypy step
+        # above ``cd``s into one service and, until ``mypy_path = "src:.."``
+        # landed, checked only that service's own src/ — so no invocation's path
+        # ever resolved to common/, while 40 files under core-api/src alone
+        # import it. Those imports were not caught either:
+        # ``ignore_missing_imports = true`` (every service sets it) plus a
+        # ``mypy_path`` of just that service's src/ meant an unresolved
+        # ``common.*`` import degraded to Any in silence rather than failing.
+        # ``cd core-api && mypy src/`` reported 199 files and none of them were
+        # common/'s 94.
+        #
+        # This step is still the one that OWNS common/. The service steps reach
+        # it only through the imports they happen to follow, so a common/ module
+        # no service imports — or a branch of one none of them exercises — is
+        # covered here and nowhere else. Keep it.
+        #
+        # Nor did the hook cover it: .pre-commit-config.yaml deliberately runs no
+        # mypy, deferring to "CI is the authoritative type-check" — which pointed
+        # at a check that did not include this directory.
+        #
+        # What it was hiding: 12 errors in 7 files, all fixed in the commit that
+        # added this step. Two were ``# type: ignore[...]`` comments naming an
+        # error code mypy does not report here (``arg-type`` for an overload
+        # failure, ``import-untyped`` for a namespace-package attribute), so they
+        # suppressed nothing — nobody could have known, because nothing ever ran
+        # mypy over these files to say so.
+        #
+        # ``--config-file`` is required, not stylistic: common/ has no
+        # pyproject.toml and the repo root has no [tool.mypy], and mypy resolves
+        # config from the CWD rather than walking up from the files it checks
+        # (ruff does walk up, which is why common/ruff.toml needs no flag). Drop
+        # the flag and this runs at mypy's bare defaults, which reports 17 —
+        # the 12 plus 5 missing-stub errors for optional deps — so the failure
+        # mode is a noisier gate, not an absent one. See common/mypy.ini.
+        run: uv run mypy --config-file common/mypy.ini common/
+
+      - name: Run mypy (scripts/)
+        # Repo-root scripts/ was type-checked by nothing, for the same structural
+        # reason common/ was: not a service src/ tree, no pyproject.toml of its
+        # own, and no root [tool.mypy], so it appeared in no mypy scope above.
+        #
+        # It is not an idle tree. scripts/forge_dry_run.py carried the other half
+        # of the forge cron outage — the same ``from common.llm import
+        # LLMRequest`` as core-api's cron_handler, a name that has never existed
+        # there, with an ``except`` that returned a stub so the CLI had never used
+        # a real LLM either. #955 repaired both halves; #983 gated the service
+        # one. This is the same gate one layer out, and re-injecting that import
+        # confirms it fires:
+        #
+        #   scripts/forge_dry_run.py:120: error: Module "common.llm" has no
+        #   attribute "LLMRequest"  [attr-defined]
+        #
+        # MUST run from the repo root. ``mypy_path`` in scripts/mypy.ini is
+        # resolved against the CWD, not against the config file, so a step that
+        # ``cd``s into scripts/ first would silently degrade every core_api.*
+        # import to Any under ignore_missing_imports — the exact gap #983 closed
+        # for the services. ``--config-file`` is required for the usual reason
+        # (mypy resolves config from the CWD and does not walk up); without it
+        # this reports 84 errors in 38 files at bare defaults instead of the 29
+        # files it owns.
+        #
+        # Six modules are exempt BY NAME in scripts/mypy.ini, not by glob, so a
+        # new script is gated the day it lands. Shrinking that list is the
+        # backlog; the gate deliberately landed without it.
+        run: uv run mypy --config-file scripts/mypy.ini scripts/
+
+      - name: Enable pgvector extension
+        run: PGPASSWORD=changeme psql -h localhost -U caura -d caura -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+      - name: Run migrations
+        run: alembic upgrade head
+        env:
+          PYTHONPATH: core-api/src:core-storage-api/src:.
+          POSTGRES_HOST: localhost
+          POSTGRES_USER: caura
+          POSTGRES_PASSWORD: changeme
+          POSTGRES_DB: caura
+          POSTGRES_REQUIRE_SSL: "false"
+
+      - name: Run tests
+        run: |
+          uv run pytest tests/ \
+            -v --tb=short -m "not benchmark" \
+            --cov=core-api/src/core_api \
+            --cov=core-storage-api/src/core_storage_api \
+            --cov-report=xml \
+            --cov-report=term-missing
+        env:
+          PYTHONPATH: core-api/src:core-storage-api/src:.
+          POSTGRES_HOST: localhost
+          POSTGRES_USER: caura
+          POSTGRES_PASSWORD: changeme
+          POSTGRES_DB: caura
+          POSTGRES_REQUIRE_SSL: "false"
+          TEST_DATABASE_URL: "postgresql+asyncpg://caura:changeme@localhost:5432/caura"
+          EMBEDDING_PROVIDER: fake
+          ENTITY_EXTRACTION_PROVIDER: none
+          USE_LLM_FOR_MEMORY_CREATION: "false"
+
+      - name: Enforce coverage floors (per package)
+        # The step above collects coverage but enforced no floor. Both packages
+        # declare ``[tool.coverage.report] fail_under = 50``, and coverage
+        # discovers config relative to the CWD — with no root pyproject.toml,
+        # running pytest from the repo root meant neither floor was ever read.
+        # Measured at the time of writing: core-api 83%, core-storage-api 67%.
+        #
+        # Enforced PER PACKAGE rather than on the combined total, because the
+        # blend is dominated by core-api (15,156 statements against 5,558) and
+        # would mask a collapse in the smaller one: core-storage-api falling to
+        # 30% still leaves a combined ~69%, comfortably over a 50% blended
+        # floor. Two declarations mean two floors.
+        #
+        # ``--rcfile`` points at each package's own pyproject so the number
+        # lives in exactly one place; hardcoding 50 here would let the workflow
+        # drift from the declaration it is meant to enforce. Reuses the data
+        # file the pytest run just wrote, so the suite is not run twice.
+        #
+        # Both reports run unconditionally, via ``|| status=1`` rather than
+        # back-to-back commands: GitHub runs a multi-line ``run`` under
+        # ``bash -e``, so a core-api breach would abort the step and a
+        # simultaneous core-storage-api breach would stay invisible until the
+        # first was fixed. Exiting once at the end keeps the step failing on
+        # either breach while always reporting both.
+        run: |
+          status=0
+          uv run coverage report \
+            --rcfile=core-api/pyproject.toml \
+            --include="core-api/src/core_api/*" || status=1
+          uv run coverage report \
+            --rcfile=core-storage-api/pyproject.toml \
+            --include="core-storage-api/src/core_storage_api/*" || status=1
+          exit "$status"
+
+      - name: Run core-api unit tests
+        # core-api/tests/ is core-api's own tree, separate from the repo-root
+        # tests/ above, and no step ran it — an explicit path overrides the
+        # root pytest.ini's ``testpaths``. It holds the only regression cover
+        # for the tenantless ``AuthContext.enforce_tenant(None)`` write gate
+        # and for broker write attribution (``_broker_write_agent_id``), so a
+        # revert of either would have merged green.
+        # ``tests/test_ci_runs_every_service_test_tree.py`` now fails if any
+        # service tree drops out of the pytest or ruff steps.
+        #
+        # No env, deliberately: these are pure unit tests (no database, no
+        # settings), and the root pytest.ini — which pytest resolves for this
+        # path, since core-api/pyproject.toml carries no pytest table — puts
+        # core-api/src and the repo root on the path.
+        run: uv run pytest core-api/tests/ -v --tb=short
+
+      - name: Create the storage-suite database
+        # Its own database, NOT the one `tests/` uses. The two suites provision
+        # differently — `tests/` conftest calls Base.metadata.create_all, the
+        # storage conftest runs the real Alembic chain via init_database(). On a
+        # shared database whichever ran first would win: create_all going first
+        # leaves tables with no alembic_version, so init_database() stamps head
+        # and skips the migrations, and every migration-only table (e.g.
+        # tenant_suppression, which has no ORM model) stays missing. Isolating
+        # removes that ordering coupling instead of relying on step order.
+        #
+        # Idempotent: Postgres has no CREATE DATABASE IF NOT EXISTS, so this
+        # guards on pg_database and creates only when absent. Fed via stdin
+        # rather than -c because \gexec is a psql meta-command and -c sends
+        # its argument as a single SQL string (where \gexec is a syntax
+        # error). ON_ERROR_STOP=1 is kept deliberately over the simpler
+        # `|| true`, which would also swallow a genuine connection or auth
+        # failure and defer the confusion to the pytest step below.
+        run: |
+          PGPASSWORD=changeme psql -h localhost -U caura -d caura -v ON_ERROR_STOP=1 <<'SQL'
+          SELECT 'CREATE DATABASE caura_storage'
+          WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'caura_storage')\gexec
+          SQL
+
+      - name: Run core-storage-api integration tests
+        run: uv run pytest core-storage-api/tests/ -v --tb=short
+        env:
+          PYTHONPATH: core-api/src:core-storage-api/src:.
+          POSTGRES_REQUIRE_SSL: "false"
+          # This suite reads DATABASE_URL (not TEST_DATABASE_URL) — its conftest
+          # migrates whatever core_storage_api.config points at.
+          DATABASE_URL: "postgresql+asyncpg://caura:changeme@localhost:5432/caura_storage"
+          EMBEDDING_PROVIDER: fake
+          ENTITY_EXTRACTION_PROVIDER: none
+          USE_LLM_FOR_MEMORY_CREATION: "false"
+
+      - name: Run core-operations tests
+        # This tree was unrun for as long as it was unlinted — the same blind
+        # spot the core-storage-api ruff step above describes, and both halves
+        # close here. It covers the cron-scheduling surface: wall-clock
+        # alignment, per-job *_run_at_hour threading, the fanout POST paths and
+        # the scheduler's failure/hot-loop guards.
+        #
+        # No env needed, deliberately. core-operations/pytest.ini sets its own
+        # ``pythonpath = src ..`` (src for core_operations, .. for common) and
+        # pytest resolves that file as the configfile for this path, so it does
+        # NOT inherit the root pytest.ini. Adding PYTHONPATH here would be
+        # inert. These tests touch no database either — the Postgres service is
+        # already up for the steps above, but nothing here uses it, so the step
+        # costs well under a second.
+        #
+        # ``--cov-config`` is load-bearing, not decoration. core-operations
+        # declares ``[tool.coverage.report] fail_under = 50``, but coverage
+        # discovers config relative to the CWD and there is no root
+        # pyproject.toml — so running from the repo root without this flag
+        # collects coverage while silently ignoring the floor. With it, the run
+        # prints "Required test coverage of 50.0% reached" and fails below it.
+        # Currently ~80%.
+        run: |
+          uv run pytest core-operations/tests/ -v --tb=short \
+            --cov=core-operations/src/core_operations \
+            --cov-config=core-operations/pyproject.toml \
+            --cov-report=term-missing
+        env:
+          # Keep this run's data file separate from the root suite's, which
+          # uploads coverage.xml to Codecov.
+          COVERAGE_FILE: .coverage.core-operations
+
+      - name: Run core-worker tests
+        # core-worker had NO CI of any kind — the tree was never installed,
+        # linted, type-checked or run, while being the production write path in
+        # deferred/SaaS mode (``handle_embed_request``, the embed-backfill sweep
+        # consumer, the enrich consumer). Same blind spot the core-operations
+        # step above closed, on a service with more production surface.
+        #
+        # Two things that had rotted behind it, both fixed in this PR:
+        #   * ``test_post_gives_up_after_max_attempts_on_connect_timeout``
+        #     asserted a hardcoded 3 attempts and had been failing since the
+        #     connect-phase budget was raised to 5 after the 2026-06-16 prod
+        #     incident. It now asserts ``CONNECT_PHASE_MAX_ATTEMPTS`` itself.
+        #   * caura#786 threaded embedding provenance through every write path
+        #     EXCEPT this one, caught only by human review.
+        #
+        # No PYTHONPATH, deliberately — core-worker/pytest.ini sets its own
+        # ``pythonpath = src ..`` (src for core_worker, .. for common) and
+        # pytest resolves it as the configfile for this path rather than
+        # inheriting the root pytest.ini, so an env var here would be inert.
+        # Verified by running the suite with PYTHONPATH unset. No database
+        # either: the conftest pins ``EVENT_BUS_BACKEND=inprocess``.
+        #
+        # ``--cov-config`` is load-bearing for the same reason as
+        # core-operations: core-worker declares ``fail_under = 50`` and coverage
+        # discovers config relative to the CWD, so without the flag the run
+        # collects coverage while silently ignoring the floor. Currently ~70%.
+        run: |
+          uv run pytest core-worker/tests/ -v --tb=short \
+            --cov=core-worker/src/core_worker \
+            --cov-config=core-worker/pyproject.toml \
+            --cov-report=term-missing
+        env:
+          COVERAGE_FILE: .coverage.core-worker
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+
+      - name: Build packages
+        # core-operations included now that CI installs, lints, type-checks and
+        # tests it — a broken pyproject/build-backend would otherwise surface
+        # only in its Docker build. core-worker joins for exactly the same
+        # reason, now that this workflow covers it: it ships as a package with
+        # its own pyproject, and until this PR nothing here exercised any of it.
+        run: |
+          cd core-api && uv build && cd ..
+          cd core-storage-api && uv build && cd ..
+          cd core-operations && uv build && cd ..
+          cd core-worker && uv build
+
+  image-version:
+    # Guards the /api/v1/version surface end-to-end: builds the actual
+    # core-api image and asserts it bakes a real semver (== pyproject),
+    # not "dev". This is the regression that silently shipped for weeks —
+    # the prod Dockerfile installs deps via ``uv export --no-emit-project``
+    # so core-api is never installed as a package, leaving importlib.metadata
+    # with nothing to resolve → "dev". A pytest check can't catch it: CI
+    # installs core-api editable, so the bug only exists inside the built
+    # image. See core-api/Dockerfile version stamp +
+    # core_api.constants._resolve_version().
+    name: core-api image bakes a real version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # Local-only tag shared by the two images used for the README Compose
+      # check below. Keeping this job's existing display name avoids changing
+      # the branch-protection status context while broadening its runtime-image
+      # coverage.
+      CAURA_VERSION: readme-ci
+      COMPOSE_PROFILES: ""
+      README_COMPOSE_PROJECT: "readme-quickstart-${{ github.run_id }}"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build core-api image
+        run: |
+          docker build --platform linux/amd64 --target runtime \
+            -t core-api-versiontest \
+            -f core-api/Dockerfile .
+          compose_image="$(
+            docker compose --env-file /dev/null --file docker-compose.yml \
+              --project-name "$README_COMPOSE_PROJECT" config --format json |
+              python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["core-api"]["image"])'
+          )"
+          docker tag core-api-versiontest "$compose_image"
+
+      - name: Assert baked version is a real semver matching pyproject
+        run: |
+          BAKED=$(docker run --rm core-api-versiontest python -c "from core_api.constants import VERSION; print(VERSION)")
+          EXPECTED=$(python3 -c "import tomllib; print(tomllib.load(open('core-api/pyproject.toml','rb'))['project']['version'])")
+          echo "baked=$BAKED expected=$EXPECTED"
+          if [ "$BAKED" = "dev" ] || ! echo "$BAKED" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::core-api image did not bake a real semver (got '$BAKED'). /api/v1/version would serve a bogus value — see core-api/Dockerfile + core_api.constants._resolve_version."
+            exit 1
+          fi
+          if [ "$BAKED" != "$EXPECTED" ]; then
+            echo "::error::baked version '$BAKED' != pyproject '$EXPECTED' — the version stamp drifted from the source of truth."
+            exit 1
+          fi
+
+      # Same class of bug as the version stamp above, and equally invisible to
+      # pytest: CI installs core-api editable, so a module that is only present
+      # transitively still imports fine in the test job while being absent from
+      # the built image. numpy was exactly this — it arrived via pgvector <0.5.0,
+      # and when 0.5.0 made it optional the insights discover mode silently
+      # degraded to its non-clustered fallback in production for days (the
+      # fallback logs a warning but the run still reports success). Assert the
+      # modules the runtime code imports directly are actually in the image.
+      - name: Assert directly-imported runtime deps are present in the image
+        run: |
+          docker run --rm core-api-versiontest python -c "import numpy; print('numpy', numpy.__version__)" || {
+            echo "::error::numpy is missing from the core-api image — insights discover mode would silently fall back to non-clustered analysis. It must stay declared in core-api/pyproject.toml (see services/insights_service.py::_numpy_kmeans)."
+            exit 1
+          }
+
+      - name: Build core-storage-api image for README quickstart
+        run: |
+          docker build --platform linux/amd64 --target runtime \
+            -t core-storage-api-readmetest \
+            -f core-storage-api/Dockerfile .
+          compose_image="$(
+            docker compose --env-file /dev/null --file docker-compose.yml \
+              --project-name "$README_COMPOSE_PROJECT" config --format json |
+              python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["core-storage-api"]["image"])'
+          )"
+          docker tag core-storage-api-readmetest "$compose_image"
+
+      # M-109: the stock stack runs the lifecycle scheduler. ``--no-build`` below
+      # needs its image too, under the name Compose resolves for it.
+      - name: Build core-operations image for README quickstart
+        run: |
+          docker build --platform linux/amd64 --target runtime \
+            -t core-operations-readmetest \
+            -f core-operations/Dockerfile .
+          compose_image="$(
+            docker compose --env-file /dev/null --file docker-compose.yml \
+              --project-name "$README_COMPOSE_PROJECT" config --format json |
+              python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["core-operations"]["image"])'
+          )"
+          docker tag core-operations-readmetest "$compose_image"
+
+      - name: Start the documented keyless stack
+        run: |
+          if [ ! -f .env.example ] || [ -L .env.example ]; then
+            echo "::error::.env.example must be a regular file"
+            exit 1
+          fi
+          rm -f -- .env
+          install -m 0600 -- .env.example .env
+          echo "IS_STANDALONE=true" >> .env
+          docker compose --env-file /dev/null --file docker-compose.yml \
+            --project-name "$README_COMPOSE_PROJECT" \
+            up --detach --no-build --wait --wait-timeout 180
+
+      - name: Run README write-and-search curl block
+        run: python3 scripts/check_readme_quickstart.py
+
+      # M-109: every scheduler tick calls an admin-only core-api endpoint with the
+      # key admin-key-init generated. If the two services resolved different keys,
+      # every tick would 403 while both containers report healthy, so call one
+      # read-only admin endpoint from inside the scheduler's container, with the
+      # key its own settings resolved.
+      - name: Assert the bundled scheduler reaches core-api's admin plane
+        run: |
+          docker compose --env-file /dev/null --file docker-compose.yml \
+            --project-name "$README_COMPOSE_PROJECT" \
+            exec -T core-operations python -c '
+          import httpx
+          from core_operations.config import settings
+          resp = httpx.get(
+              f"{settings.core_api_url}/api/v1/admin/lifecycle/embedding-coverage",
+              headers={"X-API-Key": settings.core_api_admin_api_key},
+              timeout=30,
+          )
+          print(resp.status_code, resp.text[:200])
+          resp.raise_for_status()
+          '
+
+      - name: Show README quickstart logs on failure
+        if: failure()
+        run: |
+          docker compose --env-file /dev/null --file docker-compose.yml \
+            --project-name "$README_COMPOSE_PROJECT" logs --no-color
+
+      - name: Stop README quickstart stack
+        if: always()
+        run: |
+          docker compose --env-file /dev/null --file docker-compose.yml \
+            --project-name "$README_COMPOSE_PROJECT" down --volumes
+
+  legacy-name-ratchet:
+    # Hard rule 7 of the sunset plan: mint nothing new carrying the old brand.
+    # Every one adds a redirect somebody has to keep forever and spends a rename
+    # option already paid for — and the programme runs for weeks with ordinary
+    # feature work alongside it, so the rule needs a gate rather than a
+    # reviewer's attention.
+    #
+    # A separate job on purpose: it needs no Postgres, no uv and no install, so
+    # it reports in seconds instead of waiting behind the suite, and its status
+    # check reads on its own terms rather than as one more way for "CI" to be red.
+    #
+    # ``depth=1`` is enough. On a ``pull_request`` the checkout is already the
+    # merge commit, so main's tree is the exact base for this PR's contribution
+    # and no merge-base walk is needed. Same anonymous fetch the broker gate uses.
+    name: Legacy-name ratchet
+    runs-on: ubuntu-latest
+    # Seconds of work; the only thing that can hang is the fetch.
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: No new old-brand names
+        run: |
+          git fetch --no-tags --depth=1 origin main
+          python3 scripts/legacy_name_ratchet.py --base origin/main
+
+  do-not-touch-sentinel:
+    # The other half of hard rule 4. The ratchet above is directional — it fails a
+    # file whose old-brand count goes UP — so a sweep that DELETES a load-bearing
+    # string reads as progress and passes. This job asserts the same list in the
+    # other direction, and must exist before the Phase 1.3 and Phase 7 sweeps.
+    #
+    # Not every string it guards carries the brand: three are ordinary English
+    # that a CRITICAL production Datadog monitor matches on as a regex substring.
+    # Reword one and the alert stops firing with nothing in the tree to fail.
+    #
+    # No fetch and no base. Unlike the ratchet this is not a comparison — the
+    # question is whether the strings are in the tree being built, so the
+    # checkout alone answers it.
+    name: Do-not-touch sentinel
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load-bearing strings survive
+        run: python3 scripts/do_not_touch_sentinel.py

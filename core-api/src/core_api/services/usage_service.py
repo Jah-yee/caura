@@ -1,0 +1,413 @@
+"""Usage metering — a no-op in OSS standalone, hook-backed on a platform deploy.
+
+OSS standalone has no usage limits, so with no hook wired every call here
+returns "allowed, unlimited" and records nothing. That is the intended
+behaviour, not a gap: the core engine must run without a billing plane.
+
+A platform deployment wires ``ServiceHooks.usage_meter`` at startup and these
+functions delegate to it, which is what connects the write paths to durable
+per-period counters.
+
+WHY THIS AND NOT ``capability_usage``
+-------------------------------------
+core-api already counts per-tenant operations —
+``services/capability_usage.py``, fed by ``middleware/request_observation.py``.
+That path is deliberately lossy: it buffers in memory and its own docstring
+notes counts "are lost if the process dies", and it appends rows to be SUMmed
+rather than upserting a period total. Right for adoption analytics, unfit for
+anything a plan cap is computed from. Hence a second, exact path rather than a
+rewrite of that one.
+
+METERING, NOT ENFORCEMENT — AND THAT IS BY DESIGN
+--------------------------------------------------
+Nothing in core-api reads the returned ``allowed``, and that is not an
+oversight waiting to be corrected. Enforcement arrives out-of-band: the
+platform computes "over plan" from the persisted counters and stamps
+``x-org-read-only`` on the request, which ``AuthContext.is_read_only`` reads
+and ``enforce_usage_limits()`` turns into a 403 at ~22 write routes. So a hook
+returning ``allowed=False`` blocks nothing here, by design — the decision it
+would express is already travelling a different way.
+
+What the result IS used for: the ``X-Usage-Limit`` / ``X-Usage-Remaining``
+response headers on three routes, via ``set_usage_headers`` below. Everything
+else discards it. Those headers were called ``X-RateLimit-*`` until this
+module grew ``set_usage_headers``; see the note beside the constants for why
+that name could not stay.
+
+Implementation guidance for the platform side: enqueue and return ``None``.
+This runs on the write path, and this codebase has twice moved off per-request
+round-trips there — CAURA-628 for audit, and ``capability_usage``'s in-memory
+aggregation. Report counters only when doing so costs no network call.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime
+from typing import TYPE_CHECKING, Literal, get_args
+
+from core_api.services.hooks import get_hooks
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from starlette.responses import Response
+
+logger = logging.getLogger(__name__)
+
+OperationType = Literal["write", "search", "recall", "insights", "evolve"]
+
+# --- Per-verb usage policy: what a mutating operation costs, and what gates it -
+#
+# TWO INDEPENDENT AXES, and they do not line up. Collapsing them into one
+# boolean is wrong for ``update``, which charges the write budget but is NOT
+# refused when the org is over plan:
+#
+#     verb          charges write budget   refused when over plan
+#     create               yes                     yes
+#     bulk_create          yes                     yes
+#     update               yes                     NO      <-- see below
+#     redistribute         yes                     yes
+#     transition            no                      no
+#     delete                no                      no
+#     bulk_delete           no                      no
+#
+# Both axes previously existed only as the presence or absence of a call at
+# each REST route and each MCP tool, so "free" was expressed by an omission —
+# invisible in review. That is how the surfaces drifted: the same tenant at its
+# cap was refused a status transition over REST (``enforce_usage_limits()`` on
+# ``PATCH /memories/{id}/status``) and allowed one over MCP
+# (``caura_manage(op="transition")``, which checked nothing).
+#
+# THE DECISION: transitions and deletes are free and ungated by plan limits, on
+# both surfaces.
+#
+# The principle is GROWTH, not direction. Read-only mode exists to stop an
+# over-plan org adding to the store; ``AuthContext.enforce_usage_limits`` spells
+# out the corollary — "users in read-only mode must be able to delete data to
+# get back under limits". A status transition writes one column on a row that
+# already exists. It adds nothing, in EITHER direction: ``active -> archived``
+# and ``archived -> active`` leave the store exactly the same size, so neither
+# is the thing read-only mode is defending against.
+#
+# That direction-independence is deliberate and was questioned in review, so the
+# reasoning is recorded rather than left implicit. Reactivating an archived
+# memory looks like it should cost something, but against the counters this
+# service actually maintains it cannot: ``tenant_usage_counters`` is keyed
+# ``(tenant_id, operation, period_start)`` — a monotonic count of OPERATIONS per
+# period, with no active-row or footprint dimension anywhere. There is no
+# quantity for a reactivation to inflate, and equally none for an archive to
+# reduce. Both directions are inert.
+#
+# ⚠ REVISIT IF THAT CHANGES. If a plan ever meters live rows (an "active
+# memories" cap rather than an operations-per-period cap), then archiving really
+# would reduce usage and reactivating really would raise it, and this verb stops
+# being safe to treat as one thing — it would need to discriminate on the
+# ``old_status -> new_status`` pair. Note that such a fix is only implementable
+# on REST today, and the reason has now moved twice. It first said MCP "cannot
+# see plan-limit mode at all" (false since the middleware started reading the
+# header), then that MCP sees it but never refuses (false since
+# ``enforce_mcp_plan_limits`` landed). What is left is narrower and flag-shaped:
+# MCP refuses only when that setting is ON, so a direction-discriminating gate
+# added here would hold on both surfaces with it on, and rebuild the exact
+# surface drift this table exists to close with it off. Until the flag is the
+# default, treat such a gate as REST-only.
+#
+# ``enforce_read_only()`` is NEITHER axis. That is the demo-mode gate, a
+# separate question, and it stays on the transition route.
+#
+# ``update`` charges quota and is deliberately NOT plan-limit gated: an update
+# rewrites a row rather than adding one, so it does not grow the store, which
+# is the principle this table encodes. That omission is a decision, not the
+# oversight it once sat beside — ``update`` also skipped ``enforce_read_only()``
+# and so was gated by neither, which let a read-only credential rewrite any
+# memory in its tenant (caura-ai/caura#1204). That half is now closed: the route
+# calls ``enforce_read_only()`` like every other mutating memory route, which is
+# what makes the remaining omission legible as a choice.
+WRITE_QUOTA_OPS: frozenset[str] = frozenset({"create", "bulk_create", "update", "redistribute"})
+
+# Ops refused when the org is over its plan limit. A subset of the above minus
+# ``update`` — see the note on it.
+#
+# ENFORCED ON BOTH SURFACES NOW, BUT NOT BY DEFAULT ON MCP. This comment has
+# been wrong twice in the same direction, so it is worth stating the history:
+# it first said MCP "has no read-only signal at all" (false once
+# ``MCPAuthMiddleware`` started reading ``x-org-read-only``), then that MCP sees
+# the signal but never refuses (false once ``enforce_mcp_plan_limits`` landed).
+#
+# Current state: ``mcp_server._check_plan_limit`` consults this set and returns
+# a refusal envelope when ``enforces_mcp_plan_limits()`` is on, or logs
+# ``mcp_plan_limit_would_refuse`` and allows the write when it is off — the
+# default. So an op listed here is gated on REST unconditionally and on MCP only
+# where that setting is enabled. ``transition`` is still deliberately NOT
+# listed, and while the flag is off the old asymmetry is still the shipped
+# behaviour for everything that is.
+#
+# ``redistribute`` is not exposed as an MCP tool, so this list's MCP-reachable
+# members are ``create`` and ``bulk_create``; both are wired.
+#
+# IF YOU EDIT THIS SET, the MCP side follows automatically — the call sites
+# consult ``plan_limit_gated`` rather than naming ops, so this stays the single
+# policy record.
+PLAN_LIMIT_GATED_OPS: frozenset[str] = frozenset({"create", "bulk_create", "redistribute"})
+
+# Typed so a mistyped verb is a mypy error at the call site rather than a
+# ``ValueError`` at request time — i.e. a 500 for the caller.
+#
+# It does NOT catch today's call sites, and the honest reason is worth writing
+# down rather than discovering later: ``core_api.routes.memories`` and
+# ``core_api.mcp_server`` are both on the ``ignore_errors`` list in
+# ``core-api/pyproject.toml``, which is where every lookup added here lives.
+# Verified by mistyping one and watching mypy still report success. So the
+# runtime check below is the ACTUAL protection at those two call sites, not a
+# belt-and-braces extra — do not delete it on the assumption the type covers it.
+# The annotation still earns its place: it is correct for callers outside the
+# exempted modules, and it starts working for these the day either module comes
+# off that list, which the config itself calls a to-do rather than a policy.
+MutatingOp = Literal["create", "bulk_create", "update", "redistribute", "transition", "delete", "bulk_delete"]
+
+_KNOWN_OPS: frozenset[str] = frozenset(get_args(MutatingOp))
+
+
+def _known(op: str) -> str:
+    """Reject an unrecognised verb rather than answering a question nobody asked.
+
+    Defaulting either way is silent: a new mutating op would be quietly free
+    (revenue leak) or quietly charged (surprise refusals). Raising makes adding
+    one a decision.
+    """
+    if op not in _KNOWN_OPS:
+        raise ValueError(
+            f"No usage policy for operation {op!r}. Add it to the tables in "
+            f"usage_service — known: {sorted(_KNOWN_OPS)}."
+        )
+    return op
+
+
+def charges_write_quota(op: MutatingOp) -> bool:
+    """Whether ``op`` costs write budget (i.e. calls ``check_and_increment``)."""
+    return _known(op) in WRITE_QUOTA_OPS
+
+
+def plan_limit_gated(op: MutatingOp) -> bool:
+    """Whether ``op`` is refused when the org is over its plan limit."""
+    return _known(op) in PLAN_LIMIT_GATED_OPS
+
+
+# One traceback per failed write would turn a meter outage into a log-volume
+# incident on top of a metering one. Same throttle shape as ``audit_queue``'s
+# drop counter, for the same reason.
+_METER_FAILURE_LOG_EVERY = 100
+_meter_failures = 0
+
+
+@dataclass
+class UsageCheckResult:
+    """What a meter reports back. Only ``limit`` and ``remaining`` are read.
+
+    The rest default so a platform implementation constructs what it actually
+    knows rather than filling six slots to deliver two — and so it is not
+    nudged into setting ``allowed``, which core-api ignores (module docstring).
+    """
+
+    allowed: bool
+    operation: str
+    current: int = 0
+    limit: int | None = None
+    remaining: int | None = None
+    resets_at: datetime | None = None
+    plan: str = "free"
+
+    def get(self, key: str, default=None):
+        """Dict-style access for backward compatibility with route code."""
+        return getattr(self, key, default)
+
+
+def _allowed(op: str) -> UsageCheckResult:
+    return UsageCheckResult(allowed=True, operation=op)
+
+
+async def _meter(tenant_id: str, operation: OperationType, count: int) -> UsageCheckResult:
+    """Delegate to the wired meter, or report unlimited when there is none."""
+    global _meter_failures
+    hook = get_hooks().usage_meter
+    if hook is None:
+        return _allowed(operation)
+    try:
+        result = await hook(tenant_id=tenant_id, operation=operation, count=count)
+    except Exception:
+        # FAIL OPEN. This sits on the write path of every metered route, and a
+        # metering backend that is down must not turn into a failed customer
+        # write — losing a count is the cheaper error.
+        #
+        # ⚠ Revisit the moment ``allowed`` gains a reader in core-api:
+        # fail-open would then read "meter down ⇒ every tenant unlimited", the
+        # standard billing bypass. It is safe today only because enforcement
+        # travels via ``x-org-read-only`` instead (module docstring).
+        _meter_failures += 1
+        if _meter_failures == 1 or _meter_failures % _METER_FAILURE_LOG_EVERY == 0:
+            logger.exception(
+                "usage meter failed (%d since start) for tenant=%s operation=%s; reporting unlimited",
+                _meter_failures,
+                tenant_id,
+                operation,
+            )
+        return _allowed(operation)
+    # A hook may legitimately report nothing — it recorded the usage and has no
+    # counters to hand back. ``is not None`` rather than truthiness, so a
+    # falsy-but-valid result is not silently discarded.
+    return result if result is not None else _allowed(operation)
+
+
+def recall_operation() -> OperationType:
+    """D13 — which counter a recall (search + LLM brief) bills against.
+
+    Plans have carried separate ``searches`` / ``recalls`` limits since the
+    initial schema, and the platform hook maps ``"recall"`` to the ``recalls``
+    counter — but every recall call site passed ``"search"``, so the recalls
+    counter never moved and the per-plan recall cap could never fire
+    (canonical D13). The correct operation is gated behind
+    ``settings.meter_recall_as_recall`` (default off) because the recalls
+    counter feeds over-plan enforcement; see the setting's comment.
+    """
+    from core_api.config import settings
+
+    return "recall" if settings.meter_recall_as_recall else "search"
+
+
+def enforces_mcp_plan_limits() -> bool:
+    """Whether the MCP surface REFUSES an over-plan write (caura-ai/caura#1205).
+
+    The signal has been readable on this surface since the middleware started
+    honouring ``x-org-read-only``; what was missing is the refusal.
+    ``_check_plan_limit`` logs what it would have refused and lets the write
+    through. This flag turns that observation into enforcement.
+
+    Gated for the same reason as the two flags above, and more sharply: those
+    change what is COUNTED, this changes what is ALLOWED. An over-plan tenant
+    that can write over MCP today stops being able to. That is the intended end
+    state — the same tenant is already refused on REST, and answering
+    differently per transport is the drift #1205 exists to close — but it takes
+    capability away, so it is a decision rather than a deploy side effect.
+
+    ``plan_limit_gated(op)`` is still consulted at the call site. This flag is
+    the deploy-time gate; that table remains the policy record.
+
+    INTERACTS WITH ``meters_mcp_bulk_write``, which is now ON, so the batch path
+    does move the counters over-plan mode is computed from. That removes one
+    reason a quiet ``mcp_plan_limit_would_refuse`` log was not evidence the
+    blast radius is small. It does not remove the decisive one: nothing stamps
+    an org read-only from usage growth in the first place, so the log is quiet
+    for reasons that have nothing to do with how many tenants are over plan.
+    Read ``_check_plan_limit``'s docstring before enabling this.
+    """
+    from core_api.config import settings
+
+    return settings.enforce_mcp_plan_limits
+
+
+def meters_mcp_bulk_write() -> bool:
+    """Whether the MCP batch write bills the write counter (caura-ai/caura#1220).
+
+    ``caura_write(items=[...])`` reaches ``create_memories_bulk`` with no
+    metering call of any kind, while REST's ``POST /memories/bulk`` charges one
+    unit per item. Same tenant, same N memories, different bill.
+
+    Gated for the same reason as ``recall_operation`` above, and more sharply:
+    that one bills the wrong counter, this one billed nothing. ON by default
+    since caura-ai/caura#1638 — the decision recorded there was to close the
+    measurement gap before deciding on ``enforce_mcp_plan_limits``, and this is
+    the half of it that lives in this repo.
+
+    Enabling it charges for writes that were free, so tenants that batch over
+    MCP consume quota they did not before. It refuses nobody: the meter only
+    records (``allowed`` has no reader here, see ``_meter``), and the flag that
+    enforcement travels on is not set by usage growth at all — the setting's
+    comment in ``config.py`` carries that verification.
+
+    ``charges_write_quota("bulk_create")`` is still consulted at the call site.
+    This flag is the deploy-time gate; that table remains the policy record, so
+    a future change to it reaches this path like any other.
+    """
+    from core_api.config import settings
+
+    return settings.meter_mcp_bulk_writes
+
+
+async def check_and_increment(
+    tenant_id: str,
+    operation: OperationType,
+    count: int = 1,
+) -> UsageCheckResult:
+    """Record ``count`` of ``operation`` against ``tenant_id``.
+
+    The first parameter was named ``org_id``, which was safe only while the
+    body ignored it: every call site passes a tenant id. A meter trusting the
+    old name would have keyed those writes on the wrong entity.
+    """
+    return await _meter(tenant_id, operation, count)
+
+
+# The same function under the name five modules import it by — all of them as
+# ``check_and_increment_by_tenant as check_and_increment``, so no call site
+# spells it. An alias rather than a copy, so there is visibly one
+# implementation.
+check_and_increment_by_tenant = check_and_increment
+
+
+async def bulk_check_and_increment(
+    tenant_id: str,
+    count: int,
+) -> UsageCheckResult:
+    """Record a bulk write of ``count`` items as a single metered call."""
+    return await _meter(tenant_id, "write", count)
+
+
+# ── Publishing the counters: headers of their own ───────────────────────────
+#
+# These are the PERIOD QUOTA — "you may write N this billing period, M left" —
+# and they are deliberately NOT called ``X-RateLimit-*``.
+#
+# That name belongs to something else on this API. slowapi owns
+# ``X-RateLimit-Limit`` / ``-Remaining`` / ``-Reset`` for the per-second
+# throttle (``middleware/rate_limit.py``, ``headers_enabled=True``), and that
+# meaning is the one README and ``docs/api-reference.md`` publish: a client
+# reads them to back off BEFORE it is throttled. The quota headers used to
+# reuse the same two names, so a metered route answered with both — slowapi
+# appends rather than sets, so the response carried ``X-RateLimit-Limit``
+# twice, e.g. ``None`` then ``10``. HTTP says a client may join repeated
+# headers with a comma, and httpx/requests/fetch all do, so the value a caller
+# actually read back was ``"None, 10"``: not an integer, so ``int(...)`` raises
+# and any back-off arithmetic built on it fails. The throttle signal was
+# unusable on exactly the routes most likely to be throttled — ``POST
+# /memories`` and ``POST /search``.
+#
+# Two different quantities cannot share one header name, so the one with no
+# published contract moved. ``X-RateLimit-*`` now means the throttle and only
+# the throttle.
+USAGE_LIMIT_HEADER = "X-Usage-Limit"
+USAGE_REMAINING_HEADER = "X-Usage-Remaining"
+
+
+def set_usage_headers(response: Response, usage: UsageCheckResult | None) -> None:
+    """Publish period-quota counters on ``response`` — when there are any.
+
+    Absent headers mean "no quota to report", which is the honest answer for
+    the OSS default (no meter wired, ``_allowed()`` → ``limit=None``) and for a
+    platform meter that recorded the usage without handing counters back.
+
+    The call sites previously wrote ``str(usage.get("limit", "unlimited"))``,
+    and that default is unreachable: ``UsageCheckResult.get`` is
+    ``getattr(self, key, default)``, so a field that EXISTS and is ``None``
+    returns ``None`` rather than falling back — ``dict.get`` semantics, applied
+    to a dataclass whose fields all exist. Every unmetered response therefore
+    advertised the literal string ``"None"`` as its limit. Omitting beats
+    emitting either ``"None"`` or ``"unlimited"``: both are non-numeric values
+    in a numeric header, so both break the same ``int(...)`` the caller has to
+    write.
+    """
+    if usage is None:
+        return
+    if usage.limit is not None:
+        response.headers[USAGE_LIMIT_HEADER] = str(usage.limit)
+    if usage.remaining is not None:
+        response.headers[USAGE_REMAINING_HEADER] = str(usage.remaining)

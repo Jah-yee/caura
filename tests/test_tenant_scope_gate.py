@@ -1,0 +1,2313 @@
+"""The CI gate that keeps the storage tenancy invariant checkable.
+
+The script lives at ``scripts/tenant_scope_gate.py``. It enumerates every
+storage route and every public ``PostgresService`` method, and fails when one
+that takes no binding tenant scope is not accounted for in
+``core-storage-api/tenant_scope_allowlist.json``.
+
+What these tests are for: a gate is only worth having if it FAILS on the thing
+it claims to catch, and most of the ways this one could rot are silent. It could
+enumerate fewer routes than the app serves, classify a guarded route as unscoped
+(or, far worse, an unscoped one as guarded), or let the allowlist grow while
+still reporting green. Each of those gets a case below that injects the fault
+and asserts the gate notices.
+
+``test_trunk_is_green`` is the other half: the allowlist ships seeded, so the
+gate must pass on the tree as committed. A red gate on trunk is a gate somebody
+deletes on a Friday.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import re
+import subprocess
+import sys
+import textwrap
+import typing
+from pathlib import Path
+
+import pytest
+
+pytestmark = [pytest.mark.unit]
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = REPO_ROOT / "scripts" / "tenant_scope_gate.py"
+ALLOWLIST = REPO_ROOT / "core-storage-api" / "tenant_scope_allowlist.json"
+
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+import tenant_scope_gate as gate
+
+
+def _run(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *args],
+        check=False,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _classify(source: str) -> tuple[str, str]:
+    """Classify a single handler written as source, the way the gate does."""
+    node = ast.parse(source).body[0]
+    assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    return gate._classify_handler(node)
+
+
+# ---------------------------------------------------------------------------
+# The gate holds on the tree as committed
+# ---------------------------------------------------------------------------
+
+
+def test_trunk_is_green() -> None:
+    result = _run()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Allowlist comparison: no base given; nothing to compare." in result.stdout
+
+
+def test_every_allowlist_entry_claims_a_known_category() -> None:
+    """An unclassified entry is an unreviewed one, and the gate says so.
+
+    Asserted here as well as in the gate so the failure names the entry when a
+    regeneration adds a row and nobody fills the category in.
+    """
+    entries = json.loads(ALLOWLIST.read_text())["exceptions"]
+    unclassified = [
+        e["id"] for e in entries if e.get("category") not in gate.CATEGORIES
+    ]
+    assert not unclassified, f"entries with no valid category: {unclassified}"
+
+
+def test_the_file_documents_every_category_its_entries_claim() -> None:
+    """The reader of the JSON alone must be able to look up any category it uses.
+
+    This is the property the gate lost for a round: a category was added to the
+    script and one entry hand-edited to claim it, so the file's own
+    ``_categories`` explained six of the seven categories in use.
+    """
+    doc = json.loads(ALLOWLIST.read_text())
+    used = {e["category"] for e in doc["exceptions"]}
+    assert used - set(doc["_categories"]) == set(), (
+        "entries claim categories the file never explains"
+    )
+
+
+def test_category_doc_drift_is_caught(tmp_path: Path) -> None:
+    """Each way ``_categories`` can diverge from the script is an error.
+
+    Dropping a key is what actually happened; the other two are the same defect
+    seen from the other side, and are cheap to hold once the check is equality.
+    """
+    documented = dict(gate.CATEGORIES)
+    path = tmp_path / "allowlist.json"
+
+    def write(categories: dict[str, str]) -> None:
+        path.write_text(json.dumps({"_categories": categories, "exceptions": []}))
+
+    write(documented)
+    assert gate.check_category_doc(path) == [], "the generated block must be accepted"
+
+    dropped = dict(documented)
+    del dropped["grant-in-lieu-of-tenant"]
+    write(dropped)
+    assert "missing grant-in-lieu-of-tenant" in "".join(gate.check_category_doc(path))
+
+    write({**documented, "invented-offline": "added to the JSON but not the script"})
+    assert "unknown invented-offline" in "".join(gate.check_category_doc(path))
+
+    write(
+        {
+            **documented,
+            "id-addressed-read": "a description edited in the JSON, not the script",
+        }
+    )
+    assert "reworded id-addressed-read" in "".join(gate.check_category_doc(path))
+
+
+def test_a_plural_tenant_list_is_not_a_binding_scope() -> None:
+    """``tenant_ids`` names which tenants to span; it does not confine to one.
+
+    The gate cannot see whether such a list was derived from a verified
+    caller-tenant relationship or taken verbatim from the body, so crediting it
+    would be a false REQUIRED — the direction this gate must never be wrong in.
+
+    THIS TEST USED TO PIN A LIVE INSTANCE. ``POST /tenant-usage/query``
+    forwarded ``body.tenant_ids`` straight through, and the assertions here
+    named it by id. #1095 removed the plural field, so the example is gone and
+    ``tenant_usage_query`` now scores REQUIRED on a binding singular
+    ``tenant_id``. What survives is the rule, which is the part that has to
+    hold whether or not anything currently breaks it: the key stays out of
+    ``BINDING_SCOPE``, and no live method may be credited on a plural list.
+    """
+    assert "tenant_ids" not in gate.BINDING_SCOPE
+
+    # The former offender is fixed, and stays fixed: it is now bound.
+    entries = {e.key: e for e in gate.enumerate_methods()}
+    assert entries["tenant_usage_query"].verdict == "REQUIRED"
+
+    # The category outlives its last occupant. Nothing is filed under it now,
+    # and it stays DEFINED so a future offender has somewhere to land and the
+    # gate keeps flagging it as backlog rather than silently accepting it.
+    listed = json.loads(ALLOWLIST.read_text())["exceptions"]
+    assert not [e for e in listed if e["category"] == "grant-in-lieu-of-tenant"]
+    assert "grant-in-lieu-of-tenant" in gate.CATEGORIES
+    assert "grant-in-lieu-of-tenant" in gate.BACKLOG_CATEGORIES
+
+
+def test_the_id_addressed_backlog_is_split_by_blast_radius() -> None:
+    """Reads and writes by bare UUID are not the same finding and are not filed as one.
+
+    The flat category let "another tenant's row can be DELETED by UUID" sit in
+    the same count as "another tenant's row can be READ by UUID". The split was
+    the forcing function: the mutating half got fixed first, and as of #1082 the
+    write half is empty. The read half is still the backlog.
+    """
+    listed = json.loads(ALLOWLIST.read_text())["exceptions"]
+    used = {e["category"] for e in listed}
+    assert "id-addressed" not in used, (
+        "the flat category was retired; reclassify the entry"
+    )
+    assert {"id-addressed-write", "id-addressed-read"} <= set(gate.CATEGORIES)
+    assert gate.DESTRUCTIVE_CATEGORIES <= gate.BACKLOG_CATEGORIES
+
+    # There is deliberately no assertion that the write list is non-empty. It
+    # used to read ``assert writes, "an empty write backlog means the split
+    # silently collapsed"``, which held while the backlog was being worked
+    # through and became false the moment it was cleared: the census fails on
+    # the success case. Do not restore it — it would go red on green.
+    #
+    # Every route to an empty write list OTHER than the work being done is
+    # already covered, and each by a check that does not expire:
+    #
+    #   the category dropped altogether  -> the CATEGORIES assertion above
+    #   an entry carrying a bogus one    -> test_every_allowlist_entry_claims_
+    #                                       a_known_category, which also names
+    #                                       the offending entry
+    #   an entry relabelled as milder    -> ratchet's relabel guard, pinned by
+    #                                       test_ratchet_fails_when_a_mutating_
+    #                                       path_is_relabelled_as_a_read
+    #   an entry quietly appended        -> the allowlist ratchet
+    #
+    # which leaves deletion as the only way to reach zero, and deletion is what
+    # fixing one looks like.
+
+
+def test_a_multi_line_error_survives_as_one_annotation() -> None:
+    """``::error::`` is line-based, and the remedy is always on line two onward.
+
+    Every multi-line message here puts the diagnosis first and what to do about
+    it below. Emitted raw, GitHub keeps the first line as the annotation and
+    spills the rest into the log, dropping exactly the actionable half.
+    """
+    encoded = gate._as_annotation(
+        "the allowlist grew:\n      + method:x\n    Scope it."
+    )
+    assert "\n" not in encoded
+    assert encoded.count("%0A") == 2
+    assert "method:x" in encoded
+
+
+def test_annotation_encoding_does_not_eat_its_own_escapes() -> None:
+    """A literal ``%`` must not turn a following ``%0A`` into rendered text."""
+    encoded = gate._as_annotation("100% of routes\nsecond line")
+    assert encoded == "100%25 of routes%0Asecond line"
+
+
+def test_every_gate_error_is_emitted_as_a_single_line(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """End-to-end: nothing reaches a workflow command with a raw newline in it."""
+    entry = gate.Entry(
+        "method", "brand_new_unscoped", "NONE", "no binding tenant parameter"
+    )
+    errors = gate.check([entry], [], {})
+    assert errors and any("\n" in e for e in errors), (
+        "expected a multi-line error to test"
+    )
+
+    for err in errors:
+        line = f"::error::{gate._as_annotation(err)}"
+        assert line.count("\n") == 0
+
+
+def test_duplicate_allowlist_ids_are_rejected(tmp_path: Path) -> None:
+    """Two rows for one path is a silent, order-dependent choice between them.
+
+    The dict comprehension kept whichever came last. That is also a way past the
+    relabel guard: append a second copy of a mutating entry carrying a milder
+    category, and the lookup returns the milder one while the row still reads as
+    unchanged.
+    """
+    path = tmp_path / "allowlist.json"
+    path.write_text(
+        json.dumps(
+            {
+                "exceptions": [
+                    {
+                        "id": "method:x",
+                        "verdict": "NONE",
+                        "category": "id-addressed-write",
+                    },
+                    {"id": "method:x", "verdict": "NONE", "category": "no-tenant-data"},
+                ]
+            }
+        )
+    )
+    with pytest.raises(gate.AllowlistError) as excinfo:
+        gate.load_allowlist(path)
+    assert "method:x" in str(excinfo.value)
+
+
+def test_every_owned_entry_carries_a_tracked_issue() -> None:
+    """The owned backlog records who is accountable, and the file holds it.
+
+    A category says what the debt is. The issue is where paying it gets argued
+    and closed, so a note that loses its reference turns a tracked item back
+    into a line in a JSON file nobody is accountable for.
+    """
+    listed = json.loads(ALLOWLIST.read_text())["exceptions"]
+    owned = [e for e in listed if e["category"] in gate.TRACKED_CATEGORIES]
+    # No floor on the count. This asserted ``owned`` was non-empty, which was
+    # true while the owned backlog had entries and became a FAILURE the moment
+    # it was emptied — #1095 cleared the last ``grant-in-lieu-of-tenant`` and
+    # ``id-addressed-write`` has been empty since #1082. An empty owned backlog
+    # is the goal state, so the property here is "whatever is owned carries a
+    # reference", which is vacuously true at zero and still bites at one.
+    untracked = [
+        e["id"] for e in owned if not gate.ISSUE_REF.search(e.get("note") or "")
+    ]
+    assert not untracked, f"owned entries with no tracked issue: {untracked}"
+
+
+def test_owning_a_category_is_not_the_same_question_as_mutating() -> None:
+    """The two sets differ on purpose, and the difference is load-bearing.
+
+    ``grant-in-lieu-of-tenant`` destroys nothing, so it does not belong under a
+    name meaning "mutates" — but the caller names its own scope against a
+    service that authenticates nothing, so it needs an owner just as much.
+    Answering "needs an owner" with "mutates" is what left it unowned.
+    """
+    assert gate.DESTRUCTIVE_CATEGORIES < gate.TRACKED_CATEGORIES
+    assert "grant-in-lieu-of-tenant" in gate.TRACKED_CATEGORIES
+    assert "grant-in-lieu-of-tenant" not in gate.DESTRUCTIVE_CATEGORIES
+    # The bulk read backlog is deliberately unowned: 22 issues nobody reads is
+    # not accountability.
+    assert "id-addressed-read" not in gate.TRACKED_CATEGORIES
+    # Keeps the parametrised list below honest without making it read the
+    # constant at collection time, which would make this module uncollectible
+    # against any gate that predates it rather than just failing these tests.
+    assert set(_TRACKED) == gate.TRACKED_CATEGORIES
+
+
+_TRACKED = ("id-addressed-write", "grant-in-lieu-of-tenant")
+
+
+@pytest.mark.parametrize("category", _TRACKED)
+def test_an_owned_entry_without_an_issue_is_rejected(category: str) -> None:
+    """And the gate enforces it rather than trusting the file to stay right."""
+    entry = gate.Entry(
+        "method", "some_unscoped_path", "NONE", "no binding tenant parameter"
+    )
+    listed = {
+        "method:some_unscoped_path": {
+            "id": "method:some_unscoped_path",
+            "verdict": "NONE",
+            "category": category,
+            "note": "no reference here",
+        }
+    }
+    errors = gate.check([entry], [], listed)
+    assert any("no tracked issue" in e for e in errors), (
+        f"{category} was not required to name one"
+    )
+
+    listed["method:some_unscoped_path"]["note"] = "Tracked in #1234."
+    assert gate.check([entry], [], listed) == []
+
+
+def test_the_committed_allowlist_has_no_duplicates() -> None:
+    """The file as committed, not a fixture."""
+    ids = [e["id"] for e in json.loads(ALLOWLIST.read_text())["exceptions"]]
+    assert len(ids) == len(set(ids))
+
+
+def test_allowlist_holds_only_paths_that_still_exist() -> None:
+    """No stale rows: every entry corresponds to something the gate enumerated."""
+    live = {
+        e.ident
+        for e in gate.exceptions(gate.enumerate_methods() + gate.enumerate_routes())
+    }
+    listed = {e["id"] for e in json.loads(ALLOWLIST.read_text())["exceptions"]}
+    assert listed - live == set(), (
+        f"allowlisted but no longer unscoped: {sorted(listed - live)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# It fails on what it claims to catch
+# ---------------------------------------------------------------------------
+
+
+def test_a_new_unscoped_method_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The GHSA-wgvw shape: an id-addressed read with no tenant parameter."""
+    extra = gate.Entry(
+        "method", "memory_get_everything_by_id", "NONE", "no binding tenant parameter"
+    )
+    errors = gate.check([extra], [], _seeded_allowlist())
+    assert any("memory_get_everything_by_id" in e for e in errors)
+
+
+def test_an_unscoped_method_added_to_the_real_class_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end over the real class: enumerate, classify, then fail.
+
+    The cases around this one feed synthetic entries straight to ``check``,
+    which proves the accounting but not that enumeration would have found the
+    method in the first place. Attaching one to ``PostgresService`` exercises
+    the whole chain — and the chain is where a silent hole would be, since a
+    method the enumerator never yields is a method the gate never objects to.
+    """
+    from core_storage_api.services.postgres_service import PostgresService
+
+    async def memory_get_everything_by_id(self, *, memory_id: str) -> None:  # type: ignore[no-untyped-def]
+        """An id-addressed read with no tenant predicate."""
+
+    monkeypatch.setattr(
+        PostgresService,
+        "memory_get_everything_by_id",
+        memory_get_everything_by_id,
+        raising=False,
+    )
+
+    entries = _live_entries()
+    injected = [e for e in entries if e.key == "memory_get_everything_by_id"]
+    assert injected, "enumeration missed a method added to PostgresService"
+    assert injected[0].verdict == "NONE"
+
+    errors = gate.check(entries, [], _seeded_allowlist())
+    assert any("memory_get_everything_by_id" in e for e in errors)
+
+
+def test_a_scoped_method_added_to_the_real_class_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other direction: a properly scoped addition needs no allowlist line.
+
+    Without this, a gate that simply failed on every new method would pass every
+    test above while making the allowlist grow forever.
+    """
+    from core_storage_api.services.postgres_service import PostgresService
+
+    async def memory_get_scoped(self, *, memory_id: str, tenant_id: str) -> None:  # type: ignore[no-untyped-def]
+        """An id-addressed read that binds the tenant."""
+
+    monkeypatch.setattr(
+        PostgresService, "memory_get_scoped", memory_get_scoped, raising=False
+    )
+
+    entries = _live_entries()
+    injected = [e for e in entries if e.key == "memory_get_scoped"]
+    assert injected and injected[0].verdict == "REQUIRED"
+    assert gate.check(entries, [], _seeded_allowlist()) == []
+
+
+def test_a_new_unscoped_route_fails() -> None:
+    extra = gate.Entry(
+        "route", "GET /api/v1/storage/leak/{row_id}", "NONE", "no binding tenant read"
+    )
+    errors = gate.check([extra], [], _seeded_allowlist())
+    assert any("leak/{row_id}" in e for e in errors)
+
+
+def test_an_allowlisted_entry_with_no_category_fails() -> None:
+    entry = gate.Entry("method", "some_method", "NONE", "no binding tenant parameter")
+    errors = gate.check(
+        [entry],
+        [],
+        {"method:some_method": {"id": "method:some_method", "category": ""}},
+    )
+    assert any("no category" in e for e in errors)
+
+
+def test_an_allowlisted_entry_with_an_invented_category_fails() -> None:
+    """The closed set is the thing that keeps the list readable at ~120 rows."""
+    entry = gate.Entry("method", "some_method", "NONE", "no binding tenant parameter")
+    errors = gate.check(
+        [entry],
+        [],
+        {
+            "method:some_method": {
+                "id": "method:some_method",
+                "category": "its-fine-honest",
+            }
+        },
+    )
+    assert any("unknown category" in e for e in errors)
+
+
+def test_a_stale_allowlist_entry_fails() -> None:
+    """An entry for something now scoped must be deleted, not left to rot.
+
+    Without this the list only ever grows in practice: nobody removes a row
+    when they fix the path it describes, and the count stops meaning anything.
+    """
+    errors = gate.check(
+        [], [], {"method:long_since_fixed": {"category": "id-addressed-read"}}
+    )
+    assert any("no longer needs to be" in e for e in errors)
+
+
+def test_an_allowlisted_entry_that_lost_scope_fails() -> None:
+    """Staying on the list is not permission to get worse.
+
+    OPTIONAL still scopes a caller that passes the tenant; NONE cannot be
+    scoped at all. The identifier is the same either way, so comparing id sets
+    — which is all the first version of this gate did — reports green while a
+    path already granted an exception quietly stops being scopeable.
+    """
+    entry = gate.Entry(
+        "method", "memory_admin_list", "NONE", "no binding tenant parameter"
+    )
+    errors = gate.check(
+        [entry],
+        [],
+        {
+            "method:memory_admin_list": {
+                "verdict": "OPTIONAL",
+                "category": "admin-unscoped",
+            }
+        },
+    )
+    assert any("recorded as OPTIONAL and is now NONE" in e for e in errors)
+
+
+def test_an_unchanged_verdict_is_quiet() -> None:
+    entry = gate.Entry(
+        "method", "memory_admin_list", "OPTIONAL", "tenant_id is defaulted"
+    )
+    errors = gate.check(
+        [entry],
+        [],
+        {
+            "method:memory_admin_list": {
+                "verdict": "OPTIONAL",
+                "category": "admin-unscoped",
+            }
+        },
+    )
+    assert errors == []
+
+
+def test_a_widening_grant_without_a_binding_scope_fails() -> None:
+    """``readable_tenant_ids`` is only safe to omit when there is a fallback.
+
+    All eleven call sites today pair it with ``tenant_id``, so the ``else``
+    branch narrows to one tenant. A twelfth without that pairing would make
+    omitting the grant an unscoped read, which is the direction that matters.
+    """
+    grant = gate.Entry(
+        "grant",
+        "memory_search_everywhere",
+        "NONE",
+        "takes readable_tenant_ids with no binding tenant",
+    )
+    errors = gate.check([], [grant], {})
+    assert any("widening grant" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# The classifier reads the idioms the routers actually use
+# ---------------------------------------------------------------------------
+
+
+def test_require_helper_is_required() -> None:
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body = await request.json()\n"
+        "    tenant_id = _require(body, 'tenant_id')\n"
+    )
+    assert verdict == "REQUIRED"
+
+
+def test_every_fail_closed_guard_exists_and_raises() -> None:
+    """The trusted-guard list must describe functions that are really there.
+
+    A name in ``FAIL_CLOSED_GUARDS`` is a claim that calling it proves the route
+    rejects a missing tenant. Renaming a helper, or softening one so it returns
+    instead of raising, would leave the claim standing over code that no longer
+    backs it — and the gate would keep reading REQUIRED off it.
+    """
+    import ast as _ast
+
+    source = (
+        REPO_ROOT
+        / "core-storage-api"
+        / "src"
+        / "core_storage_api"
+        / "routers"
+        / "_validation.py"
+    ).read_text()
+    defined = {
+        n.name: n
+        for n in _ast.parse(source).body
+        if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+    }
+    for name in gate.FAIL_CLOSED_GUARDS:
+        assert name in defined, (
+            f"{name} is trusted as a guard but is not defined in _validation.py"
+        )
+        assert any(isinstance(s, _ast.Raise) for s in _ast.walk(defined[name])), (
+            f"{name} is trusted as a fail-closed guard but never raises"
+        )
+
+
+def test_a_lookalike_helper_is_not_trusted_as_a_guard() -> None:
+    """``_require_if_present`` starts with ``_require`` and promises the opposite.
+
+    The prefix match this replaced would have taken any such name as proof of
+    scoping — silently, and in the direction that removes the route from the
+    allowlist rather than adding it.
+    """
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    _require_if_present(body, 'tenant_id')\n"
+        "    return await svc.by_ids(body['ids'])\n"
+    )
+    assert verdict == "NONE"
+
+
+def test_subscript_is_required() -> None:
+    verdict, _ = _classify(
+        "async def h(request):\n    body = await request.json()\n    t = body['tenant_id']\n"
+    )
+    assert verdict == "REQUIRED"
+
+
+def test_bare_get_is_optional() -> None:
+    """``bulk-get``'s shape, and the reason this verdict exists at all."""
+    verdict, detail = _classify(
+        "async def h(request):\n"
+        "    body = await request.json()\n"
+        "    tenant_filter = body.get('tenant_id')\n"
+        "    return await svc.by_ids(body['ids'])\n"
+    )
+    assert verdict == "OPTIONAL"
+    assert "never rejects" in detail
+
+
+def test_inline_guard_after_get_is_required() -> None:
+    """``purge_tenant_data``'s shape: ``.get`` then an explicit reject.
+
+    Reading only ``_require`` classified two dozen correctly-guarded routes as
+    exceptions. That is not a safe direction to be wrong in either — an
+    allowlist padded with false positives is one reviewers skim.
+    """
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body = await request.json()\n"
+        "    tenant_id = body.get('tenant_id')\n"
+        "    if not isinstance(tenant_id, str) or not tenant_id:\n"
+        "        raise HTTPException(status_code=422, detail='required')\n"
+    )
+    assert verdict == "REQUIRED"
+
+
+def test_a_raise_nested_under_a_second_condition_is_not_a_guard() -> None:
+    """A missing tenant must reach the raise for the raise to be a guard.
+
+    ``if tenant_id: if something_else: raise`` mentions the tenant and contains
+    a raise, so searching the whole subtree credited it — but a request with no
+    tenant takes neither branch. Crediting it removes the route from the
+    allowlist, which is the invisible direction.
+    """
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    tenant_id = body.get('tenant_id')\n"
+        "    if tenant_id:\n"
+        "        if something_else:\n"
+        "            raise HTTPException(status_code=400, detail='unrelated')\n"
+    )
+    assert verdict == "OPTIONAL"
+
+
+def test_a_guard_that_only_fires_when_the_tenant_is_present_is_not_a_guard() -> None:
+    """``if tenant_id and flag: raise`` raises when the tenant IS there.
+
+    The question is not whether the tenant appears in the condition but whether
+    a request WITHOUT one reaches the raise. Here it does not — the `and`
+    short-circuits — so crediting it marks an unscoped route REQUIRED.
+    """
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    tenant_id = body.get('tenant_id')\n"
+        "    if tenant_id and other_flag:\n"
+        "        raise HTTPException(status_code=400, detail='unrelated')\n"
+    )
+    assert verdict == "OPTIONAL"
+
+
+def test_an_and_guard_with_a_non_scope_branch_is_not_a_guard() -> None:
+    """``if not tenant_id and unrelated: raise`` — absent plus a false flag passes."""
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    tenant_id = body.get('tenant_id')\n"
+        "    if not tenant_id and unrelated_flag:\n"
+        "        raise HTTPException(status_code=400, detail='unrelated')\n"
+    )
+    assert verdict == "OPTIONAL"
+
+
+def test_an_and_guard_over_two_binding_keys_is_a_guard() -> None:
+    """``if not tenant_id and not org_id: raise`` — neither present reaches the raise.
+
+    The one shape the ``and`` branch does credit: every operand is itself a
+    negative check on a binding key, so the test is false exactly when at least
+    one is present.
+    """
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    tenant_id = body.get('tenant_id')\n"
+        "    org_id = body.get('org_id')\n"
+        "    if not tenant_id and not org_id:\n"
+        "        raise HTTPException(status_code=400, detail='need one')\n"
+    )
+    assert verdict == "REQUIRED"
+
+
+def test_the_widening_grant_does_not_stand_in_for_a_binding_scope() -> None:
+    """``if not tenant_id and not readable_tenant_ids: raise`` is NOT a guard.
+
+    Structurally identical to the test above, and deliberately classified the
+    other way: ``readable_tenant_ids`` is the widening grant, supplied verbatim
+    by an unauthenticated caller, so satisfying the guard with it alone proves
+    nothing about entitlement. Crediting this shape would let the weaker of the
+    two satisfy the gate — a false REQUIRED, the invisible direction — so it
+    falls through to OPTIONAL and is carried explicitly under
+    ``grant-in-lieu-of-tenant``. Pinned because the pair reads as symmetric and
+    is not.
+    """
+    verdict, evidence = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    tenant_id = body.get('tenant_id')\n"
+        "    readable_tenant_ids = body.get('readable_tenant_ids')\n"
+        "    if not tenant_id and not readable_tenant_ids:\n"
+        "        raise HTTPException(status_code=400, detail='need one')\n"
+    )
+    assert verdict == "OPTIONAL", evidence
+
+
+def test_a_compound_or_guard_is_still_a_guard() -> None:
+    """The dominant real idiom, at eight sites — rejecting every BoolOp breaks it.
+
+    ``or`` is true if any branch is, so one negative check on the tenant carries
+    the whole test. Compoundness is not what separates a guard from a non-guard;
+    polarity is.
+    """
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    tenant_id = body.get('tenant_id')\n"
+        "    if not isinstance(tenant_id, str) or not tenant_id:\n"
+        "        raise HTTPException(status_code=422, detail='required')\n"
+    )
+    assert verdict == "REQUIRED"
+
+
+def test_a_pair_check_against_the_body_tenant_is_a_guard() -> None:
+    """``node.tenant_id != body.get("tenant_id")`` — GHSA-xw4x's own fix.
+
+    An absent tenant reads as None, which differs from the row's real tenant,
+    so the raise IS reached. Handling only ``is None`` / ``== None`` would have
+    scored the endpoint that closed that advisory as unscoped.
+    """
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    node = await svc.get_node(body['node_id'])\n"
+        "    if node is None or node.tenant_id != body.get('tenant_id'):\n"
+        "        raise HTTPException(status_code=404, detail='Node not found')\n"
+    )
+    assert verdict == "REQUIRED"
+
+
+def test_a_local_that_merely_shares_the_name_is_not_the_request() -> None:
+    """A ``tenant_id`` assigned from a config default is not what the caller sent."""
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    tenant_id = DEFAULT_TENANT\n"
+        "    if not tenant_id:\n"
+        "        raise HTTPException(status_code=400, detail='misconfigured')\n"
+        "    return await svc.by_ids(body['ids'])\n"
+    )
+    assert verdict == "NONE"
+
+
+def test_a_scope_popped_from_the_body_is_still_read_from_the_request() -> None:
+    """``update_memory`` pops the tenant so it cannot reach the column update.
+
+    Removing the key afterwards does not make it less of a read of the request.
+    """
+    verdict, _ = _classify(
+        "async def h(memory_id, request):\n"
+        "    body: dict = await request.json()\n"
+        "    tenant_id = body.pop('tenant_id', None)\n"
+        "    if not tenant_id:\n"
+        "        raise HTTPException(status_code=422, detail='required')\n"
+    )
+    assert verdict == "REQUIRED"
+
+
+def test_a_guard_is_read_against_the_binding_in_effect_where_it_stands() -> None:
+    """A name bound to the tenant LATER cannot credit an EARLIER guard.
+
+    Python has no block scope, so a flat name-to-key map made
+    ``value = compute()`` / ``if not value: raise`` / ``value =
+    body.get("tenant_id")`` read as a tenant guard — the guard was checking
+    something else entirely. Resolving each guard against the last binding
+    before its line is what separates them.
+    """
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    value = compute_something()\n"
+        "    if not value:\n"
+        "        raise HTTPException(status_code=400, detail='unrelated')\n"
+        "    value = body.get('tenant_id')\n"
+        "    return await svc.by_ids(body['ids'], value)\n"
+    )
+    assert verdict == "OPTIONAL"
+
+
+def test_a_guard_after_the_binding_still_counts() -> None:
+    """The ordinary order — bind, then guard — must keep working."""
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    value = body.get('tenant_id')\n"
+        "    if not value:\n"
+        "        raise HTTPException(status_code=422, detail='required')\n"
+    )
+    assert verdict == "REQUIRED"
+
+
+def test_a_negated_or_is_not_a_guard() -> None:
+    """``if not (tenant_id or flag): raise`` fires only when BOTH are falsy.
+
+    So a request with no tenant and a truthy flag reaches past the raise. The
+    negation has to be pushed inward — De Morgan turns this into the ``and``
+    case, which already refuses a branch that is not a negative scope check —
+    rather than looked through to the names underneath it.
+    """
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    tenant_id = body.get('tenant_id')\n"
+        "    if not (tenant_id or other_flag):\n"
+        "        raise HTTPException(status_code=400, detail='unrelated')\n"
+    )
+    assert verdict == "OPTIONAL"
+
+
+def test_a_negated_and_is_a_guard() -> None:
+    """``if not (tenant_id and x): raise`` fires when EITHER is falsy.
+
+    The other half of De Morgan: a missing tenant does reach the raise, so this
+    one is fail-closed and must keep counting.
+    """
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    tenant_id = body.get('tenant_id')\n"
+        "    if not (tenant_id and something):\n"
+        "        raise HTTPException(status_code=422, detail='required')\n"
+    )
+    assert verdict == "REQUIRED"
+
+
+def test_a_tenant_key_read_off_a_config_is_not_the_request() -> None:
+    """``if not config["tenant_id"]: raise`` proves something about a config.
+
+    Matching the bare literal anywhere in a guard's test credited it as proof
+    the ROUTE was scoped. The main classification loop anchors its reads to the
+    request; a guard's test has to be held to the same rule.
+    """
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    config = await load_config()\n"
+        "    if not config['tenant_id']:\n"
+        "        raise HTTPException(status_code=400, detail='misconfigured')\n"
+        "    return await svc.by_ids(body['ids'])\n"
+    )
+    assert verdict == "NONE"
+
+
+def test_a_tenant_key_read_off_the_body_in_a_guard_still_counts() -> None:
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    if not body['tenant_id']:\n"
+        "        raise HTTPException(status_code=422, detail='required')\n"
+    )
+    assert verdict == "REQUIRED"
+
+
+def test_a_guard_that_does_not_raise_is_still_optional() -> None:
+    """Logging the absence is not rejecting it."""
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body = await request.json()\n"
+        "    tenant_id = body.get('tenant_id')\n"
+        "    if not tenant_id:\n"
+        "        logger.warning('no tenant')\n"
+    )
+    assert verdict == "OPTIONAL"
+
+
+def test_writing_a_tenant_key_is_not_reading_one() -> None:
+    """``response["tenant_id"] = ...`` says nothing about what the caller sent.
+
+    The dangerous direction. A wrong "not scoped" costs one allowlist line
+    somebody deletes; a wrong "scoped" removes the route from the list
+    entirely, so a real gap is never shown to anyone. Matching every subscript
+    in the function — regardless of receiver or Load/Store context — scored
+    this handler REQUIRED.
+    """
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    response = {}\n"
+        "    response['tenant_id'] = 'audit'\n"
+        "    return await svc.by_ids(body['ids'])\n"
+    )
+    assert verdict == "NONE"
+
+
+def test_a_tenant_key_on_an_unrelated_dict_is_not_the_request() -> None:
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    config = await load_config()\n"
+        "    t = config.get('tenant_id')\n"
+        "    return await svc.by_ids(body['ids'])\n"
+    )
+    assert verdict == "NONE"
+
+
+def test_an_annotated_body_binding_is_still_the_request() -> None:
+    """``body: dict = await request.json()`` is an AnnAssign, not an Assign.
+
+    99 of the 107 body bindings in the routers are written this way. Anchoring
+    reads to the request without handling the annotated form made every one of
+    those handlers look unscoped — 46 routes at the time — which is how a
+    correct-sounding tightening turns into a broken gate.
+    """
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    return await svc.search(tenant_id=body['tenant_id'])\n"
+    )
+    assert verdict == "REQUIRED"
+
+
+def test_a_tenant_read_through_a_nested_body_object_counts() -> None:
+    """``event = body.get("event")`` then ``_require(event, "tenant_id")``.
+
+    A real idiom in ``recall_log_write``'s route. The tenant is still one the
+    caller had to send, so anchoring has to follow the derivation.
+    """
+    verdict, _ = _classify(
+        "async def h(request):\n"
+        "    body: dict = await request.json()\n"
+        "    event = body.get('event')\n"
+        "    if not isinstance(event, dict):\n"
+        "        raise HTTPException(status_code=422, detail='required')\n"
+        "    _require(event, 'tenant_id')\n"
+    )
+    assert verdict == "REQUIRED"
+
+
+def test_no_tenant_read_at_all_is_none() -> None:
+    verdict, _ = _classify(
+        "async def h(request):\n    body = await request.json()\n    return body['ids']\n"
+    )
+    assert verdict == "NONE"
+
+
+def test_a_defaulted_query_parameter_is_optional() -> None:
+    """``GET /memories/{memory_id}``'s shape — the scope is a defaulted arg."""
+    verdict, _ = _classify(
+        "async def h(memory_id, tenant_id = None):\n    return memory_id\n"
+    )
+    assert verdict == "OPTIONAL"
+
+
+def test_an_undefaulted_parameter_is_required() -> None:
+    verdict, _ = _classify(
+        "async def h(tenant_id, fleet_id = None):\n    return tenant_id\n"
+    )
+    assert verdict == "REQUIRED"
+
+
+# ---------------------------------------------------------------------------
+# The enumeration cannot silently shrink
+# ---------------------------------------------------------------------------
+
+
+def test_route_walk_matches_the_openapi_schema() -> None:
+    """The self-check that makes walking FastAPI's private tree acceptable.
+
+    If a version bump changes how included routers are stored, the walk returns
+    fewer operations than the app serves and every one of them stops being
+    checked — green, and covering less. This asserts the guard is live rather
+    than that today's walk happens to work.
+    """
+    from core_storage_api.app import app
+
+    class Truncated:
+        """An app whose walk finds nothing but whose schema is unchanged."""
+
+        routes: typing.ClassVar[list[object]] = []
+
+        @staticmethod
+        def openapi() -> dict:
+            return app.openapi()
+
+    with pytest.raises(RuntimeError, match="disagrees with the OpenAPI schema"):
+        gate._resolve_operations(Truncated())
+
+
+def test_every_live_route_is_enumerated() -> None:
+    """The counts the gate reports are the counts the app actually serves."""
+    from core_storage_api.app import app
+
+    documented = sum(
+        1
+        for _path, verbs in app.openapi()["paths"].items()
+        for verb in verbs
+        if verb.lower() in ("get", "post", "put", "patch", "delete")
+    )
+    assert len(gate.enumerate_routes()) == documented
+
+
+def test_every_public_service_method_is_enumerated() -> None:
+    """Oracle read from the source, not from the same predicate the gate uses.
+
+    Computing the expected set with ``inspect.getmembers(..., predicate)``
+    reproduces whatever that predicate does, mistakes included, so it cannot
+    catch one that skips an entire kind of method — which is exactly what
+    ``isfunction`` did to classmethods. Parsing the class body is an
+    independent answer to the same question.
+    """
+    import ast as _ast
+
+    from core_storage_api.services import postgres_service as module
+
+    tree = _ast.parse(Path(module.__file__).read_text())
+    class_body = next(
+        n.body
+        for n in tree.body
+        if isinstance(n, _ast.ClassDef) and n.name == "PostgresService"
+    )
+    expected = {
+        n.name
+        for n in class_body
+        if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+        and not n.name.startswith("_")
+    }
+    assert {e.key for e in gate.enumerate_methods()} == expected
+
+
+def test_a_classmethod_is_enumerated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``inspect.isfunction`` is False for a classmethod reached via the class.
+
+    Which made it invisible: not reported, not allowlisted, not ratcheted. A
+    method the enumerator never yields is one the gate never objects to, so
+    this is the failure mode that looks exactly like success.
+    """
+    from core_storage_api.services.postgres_service import PostgresService
+
+    @classmethod
+    def cm_unscoped_read(cls, memory_id: str) -> None:  # type: ignore[no-untyped-def]
+        """An id-addressed read with no tenant predicate."""
+
+    monkeypatch.setattr(
+        PostgresService, "cm_unscoped_read", cm_unscoped_read, raising=False
+    )
+
+    injected = [e for e in gate.enumerate_methods() if e.key == "cm_unscoped_read"]
+    assert injected, "a @classmethod on PostgresService was not enumerated"
+    assert injected[0].verdict == "NONE"
+
+
+def test_a_staticmethod_is_enumerated(monkeypatch: pytest.MonkeyPatch) -> None:
+    from core_storage_api.services.postgres_service import PostgresService
+
+    @staticmethod
+    def sm_unscoped_read(memory_id: str) -> None:  # type: ignore[no-untyped-def]
+        """An id-addressed read with no tenant predicate."""
+
+    monkeypatch.setattr(
+        PostgresService, "sm_unscoped_read", sm_unscoped_read, raising=False
+    )
+
+    injected = [e for e in gate.enumerate_methods() if e.key == "sm_unscoped_read"]
+    assert injected and injected[0].verdict == "NONE"
+
+
+def test_a_mandatory_binding_param_does_not_outvote_a_defaulted_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``(tenant_id: str, org_id: str | None = None)`` stays OPTIONAL, not REQUIRED.
+
+    Deliberately unlike ``_classify_handler``, where one required key settles a
+    route. A route's "required" is a guard that RAISES — proof no request gets
+    through without the key. A method's "mandatory" is only the absence of a
+    default: proof a caller passes something, not that it is used as a
+    predicate. ``settings`` and ``lifecycle_audit`` key on ``org_id``, so this
+    signature can filter on the defaulted parameter and carry the mandatory one
+    for logging, and the caller who forgets it gets the unscoped query — the
+    bulk-get defect at the SQL layer.
+
+    No method has this shape today, so this pins a decision rather than a fix:
+    it passes on the parent commit. It is here because the rationale was already
+    written in ``enumerate_methods``' docstring and a reviewer still proposed
+    relaxing it, which prose evidently does not prevent and a red test does.
+    """
+    from core_storage_api.services.postgres_service import PostgresService
+
+    async def mixed_scope(self, tenant_id: str, org_id: str | None = None) -> None:  # type: ignore[no-untyped-def]
+        """Mandatory tenant_id beside a defaulted org_id."""
+
+    monkeypatch.setattr(PostgresService, "mixed_scope", mixed_scope, raising=False)
+
+    injected = [e for e in gate.enumerate_methods() if e.key == "mixed_scope"]
+    assert injected, "the injected method was not enumerated"
+    assert injected[0].verdict == "OPTIONAL"
+    assert "org_id" in injected[0].detail
+
+
+# ---------------------------------------------------------------------------
+# The ratchet
+# ---------------------------------------------------------------------------
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+
+def _write_allowlist(path: Path, rows: dict[str, str]) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "exceptions": [
+                    {"id": ident, "verdict": "NONE", "category": category}
+                    for ident, category in rows.items()
+                ]
+            }
+        )
+    )
+
+
+@pytest.fixture
+def base_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A repo whose committed allowlist already holds one exception.
+
+    A non-empty baseline is the realistic case: the gate's job is to hold a
+    large existing list flat, not to demand zero.
+    """
+    repo = tmp_path / "scratch"
+    (repo / "core-storage-api").mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _write_allowlist(
+        repo / "core-storage-api" / "tenant_scope_allowlist.json",
+        {"method:already_here": "id-addressed-read"},
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    monkeypatch.setattr(gate, "REPO_ROOT", repo)
+    return repo
+
+
+def _at(ident: str, verdict: str = "NONE") -> dict[str, gate.Entry]:
+    kind, key = ident.split(":", 1)
+    return {ident: gate.Entry(kind, key, verdict, "")}
+
+
+def test_ratchet_allows_the_list_to_stay_flat(base_repo: Path) -> None:
+    path = base_repo / "core-storage-api" / "tenant_scope_allowlist.json"
+    assert gate.ratchet("HEAD", path, _at("method:already_here")) == []
+
+
+def test_ratchet_allows_the_list_to_shrink(base_repo: Path) -> None:
+    """Shrinking is the point of the exercise, not something to warn about."""
+    path = base_repo / "core-storage-api" / "tenant_scope_allowlist.json"
+    assert gate.ratchet("HEAD", path, {}) == []
+
+
+def test_ratchet_reports_what_moved_without_netting_categories(
+    base_repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One total cannot distinguish work, deletion, reclassification, and growth."""
+    path = base_repo / "core-storage-api" / "tenant_scope_allowlist.json"
+    _write_allowlist(
+        path,
+        {
+            "method:fixed": "id-addressed-write",
+            "route:DELETE /gone": "no-tenant-data",
+            "method:moved": "opaque-body-write",
+            "method:unchanged": "admin-unscoped",
+        },
+    )
+    _git(base_repo, "commit", "-qam", "record a mixed allowlist")
+
+    _write_allowlist(
+        path,
+        {
+            "method:added": "id-addressed-read",
+            "method:moved": "id-addressed-write",
+            "method:unchanged": "admin-unscoped",
+        },
+    )
+    live = (
+        _at("method:added")
+        | _at("method:fixed", verdict="REQUIRED")
+        | _at("method:moved")
+        | _at("method:unchanged")
+    )
+
+    errors = gate.ratchet("HEAD", path, live)
+    report = capsys.readouterr().out
+
+    assert any("allowlist grew" in error for error in errors), (
+        "reporting must not relax the ratchet"
+    )
+    assert "  added (1):\n      + method:added [id-addressed-read]" in report
+    assert "  removed — fixed (1):\n      - method:fixed [id-addressed-write]" in report
+    assert (
+        "  removed — gone (1):\n      - route:DELETE /gone [no-tenant-data]" in report
+    )
+    assert (
+        "  recategorised (1):\n"
+        "      ~ method:moved [opaque-body-write -> id-addressed-write]"
+    ) in report
+    assert "      admin-unscoped: 1 -> 1" in report
+    assert "      id-addressed-read: 0 -> 1" in report
+    assert "      id-addressed-write: 1 -> 1" in report
+    assert "      no-tenant-data: 1 -> 0" in report
+    assert "      opaque-body-write: 1 -> 0" in report
+    assert report.count("method:moved") == 1, "a category move is not also a removal"
+
+
+def test_report_uses_the_written_allowlist_and_surfaces_an_invalid_removal(
+    base_repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Live code classifies a written removal; it does not invent the removal."""
+    path = base_repo / "core-storage-api" / "tenant_scope_allowlist.json"
+
+    assert (
+        gate.ratchet("HEAD", path, _at("method:already_here", verdict="REQUIRED")) == []
+    )
+    stale_report = capsys.readouterr().out
+    assert "  removed — fixed (0)" in stale_report
+    assert "      id-addressed-read: 1 -> 1" in stale_report
+
+    _write_allowlist(path, {})
+    live = _at("method:already_here")
+    assert gate.ratchet("HEAD", path, live) == []
+    removed_report = capsys.readouterr().out
+    assert (
+        "  removed — still unscoped (1):\n"
+        "      ! method:already_here [id-addressed-read]"
+    ) in removed_report
+    assert "  removed — fixed (0)" in removed_report
+    assert "  removed — gone (0)" in removed_report
+    assert any(
+        "not in the allowlist" in error
+        for error in gate.check(list(live.values()), [], {})
+    )
+
+
+def test_ratchet_fails_when_the_list_grows(base_repo: Path) -> None:
+    path = base_repo / "core-storage-api" / "tenant_scope_allowlist.json"
+    errors = gate.ratchet(
+        "HEAD", path, _at("method:already_here") | _at("method:newly_unscoped")
+    )
+    assert len(errors) == 1
+    assert "method:newly_unscoped" in errors[0]
+    assert "method:already_here" not in errors[0]
+
+
+def test_ratchet_fails_when_an_entry_weakens(base_repo: Path) -> None:
+    """The hole ``check`` alone leaves open.
+
+    ``check`` compares the tree against the committed allowlist, so it catches a
+    regression only while the file still remembers the old verdict. An author
+    who weakens a path and then re-runs ``--write`` moves the record along with
+    the code: the id set is unchanged and the file agrees with the tree, so both
+    of those go quiet. The base tree is the only copy that still remembers.
+    """
+    path = base_repo / "core-storage-api" / "tenant_scope_allowlist.json"
+    path.write_text(
+        json.dumps(
+            {
+                "exceptions": [
+                    {
+                        "id": "method:already_here",
+                        "verdict": "OPTIONAL",
+                        "category": "id-addressed-read",
+                    }
+                ]
+            }
+        )
+    )
+    _git(base_repo, "commit", "-qam", "record as OPTIONAL")
+
+    errors = gate.ratchet("HEAD", path, _at("method:already_here", verdict="NONE"))
+    assert len(errors) == 1
+    assert "OPTIONAL -> NONE" in errors[0]
+
+
+def test_ratchet_fails_when_a_mutating_path_is_relabelled_as_a_read(
+    base_repo: Path,
+) -> None:
+    """The hole the read/write split would otherwise open.
+
+    Splitting the backlog by blast radius makes "how many unscoped paths mutate
+    rows" a number people watch, and any number people watch can be made to fall
+    the cheap way. Relabelling leaves the row, the verdict and the id untouched,
+    so every other check here stays quiet.
+    """
+    path = base_repo / "core-storage-api" / "tenant_scope_allowlist.json"
+    path.write_text(
+        json.dumps(
+            {
+                "exceptions": [
+                    {
+                        "id": "method:already_here",
+                        "verdict": "NONE",
+                        "category": "id-addressed-write",
+                    }
+                ]
+            }
+        )
+    )
+    _git(base_repo, "commit", "-qam", "record as mutating")
+
+    path.write_text(
+        json.dumps(
+            {
+                "exceptions": [
+                    {
+                        "id": "method:already_here",
+                        "verdict": "NONE",
+                        "category": "id-addressed-read",
+                    }
+                ]
+            }
+        )
+    )
+    errors = gate.ratchet("HEAD", path, _at("method:already_here"))
+    assert len(errors) == 1
+    assert "id-addressed-write -> id-addressed-read" in errors[0]
+
+
+def test_ratchet_allows_a_mutating_path_to_leave_the_list_entirely(
+    base_repo: Path,
+) -> None:
+    """The legitimate exit: it got a tenant scope, so it is no longer an exception."""
+    path = base_repo / "core-storage-api" / "tenant_scope_allowlist.json"
+    path.write_text(
+        json.dumps(
+            {
+                "exceptions": [
+                    {
+                        "id": "method:already_here",
+                        "verdict": "NONE",
+                        "category": "id-addressed-write",
+                    }
+                ]
+            }
+        )
+    )
+    _git(base_repo, "commit", "-qam", "record as mutating")
+
+    path.write_text(json.dumps({"exceptions": []}))
+    assert gate.ratchet("HEAD", path, {}) == []
+
+
+def test_a_duplicate_in_the_ratchet_base_is_an_error_not_a_pass(
+    base_repo: Path,
+) -> None:
+    """A duplicate in the BASE decides what every comparison is made against.
+
+    The working copy is protected by this check running on each PR, but that
+    induction has no base case for what is already on main.
+    """
+    path = base_repo / "core-storage-api" / "tenant_scope_allowlist.json"
+    path.write_text(
+        json.dumps(
+            {
+                "exceptions": [
+                    {
+                        "id": "method:already_here",
+                        "verdict": "NONE",
+                        "category": "id-addressed-write",
+                    },
+                    {
+                        "id": "method:already_here",
+                        "verdict": "NONE",
+                        "category": "no-tenant-data",
+                    },
+                ]
+            }
+        )
+    )
+    _git(base_repo, "commit", "-qam", "a bad merge doubled a row")
+    path.write_text(
+        json.dumps(
+            {
+                "exceptions": [
+                    {
+                        "id": "method:already_here",
+                        "verdict": "NONE",
+                        "category": "id-addressed-write",
+                    }
+                ]
+            }
+        )
+    )
+
+    with pytest.raises(gate.AllowlistError):
+        gate.ratchet("HEAD", path, _at("method:already_here"))
+
+
+def test_ratchet_allows_an_entry_to_strengthen(base_repo: Path) -> None:
+    """Getting better is not a regression."""
+    path = base_repo / "core-storage-api" / "tenant_scope_allowlist.json"
+    assert (
+        gate.ratchet("HEAD", path, _at("method:already_here", verdict="OPTIONAL")) == []
+    )
+
+
+def test_ratchet_fails_loudly_on_an_unresolvable_base(base_repo: Path) -> None:
+    """ "Nobody looked" must not be reported as "nothing grew".
+
+    ``git show <bad-ref>:<path>`` fails exactly the way ``git show
+    <good-ref>:<missing-path>`` does. Treating both as "this commit introduces
+    the file" meant a failed ``git fetch`` in CI, or a mistyped ``--base``,
+    skipped the only mechanism holding the allowlist flat — on a green build,
+    with nothing printed.
+    """
+    path = base_repo / "core-storage-api" / "tenant_scope_allowlist.json"
+    errors = gate.ratchet("no-such-ref-at-all", path, _at("method:newly_unscoped"))
+    assert len(errors) == 1
+    assert "does not resolve" in errors[0]
+
+
+def test_path_existence_at_a_ref_is_decided_by_exit_code(base_repo: Path) -> None:
+    """Not by reading git's prose.
+
+    The "did the allowlist exist at base" question was answered by looking for
+    "does not exist" in ``git show``'s stderr — English, and git's to reword.
+    Under a translated locale that reads as a real failure on the introducing
+    commit, and a genuine error whose text happens to match reads as "nothing
+    to compare", which is the silently-green case the ref check exists to stop.
+    """
+    assert gate._path_in_ref("HEAD", "core-storage-api/tenant_scope_allowlist.json")
+    assert not gate._path_in_ref("HEAD", "core-storage-api/never_existed.json")
+
+
+def test_ratchet_explains_when_the_base_predates_the_allowlist(
+    base_repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The introducing commit has no baseline, and says why no split follows."""
+    missing = base_repo / "core-storage-api" / "not_yet.json"
+    assert gate.ratchet("HEAD", missing, _at("method:anything")) == []
+    assert "no allowlist at base; nothing to compare" in capsys.readouterr().out
+
+
+def _seeded_allowlist() -> dict[str, dict[str, str]]:
+    return gate.load_allowlist(ALLOWLIST)
+
+
+def _live_entries() -> list[gate.Entry]:
+    """Both halves of the enumeration.
+
+    ``check`` reports an allowlist row matching nothing as stale, so handing it
+    only the methods would call all 64 route rows stale and drown the assertion
+    the caller actually made.
+    """
+    return gate.enumerate_methods() + gate.enumerate_routes()
+
+
+# ---------------------------------------------------------------------------
+# Identity-column writability — check 4
+# ---------------------------------------------------------------------------
+#
+# The three defects this check exists for were all tenant-bound at the time, so
+# checks 1-3 passed them. What these cases pin is the decision boundary of the
+# AST half: a silent miss here is a method that writes an identity column and
+# nothing objects, which is exactly how #1118 and #1121 reached main.
+
+
+def _sites(source: str) -> dict[str, str]:
+    return gate._caller_keyed_update_sites(textwrap.dedent(source))
+
+
+def test_setattr_over_caller_keys_is_a_site() -> None:
+    """``entity_update``'s shape before #1119."""
+    assert "m" in _sites(
+        """
+        async def m(self, row_id, tenant_id, data):
+            for key, value in data.items():
+                if hasattr(row, key):
+                    setattr(row, key, value)
+        """
+    )
+
+
+def test_a_loop_over_written_out_names_is_not_a_site() -> None:
+    """``agent_add``'s shape: the keys are in the source, so no caller reaches a column.
+
+    This is the case that decides whether the check is usable. Flagging it would
+    put a safe method in the registry, and a registry with entries nobody needed
+    is how a reviewer learns to add lines without reading them.
+    """
+    assert not _sites(
+        """
+        async def m(self, data):
+            for key in ("fleet_id", "trust_level", "display_name"):
+                if key in data:
+                    setattr(row, key, data[key])
+        """
+    )
+
+
+def test_an_unrelated_earlier_loop_does_not_vouch_for_a_later_one() -> None:
+    """Loop containment is ancestry, not line order.
+
+    The first version compared ``setattr.lineno >= loop.lineno``, so any loop
+    STARTING earlier counted — including a sibling that does not contain the
+    call. A harmless ``for flag in ("a", "b")`` above then vouched for an
+    unsafe ``setattr`` over ``data.items()`` below it, and the site went
+    unreported: a false negative in the one direction this check exists for.
+    """
+    assert "m" in _sites(
+        """
+        async def m(self, row_id, tenant_id, data):
+            for flag in ("a", "b"):
+                touched = flag
+            for key, value in data.items():
+                setattr(row, key, value)
+        """
+    )
+
+
+def test_a_literal_outer_loop_does_not_vouch_for_a_caller_keyed_inner_one() -> None:
+    """Provenance, not proximity: the innermost binding of the key is what counts.
+
+    Round 1 fixed sibling loops by switching to ancestry. That left the nested
+    case, where the literal loop really is an ancestor and still says nothing
+    about where ``key`` came from::
+
+        for group in ("core", "extra"):        # literal, and irrelevant
+            for key, value in data[group].items():
+                setattr(row, key, value)
+
+    ``any(enclosing loop is literal)`` called that safe.
+    """
+    assert "m" in _sites(
+        """
+        async def m(self, tenant_id, data):
+            for group in ("core", "extra"):
+                for key, value in data[group].items():
+                    setattr(row, key, value)
+        """
+    )
+
+
+def test_a_key_no_enclosing_loop_binds_is_not_assumed_safe() -> None:
+    """A key from somewhere else is unproven, and unproven fails toward reporting."""
+    assert "m" in _sites(
+        """
+        async def m(self, data):
+            key = data["column"]
+            setattr(row, key, data["value"])
+        """
+    )
+
+
+def test_an_update_values_comprehension_written_inline_is_a_site() -> None:
+    """The detection cannot depend on the comprehension being given a name first.
+
+    Requiring ``values = {…}`` then ``.values(**values)`` meant inlining the same
+    expression walked straight past the check.
+    """
+    assert "m" in _sites(
+        """
+        async def m(self, patch):
+            await session.execute(sql_update(Memory).values(**{k: v for k, v in patch.items()}))
+        """
+    )
+
+
+def test_an_update_values_given_the_dict_positionally_is_a_site() -> None:
+    """``.values(data)`` is the same defect as ``.values(**data)``.
+
+    SQLAlchemy's ``Update.values()`` takes a single dict positionally as well as
+    a ``**`` spread, and the positional form is the one that does not require
+    every key to be a valid Python identifier. Scanning only ``node.keywords``
+    saw the spread and never the argument, so the whole of #1081/#1118/#1121
+    reproduced with two characters removed would have passed the gate.
+    """
+    assert "m" in _sites(
+        """
+        async def m(self, patch):
+            await session.execute(sql_update(Memory).values(patch))
+        """
+    )
+
+
+def test_an_update_values_given_a_comprehension_positionally_is_a_site() -> None:
+    """The positional form gets the same provenance reading as the spread."""
+    assert "m" in _sites(
+        """
+        async def m(self, patch):
+            await session.execute(sql_update(Memory).values({k: v for k, v in patch.items()}))
+        """
+    )
+
+
+def test_an_update_values_given_a_literal_dict_positionally_is_not_a_site() -> None:
+    """Written-out keys stay safe whichever way they are passed.
+
+    Without this, "look at the positional argument too" could be satisfied by
+    reporting every ``.values(...)`` call, and the two tests above would pass
+    against a check that names every update in the file.
+    """
+    assert not _sites(
+        """
+        async def m(self, status):
+            await session.execute(sql_update(Memory).values({"status": status}))
+        """
+    )
+
+
+def test_update_values_named_keywords_are_not_a_site() -> None:
+    """``report_update_completed``'s shape: each column named in the source.
+
+    ``.values(status=status, completed_at=completed_at)`` puts real column names
+    in ``kw.arg``, which is the author typing them out — the opposite of a
+    caller-keyed dict. Widening to positional arguments must not sweep this in.
+    """
+    assert not _sites(
+        """
+        async def m(self, status, completed_at):
+            await session.execute(
+                sql_update(Report).where(Report.id == rid).values(
+                    status=status, completed_at=completed_at
+                )
+            )
+        """
+    )
+
+
+def test_an_update_values_built_by_spread_or_dict_call_is_a_site() -> None:
+    """``{**data}`` and ``dict(data)`` carry the caller's keys as surely as a comprehension.
+
+    The ``set_=`` branch already treated "not written out in the source" as
+    unsafe; this branch matched two specific node types instead, so every other
+    way of copying a caller's dict read as safe.
+    """
+    assert "m" in _sites(
+        """
+        async def m(self, data):
+            values = {**data}
+            await session.execute(sql_update(Memory).where(x).values(**values))
+        """
+    )
+    assert "m" in _sites(
+        """
+        async def m(self, data):
+            values = dict(data)
+            await session.execute(sql_update(Memory).values(**values))
+        """
+    )
+
+
+def test_an_update_values_written_out_in_the_source_is_not_a_site() -> None:
+    """The conservative default must still let a written-out UPDATE through.
+
+    ``memory_update_status`` and ``lifecycle_audit_finalize`` name their own
+    columns; flagging them would put safe methods in the registry.
+    """
+    assert not _sites(
+        """
+        async def m(self, status):
+            await session.execute(sql_update(Memory).where(x).values(**{"status": status}))
+        """
+    )
+
+
+def test_an_async_for_over_caller_keys_is_a_site() -> None:
+    """``async for`` is a loop too.
+
+    It was invisible to the first version's ``isinstance(p, ast.For)`` test,
+    which happened to report the site anyway — an empty loop list reads as
+    "not literal". Right answer, wrong reason, and the reason is what would
+    have inverted the moment the keys were literal.
+    """
+    assert "m" in _sites(
+        """
+        async def m(self, data):
+            async for key, value in data.items():
+                setattr(row, key, value)
+        """
+    )
+
+
+def test_an_async_for_over_written_out_names_is_not_a_site() -> None:
+    """The other half of the same fix: the accident above is now a real read."""
+    assert not _sites(
+        """
+        async def m(self, data):
+            async for key in ("fleet_id", "display_name"):
+                setattr(row, key, data[key])
+        """
+    )
+
+
+def test_a_nested_scope_does_not_decide_the_outer_one() -> None:
+    """``_all_literal_keys`` stops at a nested ``def``.
+
+    A closure assigning its own ``values`` says nothing about the ``values``
+    the method passes to ``.values(**…)``; letting it answer would move a
+    verdict in either direction.
+    """
+    assert "m" in _sites(
+        """
+        async def m(self, patch):
+            def helper():
+                values = {"weight": 1}
+                return values
+            values = {k: v for k, v in patch.items()}
+            await session.execute(sql_update(Memory).values(**values))
+        """
+    )
+
+
+def test_a_lambda_does_not_borrow_an_outer_loops_literal_names() -> None:
+    """A function boundary between a ``setattr`` and a loop breaks the loop's vouching.
+
+    ``_enclosing_loops`` matched the key by name against any lexically
+    enclosing loop, so a lambda parameter shadowing a literally-iterated outer
+    name was cleared by a loop it never read::
+
+        for key in ("a", "b"):
+            f = lambda key, value: setattr(row, key, value)
+            f(caller_key, caller_value)
+
+    The ``key`` inside the lambda is the lambda's own parameter, filled from
+    the caller. A ``def`` in that position is reported because every function
+    is scanned as its own scope, but a ``Lambda`` is not a ``FunctionDef`` and
+    so was never visited on its own — leaving the outer pass as the only
+    reader, and it cleared the site.
+    """
+    assert "m" in _sites(
+        """
+        async def m(self, data):
+            for key in ("a", "b"):
+                f = lambda key, value: setattr(row, key, value)
+                f(caller_key, caller_value)
+        """
+    )
+
+
+def test_a_nested_def_is_reported_under_its_own_name() -> None:
+    """A nested ``def`` shadowing an outer literal loop name is not cleared.
+
+    The outer pass does clear it — the key matches the outer loop's literal
+    tuple by name — but the helper is also scanned as its own scope, where
+    there is no enclosing loop at all, so the site surfaces under ``helper``.
+    That second reading is what makes the shadowing case reported rather than
+    silent, and it is the reason the ``def`` form needed no fix while the
+    ``lambda`` form above did.
+
+    ``helper`` holds before and after the loop-boundary fix; ``m`` is the half
+    that fix adds, once a function boundary stops the outer loop from vouching.
+    """
+    sites = _sites(
+        """
+        async def m(self, data):
+            for key in ("a", "b", "c"):
+                def helper(key, value):
+                    setattr(row, key, value)
+                helper(caller_key, caller_value)
+        """
+    )
+    assert "helper" in sites
+    assert "m" in sites
+
+
+def test_a_loop_still_vouches_for_a_setattr_in_its_own_scope() -> None:
+    """``agent_add``'s shape: no function boundary in between, so it still clears.
+
+    The guard against fixing the above by simply never clearing anything.
+    """
+    assert not _sites(
+        """
+        async def m(self, data):
+            for key in ("fleet_id", "trust_level"):
+                setattr(row, key, data[key])
+        """
+    )
+
+
+def test_a_later_literal_reassignment_does_not_hide_a_caller_keyed_values() -> None:
+    """The dict that reaches the UPDATE is the one at the call, not the last one written.
+
+    Resolving a name to its final assignment answers "literal" here and the
+    site vanishes, even though the statement two lines above spread a
+    caller-keyed dict into an ``UPDATE ... SET``. Every assignment has to be
+    literal for the name to clear, which is the rule ``_statement_roots``
+    already applies to the statement builder: any origin can sink the verdict.
+    """
+    assert "m" in _sites(
+        """
+        async def m(self, patch):
+            values = {k: v for k, v in patch.items()}
+            await session.execute(sql_update(Memory).values(**values))
+            values = {"status": "ok"}
+            log_status(values)
+        """
+    )
+
+
+def test_a_later_literal_reassignment_does_not_hide_a_caller_keyed_conflict_set() -> (
+    None
+):
+    """Same hole on the ``set_=`` half — both call sites resolved the same way."""
+    assert "m" in _sites(
+        """
+        async def m(self, data):
+            update = {k: v for k, v in data.items()}
+            stmt = pg_insert(t).values(**data).on_conflict_do_update(
+                constraint="c",
+                set_=update,
+            )
+            update = {"weight": 1}
+            log_update(update)
+        """
+    )
+
+
+def test_a_name_literal_at_every_assignment_is_still_not_a_site() -> None:
+    """The other side of the rule: requiring ALL assignments must not flag the safe case.
+
+    Without this, "every origin must be literal" could be satisfied by never
+    clearing anything, and the two tests above would pass against a check that
+    reports every name it sees.
+    """
+    assert not _sites(
+        """
+        async def m(self, patch):
+            values = {"status": "running"}
+            await session.execute(sql_update(Memory).values(**values))
+            values = {"status": "done"}
+            await session.execute(sql_update(Memory).values(**values))
+        """
+    )
+
+
+def test_a_conflict_set_built_from_caller_keys_is_a_site() -> None:
+    """``fleet_upsert_node``'s shape before #1129 — a filter, but the wrong one."""
+    assert "m" in _sites(
+        """
+        async def m(self, values):
+            stmt = pg_insert(t).values(**values).on_conflict_do_update(
+                constraint="c",
+                set_={k: v for k, v in values.items() if k not in ("tenant_id",)},
+            )
+        """
+    )
+
+
+def test_a_conflict_set_written_out_in_the_source_is_not_a_site() -> None:
+    """``relation_add``'s shape: the SET names its own columns."""
+    assert not _sites(
+        """
+        async def m(self, data):
+            stmt = pg_insert(t).values(**data).on_conflict_do_update(
+                constraint="c",
+                set_={"weight": excluded.weight, "fleet_id": excluded.fleet_id},
+            )
+        """
+    )
+
+
+def test_an_insert_is_not_a_site() -> None:
+    """A caller naming the id of a row it is creating moves no existing row.
+
+    ``pg_insert(...).values(**data)`` with no DO UPDATE collides rather than
+    overwrites, so the identity of an existing row is never caller-controlled.
+    Counting inserts would flag ``relation_add``, ``agent_add`` and
+    ``agent_activity_digest_upsert`` for a defect none of them has.
+    """
+    assert not _sites(
+        """
+        async def m(self, data):
+            stmt = pg_insert(t).values(**data).on_conflict_do_nothing(index_elements=["a"])
+        """
+    )
+
+
+def test_a_private_helper_is_scanned_too() -> None:
+    """Delegation must not launder the pattern.
+
+    An earlier version skipped ``_``-prefixed functions, so moving the loop one
+    call deep hid it completely: the public method's own body is clean and the
+    helper was never looked at. The helper is reported under its own name, which
+    is also where the filter belongs.
+    """
+    found = _sites(
+        """
+        async def entity_update(self, entity_id, tenant_id, data):
+            return self._apply_patch(row, data)
+
+        def _apply_patch(self, row, data):
+            for key, value in data.items():
+                setattr(row, key, value)
+        """
+    )
+    assert "_apply_patch" in found, found
+
+
+def test_an_update_split_across_an_assignment_is_a_site() -> None:
+    """A statement does not have to be built in one expression."""
+    assert "m" in _sites(
+        """
+        async def m(self, data):
+            stmt = sql_update(Memory).where(cond)
+            await session.execute(stmt.values(**data))
+        """
+    )
+
+
+def test_a_self_referential_statement_assignment_is_a_site() -> None:
+    """``stmt = stmt.values(**data)`` makes the last assignment circular.
+
+    Resolving only the newest assignment answers ``stmt`` and the update
+    vanishes; every assignment of the name is considered so the original
+    ``sql_update`` is still found.
+    """
+    assert "m" in _sites(
+        """
+        async def m(self, data):
+            stmt = sql_update(Memory)
+            stmt = stmt.values(**data)
+            await session.execute(stmt)
+        """
+    )
+
+
+def test_an_insert_built_through_a_variable_is_still_exempt() -> None:
+    """The INSERT exclusion has to survive resolving through locals."""
+    assert not _sites(
+        """
+        async def m(self, data):
+            stmt = pg_insert(t)
+            await session.execute(stmt.values(**data))
+        """
+    )
+
+
+def test_an_unrecognised_statement_builder_is_reported() -> None:
+    """Neither insert nor update resolves to "unknown", and unknown is reported.
+
+    The alternative is to assume an unrecognised builder is harmless, which is
+    the direction this check cannot afford to be wrong in.
+    """
+    assert "m" in _sites(
+        """
+        async def m(self, data):
+            await session.execute(some_helper(Memory).values(**data))
+        """
+    )
+
+
+def test_the_registry_covers_exactly_the_methods_that_need_it() -> None:
+    """Every caller-keyed UPDATE on the tree is registered, and none spuriously.
+
+    The trunk-is-green case for check 4. A method drifting into this shape
+    without a registration fails here as well as in CI, and a registration left
+    behind after a method stops writing from caller keys fails too — a stale one
+    reads as coverage that is not there.
+    """
+    source = Path(gate.inspect.getfile(_service())).read_text()
+    assert set(gate._caller_keyed_update_sites(source)) == set(
+        gate.IDENTITY_WRITE_GUARDS
+    )
+
+
+def test_no_registered_guard_admits_an_identity_column() -> None:
+    """The runtime half, against the models as they are now."""
+    assert gate._identity_writability_findings() == []
+
+
+def test_protected_columns_come_from_the_model_not_a_list() -> None:
+    """Primary key, tenant scope and database-maintained columns, all read off the model.
+
+    Named columns would go stale on a rename; these follow the schema.
+    """
+    from common.models import Memory
+
+    protected = gate._protected_columns(Memory)
+    assert protected["id"] == "primary key"
+    assert protected["tenant_id"] == "tenant scope"
+    assert protected["search_vector"] == "database-maintained"
+    assert "content" not in protected
+
+
+def test_a_guard_that_admits_the_primary_key_is_reported() -> None:
+    """The #1121 failure, injected: a filter that looks deliberate and is not.
+
+    Widens the real constant rather than registering a new name, so the method
+    still mentions what it is registered for and the run reaches the runtime
+    half. Pointing the registry at a fresh name instead stops at the reference
+    check, which is a different finding and would not prove this one fires.
+    """
+    from common.models import FleetNode
+
+    service = _service()
+    original = service._FLEET_NODE_IMMUTABLE_FIELDS
+    try:
+        service._FLEET_NODE_IMMUTABLE_FIELDS = frozenset(
+            {"tenant_id", "node_name"}
+        )  # id dropped
+        findings = gate._identity_writability_findings()
+    finally:
+        service._FLEET_NODE_IMMUTABLE_FIELDS = original
+
+    assert any("FleetNode.id (primary key)" in f for f in findings), findings
+    assert {c.key for c in FleetNode.__table__.primary_key.columns} == {"id"}
+    assert gate._identity_writability_findings() == [], "the constant was not restored"
+
+
+def test_a_registration_naming_a_model_the_method_never_writes_is_reported() -> None:
+    """The constant can be genuinely used and the entry still describe the wrong table.
+
+    ``memory_update`` really does reference ``_MEMORY_UPDATABLE_FIELDS``, so the
+    reference check clears it; naming ``Entity`` as the model then validates
+    that constant against Entity's columns. What is lost is specific:
+    ``Memory.search_vector`` is a TSVECTOR maintained by a trigger, and Entity
+    has no such column, so the derived-column protection stops being checked
+    while everything still reads as registered.
+
+    Checked by reference rather than by reading the model out of the statement:
+    ``entity_update`` has no statement to read — it is a ``select`` plus
+    ``setattr`` — so a statement-target comparison would have to exempt the one
+    shape that started this whole check.
+    """
+    original = gate.IDENTITY_WRITE_GUARDS.copy()
+    try:
+        gate.IDENTITY_WRITE_GUARDS["memory_update"] = (
+            "Entity",  # a real model, wrong one
+            "_MEMORY_UPDATABLE_FIELDS",  # genuinely referenced by memory_update
+            True,
+        )
+        findings = gate._identity_writability_findings()
+    finally:
+        gate.IDENTITY_WRITE_GUARDS.clear()
+        gate.IDENTITY_WRITE_GUARDS.update(original)
+
+    assert any("does not mention Entity" in f for f in findings), findings
+    assert gate._identity_writability_findings() == [], "the registry was not restored"
+
+
+def test_a_registration_the_method_no_longer_uses_is_reported() -> None:
+    """The registry is checked against the code, not trusted as a description of it.
+
+    Without this, ``IDENTITY_WRITE_GUARDS`` could name a correct constant while
+    the method had gone back to ``hasattr``: the runtime half validates the
+    constant, and a constant nobody reads protects nothing.
+    """
+    original = gate.IDENTITY_WRITE_GUARDS.copy()
+    try:
+        gate.IDENTITY_WRITE_GUARDS["entity_update"] = (
+            "Entity",
+            "_MEMORY_UPDATABLE_FIELDS",  # a real constant, wrong method
+            True,
+        )
+        findings = gate._identity_writability_findings()
+    finally:
+        gate.IDENTITY_WRITE_GUARDS.clear()
+        gate.IDENTITY_WRITE_GUARDS.update(original)
+
+    assert any("does not mention it" in f for f in findings), findings
+
+
+def _service():
+    import core_storage_api.services.postgres_service as service
+
+    return service
+
+
+# ---------------------------------------------------------------------------
+# The assumptions check 4's single-file scan rests on
+# ---------------------------------------------------------------------------
+
+
+def test_the_live_service_still_satisfies_the_scan_assumptions() -> None:
+    """The tripwires are silent on the tree as it stands, or they are just noise."""
+    assert (
+        gate._scan_assumption_findings(_service().PostgresService, gate._service_tree())
+        == []
+    )
+
+
+def test_a_base_class_on_the_service_is_reported() -> None:
+    """Check 4 reads one file; checks 1-3 enumerate the class.
+
+    ``_public_methods`` goes through ``inspect.getmembers`` precisely so a
+    method arriving from a mixin is not silently skipped. Check 4 parses the
+    text of one module instead, so the same mixin would be invisible to it —
+    the two halves of the gate would disagree about what they cover, and only
+    the quieter one would be wrong.
+
+    Closing that by walking every defining module is speculative work for a
+    case that cannot happen yet: ``PostgresService.__mro__`` is
+    ``(PostgresService, object)``. This fails loudly at the moment someone
+    makes it possible, which is when there is a real second module to point at.
+    """
+
+    class Mixin:
+        pass
+
+    class Derived(Mixin):
+        pass
+
+    findings = gate._scan_assumption_findings(Derived, ast.parse(""))
+
+    assert any("Mixin" in f for f in findings), findings
+
+
+def test_two_scanned_functions_sharing_a_name_are_reported() -> None:
+    """``sites`` and ``_names_referenced`` key by bare name, and disagree on collisions.
+
+    ``sites`` keeps the first (``setdefault``) and ``_names_referenced`` keeps
+    the last, so two same-named functions could have one supply the verdict and
+    the other supply the names it is checked against. A qualified key is not the
+    fix, because ``IDENTITY_WRITE_GUARDS`` is written by hand and a qualified
+    one would have to carry a class path that goes stale. Refusing the collision
+    keeps the registry readable and the ambiguity impossible.
+    """
+    findings = gate._scan_assumption_findings(
+        object,
+        ast.parse(
+            textwrap.dedent(
+                """
+                def apply_patch(self, data): ...
+                class Other:
+                    def apply_patch(self, data): ...
+                """
+            )
+        ),
+    )
+
+    assert any("apply_patch" in f for f in findings), findings
+
+
+def test_a_qualified_reference_counts_as_mentioning_the_name() -> None:
+    """``models.Entity`` is the same registration as ``Entity``.
+
+    The reference checks read ``ast.Name`` only, so switching this file to
+    qualified imports would report every guard as stale — a gate failure fixed
+    by reverting an import style, which is the wrong thing to teach. Attribute
+    access counts too; the check is "is this name spoken here at all", and it
+    is deliberately weak in the direction that does not block a green tree.
+    """
+    referenced = gate._names_referenced(
+        textwrap.dedent(
+            """
+            def m(self, patch):
+                values = {k: v for k, v in patch.items()}
+                return sql_update(models.Entity).values(**values), service._ENTITY_UPDATABLE_FIELDS
+            """
+        )
+    )
+
+    assert "Entity" in referenced["m"]
+    assert "_ENTITY_UPDATABLE_FIELDS" in referenced["m"]
+
+
+# ── running without an installed tree ────────────────────────────────────────
+#
+# The gate used to exit 2 having printed two lines when core-storage-api was not
+# importable, which is why its numbers reached almost none of the rebranding
+# revisions while the ratchet's reached twelve. These cases hold the line on
+# both halves of the fix: the AST findings DO come out, and nothing about the
+# run can be mistaken for a pass or allowed to rewrite the allowlist.
+
+
+def _degraded(*args: str) -> subprocess.CompletedProcess:
+    """The script on a bare interpreter — no site-packages, so no imports work.
+
+    ``-S`` rather than ``-I``: ``-I`` only drops the USER site directory, so
+    inside a venv (which is how CI runs) every dependency is still importable
+    and the degraded path would never be reached. ``-S`` adds no site directory
+    at all, which is the same position as a fresh clone.
+    """
+    return subprocess.run(
+        [sys.executable, "-S", str(SCRIPT), *args],
+        check=False,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_a_bare_interpreter_reports_the_ast_findings() -> None:
+    """The whole point: findings, not a bare refusal."""
+    result = _degraded()
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "DEGRADED RUN" in result.stdout
+    # A count of handlers and a count of scoped ones — the numbers that were
+    # unpublishable before. Asserted as "a number appeared", not as a literal,
+    # so the case does not need editing every time a route lands.
+    assert re.search(r"\d+ route handlers classified", result.stdout), result.stdout
+    assert "requiring a binding tenant" in result.stdout
+
+
+def test_a_bare_interpreter_names_a_real_unscoped_handler() -> None:
+    """Findings, not just totals.
+
+    ``memories.bulk_get`` is the handler behind GHSA-wgvw-28pq-jc36's exploit
+    primitive, and ``admin_list`` is one the AST pass reads as OPTIONAL. If the
+    report only printed counts it would be a statistic, not an instrument.
+    """
+    result = _degraded()
+
+    assert "memories.py" in result.stdout
+    assert "admin_list" in result.stdout
+
+
+def test_a_bare_interpreter_says_what_it_skipped() -> None:
+    """Whatever it skips, it must say it skipped — every item, not "some checks".
+
+    Asserted against the script's own list rather than a copy of it, so adding
+    an import-dependent check without naming it here fails.
+    """
+    result = _degraded()
+
+    assert "SKIPPED" in result.stdout
+    for what, _why in gate.SKIPPED_WITHOUT_IMPORTS:
+        assert what in result.stdout, what
+    assert "service-method signatures" in result.stdout
+
+
+def test_a_bare_interpreter_does_not_claim_to_be_a_gate() -> None:
+    """Exit 2 and the words. A green-looking partial run is worse than a refusal.
+
+    Exit code AND text, because either alone is insufficient: a human reads the
+    text and a CI step reads the code, and this run must be unusable as a pass
+    to both.
+    """
+    result = _degraded()
+
+    assert result.returncode == 2
+    assert "REPORT, not a gate" in result.stdout
+
+
+def test_a_bare_interpreter_refuses_to_reseed_the_allowlist() -> None:
+    """``--write`` from a partial enumeration would DELETE reviewed entries.
+
+    ``render_allowlist`` writes the entries it was given, so seeding it from an
+    enumeration missing all 186 service methods would drop every method entry
+    and every category on them — silently, and with a green-looking "wrote"
+    line. This is the one failure in the degraded path that damages the
+    repository rather than merely under-reporting.
+    """
+    before = ALLOWLIST.read_bytes()
+
+    result = _degraded("--write")
+
+    assert result.returncode == 2
+    assert "refused in a degraded run" in result.stdout
+    assert "wrote" not in result.stdout
+    assert ALLOWLIST.read_bytes() == before
+
+
+def test_a_bare_interpreter_refuses_to_ratchet() -> None:
+    """``--base`` compares allowlists; a partial entry set makes the answer wrong.
+
+    Every method entry would read as "removed", which the ratchet reports as
+    progress — the direction it exists to distinguish from regression.
+    """
+    result = _degraded("--base", "origin/main")
+
+    assert result.returncode == 2
+    assert "refused in a degraded run" in result.stdout
+    assert "Allowlist comparison against" not in result.stdout
+
+
+def test_the_import_free_checks_actually_run_when_degraded(tmp_path: Path) -> None:
+    """The report is not only prose: two real checks run and can fail.
+
+    Driven through ``report_degraded`` with a deliberately broken allowlist,
+    since the committed one is (and must stay) valid.
+    """
+    broken = tmp_path / "tenant_scope_allowlist.json"
+    broken.write_text(
+        json.dumps(
+            {
+                "_categories": gate.CATEGORIES,
+                "exceptions": [
+                    {"id": "route:GET /x", "category": "no-tenant-data"},
+                    {"id": "route:GET /x", "category": "admin-unscoped"},
+                ],
+            }
+        )
+    )
+
+    code = gate.report_degraded(ImportError("No module named 'pgvector'"), broken)
+
+    assert code == 2
+
+
+def test_a_degraded_run_still_passes_its_own_integrity_checks() -> None:
+    """And on the committed allowlist, those checks report clean.
+
+    Paired with the case above so "the checks ran" is not satisfied by a check
+    that fails either way.
+    """
+    result = _degraded()
+
+    assert "no duplicate ids" in result.stdout
+    assert "matches CATEGORIES" in result.stdout
+
+
+def test_an_installed_tree_is_unaffected() -> None:
+    """The full run is the gate, and this change must not have touched it.
+
+    Verified against the real environment rather than a mock: if the tests can
+    import the service, so can the script, and it must take the full path.
+    """
+    result = _run()
+
+    assert "DEGRADED" not in result.stdout
+    assert "service methods" in result.stdout

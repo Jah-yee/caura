@@ -1,0 +1,725 @@
+"""Keystone rules — REST surface (CAURA-000).
+
+Public mirror of the ``caura_keystones`` / ``caura_keystones_set``
+MCP tools. Thin proxy over core-storage's ``/api/v1/storage/keystones``;
+tiered trust enforcement (see the matrix below) and audit live in
+core-api so the storage layer can stay a dumb CRUD service.
+
+Endpoints (under ``/api/v1``):
+* ``GET    /keystones`` — list scope-merged rules
+* ``POST   /keystones`` — upsert a rule (tiered trust; see below)
+* ``DELETE /keystones/{doc_id}`` — remove a rule (tiered trust)
+* ``GET    /keystones/versions`` — the tenant's keystone versions
+* ``GET    /keystones/versions/{version}`` — one version and its rules
+
+Storage records a version with every set and delete (plan row g1.12): the
+tenant's whole keystone set after the change, numbered per tenant, with the
+calling agent and the person the gateway vouched for as its actor.
+
+Trust gating is dynamic per the targeted rule's scope:
+
+* ``scope=agent`` with an **explicit** ``agent_id`` equal to the caller
+  → **trust ≥ 1** (self-author). The ``agent_id`` field is mandatory
+  here: "self-scoped" is a property of the payload, not of the caller.
+* Anything else → **trust ≥ 2**. That includes ``scope=fleet``,
+  ``scope=tenant``, cross-agent ``scope=agent``, and — the case that
+  surprises callers — ``scope=agent`` with ``agent_id`` **omitted**,
+  which names no target and so cannot claim the self-author tier
+  (storage rejects that shape too: "scope=agent requires agent_id").
+
+That matrix reads the **submitted** shape. Two further constraints can
+raise the floor above it, so a correctly-shaped self-authored rule is
+not guaranteed to pass at trust 1:
+
+* **The stored shape.** ``effective_keystone_min_trust`` takes the max
+  of the submitted floor and the floor the rule ALREADY persisted under
+  that ``doc_id`` requires. Overwriting a ``scope=fleet`` rule needs ≥ 2
+  however the new body is shaped — that is the escalation guard.
+* **Caller verification.** The self-author tier needs a *verified*
+  identity — an agent-scoped credential, not an ``X-Agent-ID`` header
+  asserted alongside an admin/tenant key. See
+  ``_effective_min_for_caller``: an unverified caller is held at ≥ 2
+  even with a correctly-shaped self-authored rule, because otherwise an
+  admin-key holder could forge a rule in any agent's name.
+
+Neither is visible to ``keystone_trust_hint``, by design — see its
+docstring for why the hint stays blind to stored state.
+
+Surface the ``X-Truncated`` header from core-storage so callers can warn
+operators when rules are being silently dropped.
+
+The list's envelope also names the rules it returns by their rule-set hash
+(plan row g1.10), so the broker and the dashboard agree on which set is
+current.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Literal
+
+import httpx
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Response
+from pydantic import Field
+
+from common.governance.ruleset_hash import (
+    RuleSetHashError,
+    rule_set_hash,
+    rules_from_keystone_rows,
+)
+from core_api import openapi_responses as _oar
+from core_api.agent_ids import canonical_service_agent_id
+from core_api.auth import AuthContext, get_auth_context
+from core_api.clients.storage_client import KeystoneUpsertPayload, get_storage_client
+from core_api.config import settings as app_settings
+from core_api.constants import KEYSTONES_EMPTY_HINT
+from core_api.errors import (
+    AUTH_AGENT_NOT_REGISTERED,
+    AUTH_AGENT_TRUST_TOO_LOW,
+    coded_detail,
+)
+from core_api.schemas import STRICT_WRITE_BODY, TenantScopedBody
+from core_api.services.audit_service import log_action
+from core_api.services.trust_service import parse_trust_error
+from core_api.services.trust_service import require_trust as _require_trust
+from core_api.trust_utils import (
+    effective_keystone_min_trust,
+    keystone_min_trust,
+    keystone_trust_hint,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/keystones", tags=["Keystones"])
+# The versions reads (plan row g1.12) are served under /api/v1 only. app.py also
+# mounts ``router`` under the legacy prefix, for the CRUD that predates them.
+versions_router = APIRouter(prefix="/keystones/versions", tags=["Keystones"])
+# Storage numbers versions in an int4, and refuses a larger one too.
+_MAX_VERSION = 2**31 - 1
+
+
+# ── Schemas ──
+
+
+class KeystoneSetRequest(TenantScopedBody):
+    """Payload shape mirrors the storage-api validator one-for-one so we
+    don't need to re-do the scope/weight/fleet shape checks here — the
+    storage 422 propagates through."""
+
+    model_config = STRICT_WRITE_BODY
+
+    fleet_id: str | None = None
+    agent_id: str | None = None
+    # Slug shape mirrors ``caura_doc`` collection=skills (filesystem-safe
+    # identifier) so keystone ``doc_id`` values stay greppable in audit
+    # logs and safe to render in dashboards. The pattern already pins
+    # length (1 leading char + up to 99 trailing), so explicit ``min_length``
+    # / ``max_length`` would be redundant.
+    doc_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,99}$")
+    title: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+    scope: Literal["tenant", "fleet", "agent"]
+    weight: Literal["low", "med", "high"]
+    author_user_id: str | None = None
+
+
+# ── Helpers ──
+
+
+async def _enforce_author_trust(
+    tenant_id: str,
+    agent_id: str,
+    *,
+    min_level: int,
+    standalone_admin: bool = False,
+    hint: str = "",
+) -> None:
+    """Block keystone writes / deletes from principals below ``min_level``.
+
+    Callers compute ``min_level`` via
+    :func:`core_api.trust_utils.keystone_min_trust` (or
+    :func:`~core_api.trust_utils.effective_keystone_min_trust` for upserts
+    against an existing rule). The check itself
+    is the standard write-path pattern (mirrors ``routes/evolve.py``):
+    ``require_trust`` soft-passes when no agent row exists AND
+    ``min_level <= DEFAULT_TRUST_LEVEL``, so the ``not_found`` branch
+    is rejected explicitly — keystone writes must be traceable to a
+    registered identity, and the soft-pass would let a fabricated
+    ``agent_id`` through.
+
+    **Cross-fleet authoring at trust ≥ 2 is intentionally allowed.**
+    A trust-2 agent in tenant T can still write ``scope=fleet`` rules
+    for any fleet within T — finer-grained scope authority (admin/org
+    role, fleet pinning) is tracked separately (#119).
+
+    ``hint`` is appended to the insufficient-trust 403 only (see
+    :func:`core_api.trust_utils.keystone_trust_hint`). It is not added
+    to the unregistered-agent 403 above: that refusal is about identity,
+    and "pass agent_id" is not its remedy — registering is. Callers that
+    pass no ``hint`` (the anti-probing pre-check, the delete path) are
+    unchanged.
+    """
+    # Standalone single-tenant operator: the API-key holder IS the admin and
+    # there is no other agent to impersonate, so the anti-spoof trust gate is
+    # pure friction. Skip it (the caller still passes storage-side shape
+    # validation). See ``_is_standalone_admin``.
+    if standalone_admin:
+        return
+    _trust, not_found, terr = await _require_trust(tenant_id, agent_id, min_level=min_level)
+    if not_found:
+        raise HTTPException(
+            status_code=403,
+            detail=coded_detail(
+                AUTH_AGENT_NOT_REGISTERED,
+                f"Agent '{agent_id}' has no registered agent row, so its keystone-author "
+                "trust can't be verified. Register it (write one memory as that agent, then "
+                "promote its trust), or call with X-Agent-ID / an agent-scoped credential for "
+                "an agent at trust ≥ 2.",
+            ),
+        )
+    if terr:
+        raise HTTPException(
+            status_code=403,
+            detail=coded_detail(AUTH_AGENT_TRUST_TOO_LOW, parse_trust_error(terr) + hint),
+        )
+
+
+def _resolve_caller_identity(auth: AuthContext, x_agent_id: str | None) -> tuple[str, bool]:
+    """Return ``(caller_agent_id, verified)`` for the request.
+
+    ``verified=True`` means the gateway established the caller's agent
+    identity (an agent-scoped credential whose ``kind=agent_key`` had
+    ``X-Agent-ID`` injected behind the gateway perimeter). ``verified=False``
+    means the identity is asserted by the caller — which is what happens when
+    a non-agent-scoped (admin / tenant / shared) key is in use. Unverified
+    identities are still accepted but with stricter trust gating downstream —
+    see ``_effective_min_for_caller``.
+
+    PROVENANCE, NOT PRESENCE, and the distinction is the whole gate
+    (oss-0922-m-03). This used to read ``auth.agent_id`` alone, which answers
+    "did the caller name an agent" — but ``auth.py`` builds that attribute
+    from the raw ``X-Agent-ID`` header on the shared-``CAURA_API_KEY`` path
+    (Path 2) exactly as it does on the gateway path (Path 4), so a shared-key
+    holder's own assertion read as proof and the floor bump below was skipped
+    for it. Measured end-to-end: the admin key was refused at floor 2 on a
+    trust-1 victim while the shared key wrote the rule in that victim's name —
+    the WEAKER credential facing the LOOSER gate, and a plant the bump exists
+    to stop. ``AuthContext.agent_id_verified`` is set only where the identity
+    was established, so this asks the right question. See
+    ``docs/plans/rest-mcp-agent-identity-asymmetry.md``.
+
+    The defect was reachable only through the real route with a real
+    credential — the helpers agree with each other in isolation — so the
+    regression guard is an end-to-end test
+    (``tests/test_keystone_identity_provenance.py``), not a unit call on this
+    function. A trust-floor change is semantic with no schema movement, so
+    oasdiff cannot catch this class at all.
+
+    Mismatch rejection: when both signals are present and disagree,
+    the caller is treated as a spoofing attempt and rejected outright
+    rather than letting the helper silently pick one. Pre-fix, an
+    attacker holding an admin key could supply ``X-Agent-ID`` for any
+    trust-1 victim and forge keystones in the victim's name; mismatch
+    handling is one half of the defence, the other is the floor bump
+    in ``_effective_min_for_caller``.
+
+    Fallback ``"rest-admin"`` is preserved for legacy callers — the
+    trust check 403s on it anyway (no agent row exists), but the
+    fallback keeps the error surface predictable.
+
+    NOTE: keystones deliberately does NOT use ``services/caller_identity``
+    (the shared evolve/insights resolver). Governance writes must not fall
+    back to a *registerable* identity like ``DEFAULT_AGENT_ID`` — the
+    never-registered ``rest-admin`` sentinel forces an explicit identity on
+    the gateway — and this path needs stricter anti-spoof handling (X-Agent-ID
+    mismatch rejection + the verified-floor bump) than that resolver provides.
+    """
+    # ``agent_id_verified`` gates the READ of ``agent_id`` rather than being
+    # ANDed into the returned flag, so an asserted identity keeps flowing to
+    # the ``x_agent_id`` branch below and still resolves to a caller — it just
+    # resolves as unverified. Collapsing both to ``(None, False)`` would drop
+    # the caller to the ``rest-admin`` sentinel and turn every Path-2 keystone
+    # write into an unregistered-agent 403, which is a different (and much
+    # larger) behaviour change than the floor bump this fix is.
+    verified_id = getattr(auth, "agent_id", None) if getattr(auth, "agent_id_verified", False) else None
+    # The self plane, asked of a header rather than a body or query parameter:
+    # ``AuthContext.enforce_self_agent`` owns that question for the whole REST
+    # surface. ``or None`` keeps an empty ``X-Agent-ID:`` an omission here — the
+    # helper refuses an explicit ``""`` and this site has always let it fall
+    # through to the unverified-identity path below.
+    auth.enforce_self_agent(
+        x_agent_id or None,
+        field="X-Agent-ID",
+        message=(
+            "X-Agent-ID header does not match authenticated identity. "
+            "Refusing to act on behalf of a different agent."
+        ),
+    )
+    if verified_id:
+        return canonical_service_agent_id(verified_id), True
+    if x_agent_id:
+        return canonical_service_agent_id(x_agent_id), False
+    return "rest-admin", False
+
+
+def _is_standalone_admin(auth: AuthContext, x_agent_id: str | None) -> bool:
+    """True for the unidentified single-tenant operator on a standalone box.
+
+    Under ``IS_STANDALONE`` there is exactly one principal — the API-key
+    holder — and no other agent to impersonate, so the keystone trust gate
+    that protects multi-tenant / gateway deployments is pure friction here
+    (the flagship governance feature otherwise 403s on a fresh install).
+
+    Deliberately narrow: fires ONLY when the caller asserts no agent identity
+    at all — no agent-scoped credential (``auth.agent_id``) and no
+    ``X-Agent-ID`` header — i.e. the ``rest-admin`` fallback in
+    ``_resolve_caller_identity``. A request that names an agent via
+    ``X-Agent-ID`` still goes through the normal trust gate, so the anti-spoof
+    defenses (floor bump, mismatch rejection) are untouched, and this is a
+    no-op whenever ``IS_STANDALONE`` is false.
+    """
+    return app_settings.is_standalone and getattr(auth, "agent_id", None) is None and x_agent_id is None
+
+
+def _effective_min_for_caller(scope_floor: int, caller_verified: bool) -> int:
+    """Bump the trust floor when the caller's identity is unverified.
+
+    The self-author tier (``scope=agent`` for one's own ``agent_id``)
+    is open at trust ≥ 1 precisely because we KNOW the caller IS the
+    target. If we don't know — i.e. the caller is only asserting their
+    identity via the unverified ``X-Agent-ID`` header — fall back to
+    the cross-agent governance bar (≥ 2). Otherwise an admin-key
+    holder could spoof any registered trust-1 agent and plant a rule
+    in that agent's name.
+    """
+    if not caller_verified and scope_floor < 2:
+        return 2
+    return scope_floor
+
+
+def _surface_storage_error(exc: httpx.HTTPStatusError) -> HTTPException:
+    """Translate a storage-api ``HTTPStatusError`` into an ``HTTPException``
+    so the caller sees the original status (e.g. storage's 422 validator
+    output) instead of a 500. ``storage_client._post`` raises on non-2xx,
+    so writes that fail storage-side shape validation bubble up here."""
+    detail: object
+    try:
+        detail = exc.response.json()
+    except ValueError:
+        detail = exc.response.text or str(exc)
+    return HTTPException(status_code=exc.response.status_code, detail=detail)
+
+
+def _principal(fleet_id: str | None, agent_id: str | None) -> tuple[str | None, str | None]:
+    """The ``(fleet_id, agent_id)`` whose rules a read resolves.
+
+    The agent is canonical, and dropped when there's no ``fleet_id``:
+    agent-scope rows are keyed on the (fleet_id, agent_id) pair, so an
+    agent-only filter can't resolve them. Mirrors the MCP handler's guard so
+    both surfaces return identical results for the same input.
+    """
+    if not fleet_id or agent_id is None:
+        return fleet_id, None
+    return fleet_id, canonical_service_agent_id(agent_id)
+
+
+def _rule_set_hash(rows: list[dict], tenant_id: str) -> str | None:
+    """Return the rule-set hash of the rules a list returns (plan row g1.10).
+
+    It covers exactly ``rows``, after the cap, because that is what the broker
+    receives and hashes on its side (``common/governance/ruleset_hash.py``
+    defines the hash). A set that can't be hashed without guessing gets
+    ``None`` and a warning, never an error: a session still needs its rules.
+    """
+    try:
+        return rule_set_hash(rules_from_keystone_rows(rows))
+    except RuleSetHashError as exc:
+        logger.warning("keystones: tenant %s's rule set has no hash: %s", tenant_id, exc)
+        return None
+
+
+# ── Routes ──
+
+
+@router.get(
+    "",
+    responses={200: {"model": list[_oar.KeystoneDoc] | _oar.KeystonesEnvelope}},
+)
+async def list_keystones(
+    response: Response,
+    tenant_id: str = Query(...),
+    fleet_id: str | None = Query(default=None),
+    agent_id: str | None = Query(default=None),
+    envelope: bool = Query(
+        default=False,
+        description=(
+            "C30/D1 opt-in: return {count, items} instead of the bare array. "
+            "The bare array stays the default until a separate announced "
+            "deprecation wave."
+        ),
+    ),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Return scope-merged keystone rules. No trust gate — reads are
+    safe and the plugin needs this on every session start.
+
+    Cross-tenant credentials may inspect any tenant in their readable set
+    by pinning ``tenant_id`` to it; the read is scoped to that single
+    tenant's rules. Aggregate keystone view across the readable set
+    isn't exposed here — agents should keep keystones explicitly per
+    tenant for scope clarity.
+
+    The envelope's ``rule_set_hash`` names the rules in ``items``, so a
+    caller can tell whether a set it holds is still current.
+    """
+    auth.enforce_readable_tenant(tenant_id)
+    fleet_id, agent_id = _principal(fleet_id, agent_id)
+    sc = get_storage_client()
+    try:
+        rows, truncated = await sc.list_keystones(
+            tenant_id=tenant_id,
+            fleet_id=fleet_id,
+            agent_id=agent_id,
+        )
+    except httpx.HTTPStatusError as exc:
+        raise _surface_storage_error(exc) from exc
+    if truncated:
+        response.headers["X-Truncated"] = "true"
+    # C30 / wire-contract D1 (ratified 2026-08-25): opt-in envelope. The bare
+    # array remains the default response shape — existing consumers (plugin
+    # session-start fetch included) see zero change unless they ask.
+    if envelope:
+        body: dict = {"count": len(rows), "items": rows}
+        # g1.10: envelope only, like the hint below — the bare array can't
+        # grow a field.
+        body["rule_set_hash"] = _rule_set_hash(rows, tenant_id)
+        if not rows:
+            # F9 — parity with the MCP surface, which is where agents actually
+            # read this. ENVELOPE ONLY: the bare array is still the default
+            # response shape, and adding a key to it would change the wire
+            # contract for every existing consumer — the precise thing C30/D1
+            # opted out of.
+            body["hint"] = KEYSTONES_EMPTY_HINT
+        return body
+    return rows
+
+
+@router.post("", responses={200: {"model": _oar.KeystoneDoc}})
+async def upsert_keystone(
+    body: KeystoneSetRequest,
+    x_agent_id: str | None = Header(default=None, alias="X-Agent-ID"),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Upsert a keystone rule. Trust ≥ 1 for a self-authored
+    ``scope=agent`` rule — meaning one that carries an explicit
+    ``agent_id`` equal to the caller; ≥ 2 otherwise, including
+    ``scope=agent`` with ``agent_id`` omitted. See module docstring."""
+    auth.enforce_tenant(body.tenant_id)
+    # ``enforce_read_only`` gates demo sandboxes; ``enforce_usage_limits``
+    # gates plan-exceeded orgs. Write routes must call both — delete
+    # routes only the former (see usage_service docstring).
+    auth.enforce_read_only()
+    auth.enforce_usage_limits()
+    caller_agent_id, caller_verified = _resolve_caller_identity(auth, x_agent_id)
+    if body.agent_id is not None:
+        body.agent_id = canonical_service_agent_id(body.agent_id)
+    standalone_admin = _is_standalone_admin(auth, x_agent_id)
+
+    # Early registration check — anti-probing parity with delete. Without
+    # this, an unregistered caller could probe ``doc_id`` existence
+    # because ``sc.get_document`` below runs before any trust check
+    # fires. Use the minimum floor (1) here so a trust-1 caller passes;
+    # the full floor (which may be 2 once the stored shape is known) is
+    # re-enforced after the storage read.
+    await _enforce_author_trust(
+        body.tenant_id, caller_agent_id, min_level=1, standalone_admin=standalone_admin
+    )
+
+    sc = get_storage_client()
+    # Look up the existing rule (if any) so the trust floor combines
+    # the NEW body shape and the STORED shape. Without this, a trust-1
+    # agent could overwrite a ``scope=fleet`` rule by submitting
+    # ``scope=agent`` + ``agent_id=<self>`` — the new-shape floor (1)
+    # would pass the gate and storage would upsert unconditionally,
+    # silently replacing a tenant-wide rule with one only the attacker
+    # controls. ``effective_keystone_min_trust`` returns the max of the
+    # two floors so the caller must be authorised for whichever shape
+    # is stricter.
+    existing = await sc.get_document(tenant_id=body.tenant_id, collection="_keystones", doc_id=body.doc_id)
+    existing_data = (existing or {}).get("data") or {}
+    scope_floor = effective_keystone_min_trust(
+        new_scope=body.scope,
+        new_target_agent_id=body.agent_id,
+        stored_scope=existing_data.get("scope") if existing else None,
+        stored_target_agent_id=existing_data.get("agent_id") if existing else None,
+        caller_agent_id=caller_agent_id,
+    )
+    # Bump the floor when the caller's identity is unverified — self-
+    # author tier requires we KNOW who the caller is. Without this, an
+    # admin-key holder could supply ``X-Agent-ID=<victim>`` plus
+    # ``scope=agent``+``agent_id=<victim>`` and forge a rule in the
+    # victim's name at trust 1.
+    min_level = _effective_min_for_caller(scope_floor, caller_verified)
+    await _enforce_author_trust(
+        body.tenant_id,
+        caller_agent_id,
+        min_level=min_level,
+        standalone_admin=standalone_admin,
+        # Distinguish "you're not trusted enough for this scope" from
+        # "you meant to self-author but left agent_id out" — the latter
+        # otherwise reads as the trust matrix contradicting the docs.
+        hint=keystone_trust_hint(body.scope, body.agent_id, caller_agent_id),
+    )
+    # TOCTOU narrowing: re-fetch the stored row immediately before the
+    # upsert and abort with 409 if the shape changed. A legitimate
+    # concurrent upsert could otherwise promote the stored scope
+    # between the gate read and the write below, letting a caller
+    # authorised for the looser earlier shape overwrite a stricter
+    # rule. Window is now reduced to (recheck → write), matching the
+    # delete path; storage-side conditional upsert (e.g. WHERE scope=?
+    # AND agent_id IS NOT DISTINCT FROM ?) remains the proper fix.
+    recheck = await sc.get_document(tenant_id=body.tenant_id, collection="_keystones", doc_id=body.doc_id)
+    recheck_data = (recheck or {}).get("data") or {}
+    if (existing is None) != (recheck is None) or (
+        existing is not None
+        and recheck is not None
+        and (
+            recheck_data.get("scope") != existing_data.get("scope")
+            or recheck_data.get("agent_id") != existing_data.get("agent_id")
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Keystone scope changed during operation; aborting upsert.",
+        )
+    # Pass-through to storage — it owns scope/weight/agent_id shape
+    # validation; surface its 422 directly so the caller sees a single
+    # canonical error list.
+    # Build the TypedDict explicitly so mypy catches missing required
+    # fields here, not at the network boundary. Storage treats a present
+    # ``"fleet_id": None`` differently from an absent key (scope=tenant
+    # must not include fleet_id), so optional fields are added only when
+    # set rather than included as None.
+    payload: KeystoneUpsertPayload = {
+        "tenant_id": body.tenant_id,
+        "doc_id": body.doc_id,
+        "title": body.title,
+        "content": body.content,
+        "scope": body.scope,
+        "weight": body.weight,
+    }
+    if body.fleet_id is not None:
+        payload["fleet_id"] = body.fleet_id
+    if body.agent_id is not None:
+        payload["agent_id"] = body.agent_id
+    if body.author_user_id is not None:
+        payload["author_user_id"] = body.author_user_id
+    payload["actor_agent_id"] = caller_agent_id
+    if auth.user_id is not None:
+        payload["actor_user_id"] = auth.user_id
+
+    try:
+        doc = await sc.upsert_keystone(payload)
+    except httpx.HTTPStatusError as exc:
+        raise _surface_storage_error(exc) from exc
+
+    await log_action(
+        tenant_id=body.tenant_id,
+        agent_id=caller_agent_id,
+        action="keystone.set",
+        resource_type="keystone",
+        resource_id=doc.get("id"),
+        detail={
+            "doc_id": body.doc_id,
+            "scope": body.scope,
+            "fleet_id": body.fleet_id,
+            "agent_id": body.agent_id,
+            "weight": body.weight,
+            # The body's claim. ``user_id`` below is the one the gateway vouched for.
+            "author_user_id": body.author_user_id,
+            "via": "rest",
+            **auth.audit_actor(),
+        },
+    )
+    return doc
+
+
+@router.delete("/{doc_id}", responses={200: {"model": _oar.KeystoneDeleteResponse}})
+async def delete_keystone(
+    # Enforce the slug shape at the path-parameter layer — without this
+    # an unvalidated ``doc_id`` flows straight into ``storage_client``'s
+    # f-string URL construction, where ``..`` would resolve to the
+    # storage parent path. Matches ``KeystoneSetRequest.doc_id``'s
+    # Pydantic ``pattern``.
+    doc_id: str = Path(..., pattern=r"^[a-z0-9][a-z0-9._-]{0,99}$"),
+    tenant_id: str = Query(...),
+    x_agent_id: str | None = Header(default=None, alias="X-Agent-ID"),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Remove a keystone rule. Trust ≥ 1 to delete a self-authored
+    ``scope=agent`` rule; ≥ 2 otherwise. The rule is fetched first so
+    the gate can read the actual scope/agent_id from the stored row
+    rather than trusting any caller assertion."""
+    auth.enforce_tenant(tenant_id)
+    auth.enforce_read_only()
+    caller_agent_id, caller_verified = _resolve_caller_identity(auth, x_agent_id)
+    standalone_admin = _is_standalone_admin(auth, x_agent_id)
+    trust: int = 0  # assigned in the trust-gate block below; default unused (read is in the same not-standalone_admin guard)
+
+    # ONE trust round-trip for both the pre-lookup registration check
+    # (≥ 1, anti-probing) and the post-lookup floor check. We ask
+    # ``_require_trust`` for the minimum the caller could possibly
+    # need (1), then compare the returned trust level against the
+    # floor computed from the stored rule. This collapses two DB
+    # queries into one without losing either guarantee. Skipped for the
+    # standalone single-tenant operator (see ``_is_standalone_admin``).
+    if not standalone_admin:
+        trust, not_found, terr = await _require_trust(tenant_id, caller_agent_id, min_level=1)
+        # Anti-probing: an unregistered caller must NOT learn whether a
+        # ``doc_id`` exists (404 would leak presence; trust check below
+        # would 403). 403 unconditionally on missing identity.
+        if not_found:
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    AUTH_AGENT_NOT_REGISTERED,
+                    f"Agent '{caller_agent_id}' has no registered agent row, so its "
+                    "keystone-author trust can't be verified. Register it (write one memory "
+                    "as that agent, then promote its trust), or call with X-Agent-ID / an "
+                    "agent-scoped credential for an agent at trust ≥ 2.",
+                ),
+            )
+        if terr:
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(AUTH_AGENT_TRUST_TOO_LOW, parse_trust_error(terr)),
+            )
+
+    sc = get_storage_client()
+    # Look up the rule before computing the scope-derived floor — the
+    # documents-store GET ignores the system-collection guard (which
+    # only fires on write/delete), so this needs no new endpoint.
+    existing = await sc.get_document(tenant_id=tenant_id, collection="_keystones", doc_id=doc_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Keystone not found")
+    data = existing.get("data") or {}
+    if not standalone_admin:
+        scope_floor = keystone_min_trust(
+            data.get("scope", ""),
+            data.get("agent_id"),
+            caller_agent_id,
+        )
+        # Bump to ≥ 2 if the caller's identity is unverified (admin key
+        # with ``X-Agent-ID`` claim only) — same anti-spoof rationale as
+        # the upsert path.
+        min_level = _effective_min_for_caller(scope_floor, caller_verified)
+        if trust < min_level:
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    AUTH_AGENT_TRUST_TOO_LOW,
+                    f"Agent '{caller_agent_id}' (trust_level={trust}) < required {min_level}.",
+                ),
+            )
+
+    # TOCTOU narrowing: re-fetch the stored row immediately before the
+    # delete and abort with 409 if the shape changed. Without this, a
+    # legitimate concurrent upsert can promote a ``scope=agent`` rule
+    # to ``scope=fleet`` between the first read and the storage delete,
+    # letting a trust-1 caller delete a now-fleet rule it was never
+    # authorised for — both flows pass their own gates individually
+    # but the net effect bypasses the cross-agent governance bar. The
+    # race window is now reduced to (recheck → delete), which is a
+    # storage round-trip only; the proper fix is a storage-side
+    # compare-and-delete with scope/agent_id preconditions, tracked
+    # for a follow-up.
+    recheck = await sc.get_document(tenant_id=tenant_id, collection="_keystones", doc_id=doc_id)
+    if not recheck:
+        raise HTTPException(status_code=404, detail="Keystone not found")
+    recheck_data = recheck.get("data") or {}
+    if recheck_data.get("scope") != data.get("scope") or recheck_data.get("agent_id") != data.get("agent_id"):
+        raise HTTPException(
+            status_code=409,
+            detail="Keystone scope changed during operation; aborting delete.",
+        )
+    try:
+        deleted = await sc.delete_keystone(
+            tenant_id=tenant_id,
+            doc_id=doc_id,
+            actor_agent_id=caller_agent_id,
+            actor_user_id=auth.user_id,
+        )
+    except httpx.HTTPStatusError as exc:
+        raise _surface_storage_error(exc) from exc
+    if not deleted:
+        # The row vanished between the lookup and the delete (concurrent
+        # delete from another caller). Surface as 404, same as the
+        # original missing-row case.
+        raise HTTPException(status_code=404, detail="Keystone not found")
+
+    await log_action(
+        tenant_id=tenant_id,
+        agent_id=caller_agent_id,
+        action="keystone.delete",
+        resource_type="keystone",
+        resource_id=None,
+        detail={"doc_id": doc_id, "via": "rest", **auth.audit_actor()},
+    )
+    return {"deleted": True, "doc_id": doc_id}
+
+
+@versions_router.get("", responses={200: {"model": _oar.KeystoneVersionsPage}})
+async def list_keystone_versions(
+    tenant_id: str = Query(...),
+    fleet_id: str | None = Query(default=None),
+    agent_id: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=100),
+    before: int | None = Query(
+        default=None,
+        ge=1,
+        le=_MAX_VERSION,
+        description="The next_before of the previous page: versions below it.",
+    ),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """The tenant's keystone versions, newest first (plan row g1.12).
+
+    Each version's ``rule_set_hash`` is the hash of what it gives
+    ``(fleet_id, agent_id)``: the rules the keystones list would have returned
+    them then. A receipt's hash names its version that way. Without ``fleet_id``
+    that is the tenant-wide rules alone, as for the list, and ``agent_id``
+    without ``fleet_id`` is dropped, as there.
+
+    Tenant-scoped like ``/audit-log``: the history names who made each change.
+    """
+    auth.enforce_tenant(tenant_id)
+    fleet_id, agent_id = _principal(fleet_id, agent_id)
+    try:
+        return await get_storage_client().list_keystone_versions(
+            tenant_id, fleet_id=fleet_id, agent_id=agent_id, limit=limit, before=before
+        )
+    except httpx.HTTPStatusError as exc:
+        raise _surface_storage_error(exc) from exc
+
+
+@versions_router.get("/{version}", responses={200: {"model": _oar.KeystoneVersionDetail}})
+async def get_keystone_version(
+    version: int = Path(..., ge=1, le=_MAX_VERSION),
+    tenant_id: str = Query(...),
+    fleet_id: str | None = Query(default=None),
+    agent_id: str | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """One keystone version, with the rules it gives ``(fleet_id, agent_id)``
+    as ``items``, in the list's order. Compare two versions to diff them."""
+    auth.enforce_tenant(tenant_id)
+    fleet_id, agent_id = _principal(fleet_id, agent_id)
+    try:
+        found = await get_storage_client().get_keystone_version(
+            tenant_id, version, fleet_id=fleet_id, agent_id=agent_id
+        )
+    except httpx.HTTPStatusError as exc:
+        raise _surface_storage_error(exc) from exc
+    if found is None:
+        raise HTTPException(status_code=404, detail="Keystone version not found")
+    return found

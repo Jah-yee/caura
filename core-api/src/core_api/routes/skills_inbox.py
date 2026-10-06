@@ -1,0 +1,1449 @@
+"""Skills Inbox — HITL endpoints (SF-206 + SF-207).
+
+The Inbox UI lives here as a tight read+act surface over the
+``skills`` collection. There is no new persistence — every Inbox
+action is a status transition (or in the case of Edit, a content
+revision) on the existing skill doc.
+
+Endpoints (all under ``/v1/skills-inbox``):
+
+  GET    /                       — list staged candidates (or, with
+                                   ?status=quarantined, quarantined ones)
+  POST   /{slug}/approve         — staged → active   (+ pre-apply rescan);
+                                   with override_quarantine, also
+                                   quarantined → active
+  POST   /{slug}/reject          — staged → rejected (+ poison-table write
+                                   for a Forge candidate)
+  POST   /{slug}/quarantine      — staged → quarantined  (security review)
+  POST   /{slug}/defer           — no-op; stamps ``deferred_at`` (Forge can revise)
+  POST   /{slug}/edit            — revise content / description / summary;
+                                   rehash + rescan; stays staged
+
+Phase-2 scope (per plan §15): the 5 actions land status transitions.
+Phase 3 wires the actual harness install on ``staged → active`` —
+this route still flips status; the Phase-3 install worker watches the
+status flip and emits SKILL.md files.
+
+All endpoints require the flag
+``org_settings.skills_factory.enabled == True``; if disabled they
+respond with ``403 SKILLS_FACTORY_DISABLED`` so a curious operator
+gets a clear error instead of a silent 404.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+from typing import Any, Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field, model_validator
+
+from core_api.agent_ids import canonical_service_agent_id
+from core_api.auth import AuthContext, get_auth_context
+from core_api.clients.storage_client import get_storage_client
+from core_api.errors import (
+    AUTH_SKILLS_FACTORY_DISABLED,
+    AUTH_SKILLS_INBOX_FORBIDDEN,
+    AUTH_TENANT_MISMATCH,
+    AUTH_UNAUTHENTICATED,
+    coded_detail,
+)
+from core_api.schemas import STRICT_WRITE_BODY
+from core_api.services.audit_service import log_action
+from core_api.services.forge.poison import write_rejected_fingerprint
+from core_api.services.forge.sentinel_scan import scan_skill_doc
+from core_api.services.organization_settings import (
+    get_raw_settings,
+    get_settings_for_display,
+)
+from core_api.services.skill_lifecycle import (
+    SkillWriteContext,
+    validate_and_normalize_skill_write,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/skills-inbox", tags=["Skill Factory · Inbox"])
+
+
+SKILLS_COLLECTION = "skills"
+
+
+# ── Flag gate ──────────────────────────────────────────────────────
+
+
+async def _require_skills_factory_enabled(tenant_id: str) -> dict:
+    """Hot-path: read the raw settings row and short-circuit when the
+    feature flag is off. Returns the resolved settings-for-display
+    dict so each endpoint has the per-tenant caps in one fetch.
+
+    Org settings route through core-storage-api (Fix 2 Phase 0), so no DB
+    session is involved.
+    """
+    raw = await get_raw_settings(tenant_id)
+    enabled = (
+        isinstance(raw, dict)
+        and isinstance(raw.get("skills_factory"), dict)
+        and bool(raw["skills_factory"].get("enabled"))
+    )
+    if not enabled:
+        raise HTTPException(
+            status_code=403,
+            detail=coded_detail(
+                AUTH_SKILLS_FACTORY_DISABLED,
+                "SKILLS_FACTORY_DISABLED — set org_settings.skills_factory.enabled=true to use the inbox",
+            ),
+        )
+    return await get_settings_for_display(tenant_id)
+
+
+def _require_tenant(auth: AuthContext, explicit_tenant_id: str | None = None) -> str:
+    """Every inbox endpoint needs a concrete tenant. ``AuthContext.tenant_id``
+    is typed ``str | None`` because some bootstrap paths land there
+    pre-auth — but so does the OSS admin path (auth Path 1), which
+    deliberately builds ``AuthContext(tenant_id=None, is_admin=True)``.
+    Wet-test defect WT-4: treating BOTH as "missing tenant → 401" told
+    the most privileged credential it did not authenticate.
+
+    Resolution order:
+
+    - Tenant-scoped credential (``auth.tenant_id`` set): the key's own
+      tenant wins. A conflicting explicit ``?tenant_id=`` is a 403 —
+      a tenant key must not act on another tenant.
+    - Admin credential (no tenant of its own): acts on the tenant it
+      names via ``?tenant_id=``. Naming none is a 400 (a REQUEST
+      problem — the credential IS authenticated, so never 401).
+    - Neither: genuinely unauthenticated bootstrap context → 401.
+
+    Returning the narrowed ``str`` lets mypy verify the downstream
+    calls without litter ``cast``s.
+    """
+    if auth.tenant_id:
+        if explicit_tenant_id is not None and explicit_tenant_id != auth.tenant_id:
+            # Neither id appears in the message — see the same guard in
+            # ``routes/stm.py`` for the full reasoning: the credential's own
+            # tenant is a binding its holder may never have been told, and
+            # the requested tenant is caller-controlled input that would be
+            # reflected into a body which also lands in logs. Clients branch
+            # on the ``TENANT_MISMATCH`` prefix, not on the prose.
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    AUTH_TENANT_MISMATCH,
+                    "TENANT_MISMATCH — this credential is not scoped to the requested tenant.",
+                ),
+            )
+        return auth.tenant_id
+    if getattr(auth, "is_admin", False):
+        if explicit_tenant_id:
+            return explicit_tenant_id
+        raise HTTPException(
+            status_code=400,
+            detail="admin credential must name a tenant — pass ?tenant_id=",
+        )
+    raise HTTPException(
+        status_code=401,
+        detail=coded_detail(AUTH_UNAUTHENTICATED, "UNAUTHENTICATED — auth context has no tenant_id"),
+    )
+
+
+def _require_inbox_admin(auth: AuthContext) -> None:
+    """Inbox MUTATING actions (approve/reject/quarantine/defer/edit)
+    require admin privileges. The ``GET /`` list endpoint is left open
+    to any tenant member so non-admin operators can still see what's
+    in flight.
+
+    Centralized so the check stays consistent across all five action
+    handlers — a missed handler is a privilege-escalation bug.
+
+    THIS IS THE ADMIN AXIS ONLY: it says WHO the caller is, never
+    whether their credential may write. Each handler calls
+    ``auth.enforce_read_only()`` for that second axis, and the two are
+    not substitutes in either direction.
+
+    That is defence in depth rather than a closed hole, and the
+    distinction is worth stating precisely. Today no gateway-minted
+    credential is both an org admin and non-writing: the auth service
+    emits ``X-Org-Role`` only for user principals and DELETES it on the
+    API-key path, which is the only path that emits ``X-Capabilities``
+    ("keys carry no org membership, and admin surfaces stay human-only").
+    So an admin arrives with ``capabilities=None``, for which
+    ``enforce_read_only`` is a no-op.
+
+    What the gate buys is that core-api stops depending on that. It
+    reads the two axes as independent fields, so "admin implies may
+    write" held only by a convention enforced in another repo and
+    asserted in a docstring there — with nothing here to notice if an
+    ingress, an on-prem deployment, or a caller reaching core-api
+    directly (``gateway_shared_secret`` unset, where both headers are
+    client-supplied) ever presented the combination.
+
+    This is how the authz inventory found them: of the routes it counts
+    as mutating, these five were the only ones that write tenant state
+    and reached no write gate at all. Its other exemptions are
+    POST-bodied reads, gated by ``enforce_readable_tenant``, and the
+    unauthenticated bootstrap routes, which take no ``auth`` and write
+    nothing tenant-scoped.
+    """
+    # ``AuthContext.is_org_admin`` is the shared spelling of "admin status
+    # may come from either the legacy ``is_admin`` flag OR
+    # ``org_role == 'admin'``". Keeping this surface and ``documents`` on the
+    # same property means an operator authorized to write admin-gated skills
+    # via ``caura_doc`` can also act on the inbox, and stays that way — when
+    # the two were written out by hand in three places, nothing held them
+    # together but the habit of copying.
+    if not auth.is_org_admin:
+        raise HTTPException(
+            status_code=403,
+            detail=coded_detail(
+                AUTH_SKILLS_INBOX_FORBIDDEN, "SKILLS_INBOX_FORBIDDEN — inbox actions require admin privileges"
+            ),
+        )
+
+
+# ── Pydantic shapes ────────────────────────────────────────────────
+
+
+# Cap on findings surfaced per card. A pathological doc can carry an
+# unbounded findings list; the card only needs enough for an operator
+# to see WHY a scan tripped — the full list stays on ``data.scan``.
+_MAX_CARD_FINDINGS = 20
+
+
+class ScanFindingOut(BaseModel):
+    """One Sentinel finding, shaped for the card UI: enough to render
+    '<severity> <code>: <message>' under the scan badge. Mirrors the
+    ``data.scan.findings[]`` entries written by ``ScanResult.as_doc_field``.
+    """
+
+    code: str = ""
+    severity: str = ""
+    message: str = ""
+    fatal: bool = False
+    locator: str | None = None
+
+
+class SentinelScanSummary(BaseModel):
+    """Nested scan verdict, shaped for the dashboard card UI.
+
+    ``status`` mirrors ``data.scan.state`` (``clean`` / ``quarantined``
+    / ``failed``); the counts mirror ``critical`` / ``warn``. The flat
+    ``scan_state`` / ``scan_critical`` / ``scan_warn`` card fields carry
+    the same values for pre-existing consumers. ``findings`` carries up
+    to ``_MAX_CARD_FINDINGS`` entries so the UI can say WHY a scan
+    tripped instead of just showing counts.
+    """
+
+    status: str | None = None
+    critical_count: int = 0
+    warning_count: int = 0
+    findings: list[ScanFindingOut] = Field(default_factory=list)
+
+
+class ForgeEvidence(BaseModel):
+    """Forge cluster evidence, surfaced only for ``source='forge'``
+    cards: how many behavior traces the candidate was distilled from
+    and how many distinct agents produced them. Values live in
+    ``data.origin`` on disk (the auto-gate evaluator reads them there).
+    """
+
+    cluster_size: int = 0
+    distinct_agents: int = 0
+
+
+class InboxCard(BaseModel):
+    """One row in the Inbox list response. Shape matches what the
+    card-UI surfaces — keep the field list in sync with plan §10.
+    """
+
+    slug: str = Field(..., description="Skill slug (also doc_id, with optional forge/ prefix)")
+    doc_id: str
+    name: str | None = None
+    description: str | None = None
+    summary: str | None = None
+    # Full SKILL.md body. The list response is the ONLY inbox read
+    # surface (there is no per-slug GET); the edit UI needs the body to
+    # pre-fill the Edit form, but bodies are heavy
+    # (``skills_factory.body_max_bytes``, 40 KB default, times the page limit),
+    # so the list omits them UNLESS ``?include_content=true`` is passed.
+    content: str | None = None
+    domain: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    source: str | None = None
+    status: str
+    fingerprint: str | None = None
+    scan_state: str | None = None
+    scan_critical: int = 0
+    scan_warn: int = 0
+    # Nested duplicates of the scan / evidence fields in the shape the
+    # dashboard card UI consumes. Kept alongside the flat fields (and
+    # ``origin``) so neither consumer generation breaks.
+    sentinel_scan: SentinelScanSummary | None = None
+    forge_evidence: ForgeEvidence | None = None
+    origin: dict = Field(default_factory=dict)
+    # Forge writes a free-text rationale string; hand-authored or
+    # legacy docs may carry a structured dict. Accept both — typing
+    # this ``dict`` made the whole list endpoint 500 on the first
+    # Forge-minted card. Absent evidence serializes as ``{}``, never
+    # null (downstream card UIs predate the union and may lack a
+    # null guard), so ``None`` is deliberately NOT in the type.
+    evidence: str | dict = Field(default_factory=dict)
+    # Memory-ID provenance: the memories this skill was distilled
+    # from. Present on every Forge candidate (SF-002 validator
+    # requires it); empty for hand-authored docs.
+    cites: list[str] = Field(default_factory=list)
+    created_at: str | None = None
+    updated_at: str | None = None
+    content_hash: str | None = None
+    kind: str | None = None
+    target: dict | None = None
+    # When set, this card was Deferred — Inbox sorts it to the bottom
+    # so the queue surface stays focused on fresh actionable items.
+    deferred_at: str | None = None
+
+
+class InboxListResponse(BaseModel):
+    tenant_id: str
+    fleet_id: str | None
+    count: int
+    # True when more staged cards exist than this page returned (the
+    # effective limit — min(limit, inbox_max_pending, 200) — cut the
+    # list, or the oversample window saturated). Lets the UI say
+    # "there's more" instead of guessing from page fullness: a page of
+    # exactly ``count`` items is indistinguishable from a capped one
+    # without this flag.
+    truncated: bool = False
+    items: list[InboxCard]
+
+
+class RejectRequest(BaseModel):
+    model_config = STRICT_WRITE_BODY
+
+    reason: str = Field(..., min_length=1, max_length=2000)
+    cooloff_days: int | None = Field(
+        default=None,
+        ge=1,
+        le=365,
+        description=(
+            "Override poison-table cooloff. Defaults to org_settings.skills_factory.rejection_cooloff_days. "
+            "Ignored for a skill with no cluster fingerprint, such as one an agent wrote: there is no "
+            "Forge cluster to cool off."
+        ),
+    )
+
+
+class QuarantineRequest(BaseModel):
+    model_config = STRICT_WRITE_BODY
+
+    reason: str = Field(..., min_length=1, max_length=2000)
+
+
+class DeferRequest(BaseModel):
+    model_config = STRICT_WRITE_BODY
+
+    reason: str | None = Field(default=None, max_length=2000)
+
+
+class EditRequest(BaseModel):
+    model_config = STRICT_WRITE_BODY
+
+    content: str | None = None
+    description: str | None = None
+    summary: str | None = None
+
+    def has_changes(self) -> bool:
+        return any(v is not None for v in (self.content, self.description, self.summary))
+
+
+# What quarantine leaves on a doc. An override approve moves them into
+# ``quarantine_override``: on an active skill they would say it is quarantined.
+_QUARANTINE_MARKERS = ("quarantined_at", "quarantine_reason")
+
+
+def _approver(auth: AuthContext) -> str:
+    """Who approved an override (M-120), for the doc and the audit row.
+
+    The gateway user when there is one, else the calling agent. The admin API key
+    carries neither, so it is named by its credential, as is a tenant key.
+    """
+    if auth.user_id:
+        return auth.user_id
+    if auth.agent_id:
+        return str(auth.agent_id)
+    return "admin-api-key" if auth.is_admin else "tenant-api-key"
+
+
+class ApproveRequest(BaseModel):
+    """Approve's optional body: only an override needs one (M-120)."""
+
+    model_config = STRICT_WRITE_BODY
+
+    override_quarantine: bool = Field(
+        default=False,
+        description=(
+            "Approve although Sentinel holds the skill: a quarantined skill, or a staged one whose "
+            "pre-apply rescan is critical. Needs a reason and is recorded in the audit log. Never lifts "
+            "a fatal finding (a size or path limit)."
+        ),
+    )
+    reason: str | None = Field(default=None, min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def _an_override_gives_a_reason(self) -> ApproveRequest:
+        if self.override_quarantine and self.reason is None:
+            raise ValueError("override_quarantine needs a reason")
+        return self
+
+
+class ActionResponse(BaseModel):
+    slug: str
+    previous_status: str
+    new_status: str
+    detail: str | None = None
+
+
+# ── Helpers ────────────────────────────────────────────────────────
+
+
+def _card_from_doc(doc: dict) -> InboxCard:
+    data = doc.get("data") or {}
+    scan = data.get("scan") or {}
+    # Coerce to ``str`` for the typed Pydantic model. Storage always
+    # populates ``doc_id`` (it's the lookup key); the empty-string
+    # fallbacks are defensive against malformed rows.
+    #
+    # ``slug`` must be the FULL ``doc_id`` (e.g. ``forge/abc``), not
+    # the bare ``data.slug`` (``abc``), because every Inbox action
+    # endpoint resolves the doc via ``doc_id=slug``. Forge writes
+    # ``doc_id="forge/<slug>"`` while ``data.slug="<slug>"`` (bare);
+    # if the card surfaced the bare slug, every action call would
+    # 404 for Forge-namespaced candidates.
+    doc_id: str = doc.get("doc_id") or ""
+    slug: str = doc_id or data.get("slug") or ""
+
+    sentinel_scan: SentinelScanSummary | None = None
+    if scan:
+        raw_findings = scan.get("findings")
+        findings: list[ScanFindingOut] = []
+        if isinstance(raw_findings, list):
+            for f in raw_findings:
+                if len(findings) >= _MAX_CARD_FINDINGS:
+                    break
+                # Skip malformed entries (don't 500 the page, and don't
+                # let junk consume one of the capped slots).
+                if not isinstance(f, dict):
+                    continue
+                findings.append(
+                    ScanFindingOut(
+                        code=str(f.get("code") or ""),
+                        severity=str(f.get("severity") or ""),
+                        message=str(f.get("message") or ""),
+                        fatal=bool(f.get("fatal", False)),
+                        locator=(str(f["locator"]) if f.get("locator") else None),
+                    )
+                )
+        sentinel_scan = SentinelScanSummary(
+            status=scan.get("state"),
+            critical_count=scan.get("critical", 0),
+            warning_count=scan.get("warn", 0),
+            findings=findings,
+        )
+
+    # Evidence counters ride in ``data.origin`` (Forge stamps them for
+    # the auto-gate evaluator). Only surface the nested block for Forge
+    # cards — for hand-authored docs ``origin`` describes the writer,
+    # not a cluster, and a zero-filled block would render as
+    # "0 occurrences across 0 agents".
+    origin = data.get("origin") or {}
+    forge_evidence: ForgeEvidence | None = None
+    if (
+        data.get("source") == "forge"
+        and isinstance(origin, dict)
+        and ("cluster_size" in origin or "distinct_agents" in origin)
+    ):
+        forge_evidence = ForgeEvidence(
+            cluster_size=origin.get("cluster_size") or 0,
+            distinct_agents=origin.get("distinct_agents") or 0,
+        )
+
+    # Bound to a local so mypy can narrow the ``None`` away (two
+    # separate ``data.get`` calls in a ternary don't narrow).
+    raw_evidence = data.get("evidence")
+    evidence: str | dict = raw_evidence if raw_evidence is not None else {}
+
+    return InboxCard(
+        slug=slug,
+        doc_id=doc_id,
+        name=data.get("name"),
+        description=data.get("description"),
+        summary=data.get("summary"),
+        content=data.get("content"),
+        domain=data.get("domain"),
+        tags=data.get("tags") or [],
+        source=data.get("source"),
+        status=data.get("status", ""),
+        fingerprint=data.get("cluster_fingerprint"),
+        scan_state=scan.get("state"),
+        scan_critical=scan.get("critical", 0),
+        scan_warn=scan.get("warn", 0),
+        sentinel_scan=sentinel_scan,
+        forge_evidence=forge_evidence,
+        origin=origin,
+        # Absent evidence stays an EMPTY OBJECT (never null on the wire):
+        # downstream card UIs predate the nullable union and may lack a
+        # null guard. Forge string/dict values pass through unchanged.
+        evidence=evidence,
+        # Stringify defensively — cites are memory UUIDs written as
+        # strings, but a malformed row must degrade to a bad link in
+        # the UI, not a 500 on the whole page.
+        cites=[str(c) for c in (data.get("cites") or []) if c is not None],
+        created_at=data.get("created_at"),
+        updated_at=data.get("updated_at"),
+        content_hash=data.get("content_hash"),
+        kind=data.get("kind"),
+        target=data.get("target"),
+        deferred_at=data.get("deferred_at"),
+    )
+
+
+def _binding_target_slug(data: dict) -> str | None:
+    """Which live skill a ``kind='update'`` candidate binds against.
+
+    ``data["slug"]``, and named here so it can be tested without standing up
+    the whole edit route. It read ``data["target"]["slug"]`` before: ``target``
+    carries ``target_content_hash`` and nothing else — the validator requires
+    that one key and no writer has ever set a ``slug`` beside it — so the
+    lookup always came back None and the binding gate refused every edit with
+    "no live skill exists", naming a skill that does.
+
+    ``validate_and_normalize_skill_write``'s own gate resolves the live skill
+    by ``doc["slug"]``; reading the same key is what makes the pre-fetch and
+    the check agree about which document is being bound.
+    """
+    if data.get("kind") != "update":
+        return None
+    slug = data.get("slug")
+    return slug if isinstance(slug, str) and slug else None
+
+
+async def _load_doc_or_404(*, tenant_id: str, slug: str) -> dict:
+    """Load one inbox doc, from the WRITER.
+
+    Every caller here is a read-modify-write: approve, edit, defer and reject
+    all load the doc, change part of it, and upsert the whole thing back. A
+    replica read makes that a lost update — approve reloads the version from
+    before a just-saved edit and writes it back, silently reverting the edit,
+    and the TOCTOU re-checks that exist to catch concurrent modification
+    re-read the same stale copy and agree with themselves.
+
+    ``get_document``'s own docstring already names this case: "read=False
+    forces the primary — use it for read-after-write re-fetches ... so
+    replication lag can't yield None." The inbox is where that matters most and
+    was the one place not passing it.
+    """
+    sc = get_storage_client()
+    doc = await sc.get_document(
+        tenant_id=tenant_id,
+        collection=SKILLS_COLLECTION,
+        doc_id=slug,
+        read=False,
+    )
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"skill {slug!r} not found")
+    return doc
+
+
+async def _reload_and_assert_status(
+    *,
+    tenant_id: str,
+    slug: str,
+    expected_statuses: set[str],
+) -> dict:
+    """TOCTOU guard: re-fetch the doc just before mutating it, and
+    raise 409 if its status changed since the handler's initial load.
+
+    Every Inbox action follows the same shape: load → do work
+    (rescan / validate / poison-write) → mutate. Between the initial
+    load and the mutation, a concurrent operator (or the lifecycle
+    promoter worker) may have moved the doc — without this guard, two
+    racing approves both flip ``staged → active`` and the second one
+    silently re-clobbers the doc; a race between Approve and Reject
+    leaves the poison row + an ``active`` doc.
+    """
+    doc = await _load_doc_or_404(tenant_id=tenant_id, slug=slug)
+    current_status = (doc.get("data") or {}).get("status")
+    if current_status not in expected_statuses:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"skill {slug!r} was concurrently transitioned to "
+                f"status={current_status!r} (expected one of {sorted(expected_statuses)}); "
+                f"reload and retry"
+            ),
+        )
+    return doc
+
+
+async def _persist_status_transition(
+    *,
+    tenant_id: str,
+    fleet_id: str | None,
+    slug: str,
+    doc: dict,
+    new_status: str,
+    extra_data_patches: dict | None = None,
+    remove_keys: tuple[str, ...] = (),
+) -> tuple[str, dict]:
+    """Patch ``data.status`` (plus any extras) and upsert. Returns
+    ``(previous_status, new_data)`` for audit + response shaping.
+
+    ``remove_keys`` drops the named keys from ``data`` before the
+    upsert — useful for clearing transient markers (e.g. clearing
+    ``deferred_at`` when an Approve crystallizes the doc to active).
+    """
+    data = dict(doc.get("data") or {})
+    previous_status = data.get("status", "")
+    data["status"] = new_status
+    now_iso = datetime.now(UTC).isoformat(timespec="seconds")
+    data[f"{new_status}_at"] = now_iso
+    # Bump the indexable ``updated_at`` so every Inbox-driven status
+    # transition (approve/reject/quarantine/defer/edit) becomes
+    # discoverable via sort-by-modified-time. Without this, a doc that
+    # transitions through the inbox retains the timestamp from its
+    # original Forge write. Coexists with the per-status
+    # ``<status>_at`` (human-readable intent) and ``edited_at`` (set
+    # by the edit handler) — those tell you WHY, this tells you WHEN.
+    data["updated_at"] = now_iso
+    if extra_data_patches:
+        data.update(extra_data_patches)
+    for key in remove_keys:
+        data.pop(key, None)
+    sc = get_storage_client()
+    await sc.upsert_document(
+        {
+            "tenant_id": tenant_id,
+            "fleet_id": fleet_id,
+            "collection": SKILLS_COLLECTION,
+            "doc_id": slug,
+            "data": data,
+        }
+    )
+    return previous_status, data
+
+
+# ── Endpoints ──────────────────────────────────────────────────────
+
+
+# Registered at BOTH ``/skills-inbox`` and ``/skills-inbox/``: browser
+# clients call the bare path and Starlette's redirect_slashes would
+# otherwise answer with a 307 whose Location is built from the backend
+# host — behind the SaaS gateway that leaks the internal upstream URL
+# and costs an extra round-trip. The bare path is the canonical
+# (schema-visible) one.
+@router.get("", response_model=InboxListResponse)
+@router.get("/", response_model=InboxListResponse, include_in_schema=False)
+async def list_inbox(
+    fleet_id: str | None = None,
+    # Tenant selector for ADMIN credentials (auth Path 1 carries no
+    # tenant of its own — see _require_tenant / WT-4). Tenant-scoped
+    # keys may omit it (their own tenant wins) or echo it; a
+    # conflicting value is a 403.
+    tenant_id: str | None = Query(None),
+    # Validated at the FastAPI layer: 1 ≤ limit ≤ 200. A bare ``int=50``
+    # default would 200 on any non-negative input — including ``limit=0``
+    # (silently empty list) and ``limit=10_000`` (DoS via wide query).
+    limit: int = Query(50, ge=1, le=200),
+    # Full SKILL.md bodies are heavy (body_max_bytes times the page limit); the
+    # list stays lean by default and the edit UI opts in explicitly.
+    include_content: bool = Query(False),
+    # M-120: reviewers open quarantined skills here too, to approve one with an
+    # override or reject it. Other statuses are not the inbox's: a candidate
+    # is the promoter's, and active and rejected skills are done with.
+    status: Literal["staged", "quarantined"] = Query("staged"),
+    auth: AuthContext = Depends(get_auth_context),
+) -> InboxListResponse:
+    """List the tenant's skills in ``status`` (``staged`` by default).
+
+    Caps default to ``org_settings.skills_factory.inbox_max_pending``;
+    beyond that, auto-defer is the relief valve (Phase 2 worker
+    enforces).
+    """
+    tenant_id = _require_tenant(auth, tenant_id)
+    settings = await _require_skills_factory_enabled(tenant_id)
+    max_pending = (
+        ((settings.get("skills_factory") or {}).get("inbox_max_pending"))
+        if isinstance(settings, dict)
+        else None
+    )
+    # ``max_pending or limit`` would coerce ``max_pending=0`` (a
+    # tenant explicitly muting the inbox) into "uncapped"; check
+    # ``is not None`` so a zero cap actually caps.
+    effective_limit = min(limit, max_pending if max_pending is not None else limit, 200)
+
+    # Storage ``where`` is JSONB scalar equality on ``data->>key`` --
+    # it does NOT filter the top-level ``fleet_id`` column. The
+    # ``query_documents`` API has a separate top-level ``fleet_id``
+    # parameter for that (see core-storage's ``document_query``).
+    # Putting fleet_id in ``where`` only works if writers mirror
+    # ``fleet_id`` into ``data``, which is brittle. Pass it as the
+    # dedicated top-level parameter so we filter on the indexed
+    # column directly.
+    where: dict = {"status": status}
+
+    # The storage layer's ``where`` is JSONB scalar equality and does
+    # NOT support an ``IS NULL`` predicate (see ``document_query`` in
+    # core-storage's postgres_service), so we can't ask the DB to
+    # split deferred vs non-deferred for us. To avoid the prior bug --
+    # an older deferred doc consuming a page slot ahead of a fresh
+    # candidate -- we OVERSAMPLE in a single query (capped at 2x the
+    # effective limit, hard-capped at 400), partition in Python, and
+    # take up-to-limit non-deferred FIRST, then fill remaining slots
+    # with deferred. The deferred-at-bottom invariant holds for the
+    # 2x window; an explicit DB-side priority sort would require
+    # extending storage's ``order_by`` shape and is out of scope here.
+    oversample_limit = min(effective_limit * 2, 400)
+    query_body: dict = {
+        "tenant_id": tenant_id,
+        "collection": SKILLS_COLLECTION,
+        "where": where,
+        "limit": oversample_limit,
+        "offset": 0,
+        "order_by": "created_at",
+        # DESC so fresh candidates land at the front of the
+        # oversample window. ASC would let an old deferred
+        # backlog fill the window first and starve the page of
+        # fresh items.
+        "order": "desc",
+    }
+    if fleet_id is not None:
+        query_body["fleet_id"] = fleet_id
+    sc = get_storage_client()
+    rows = await sc.query_documents(query_body)
+
+    all_cards = [_card_from_doc(r) for r in rows or []]
+    # Guard against ``oversample_limit == 0`` (tenant explicitly muted
+    # the inbox via ``inbox_max_pending=0``); otherwise we'd log a
+    # spurious "cap hit" warning on every empty list call.
+    if oversample_limit > 0 and len(all_cards) >= oversample_limit:
+        # The oversample window saturated -- there are more staged
+        # candidates than the partition pass can see. We won't 500,
+        # but the page is missing the tail; operators should narrow
+        # by fleet or raise inbox_max_pending.
+        logger.warning(
+            "skill_inbox list: oversample cap hit (tenant=%s fleet=%s oversample_limit=%d); "
+            "some staged candidates may not appear in this page",
+            tenant_id,
+            fleet_id,
+            oversample_limit,
+        )
+    active = [c for c in all_cards if not c.deferred_at]
+    deferred = [c for c in all_cards if c.deferred_at]
+    # Take non-deferred first up to effective_limit; backfill remaining
+    # slots with deferred. This is the page the operator actually
+    # works through — fresh candidates always surface before stashed
+    # ones, regardless of which set is older by ``created_at``.
+    items = active[:effective_limit]
+    remaining = effective_limit - len(items)
+    if remaining > 0:
+        items.extend(deferred[:remaining])
+
+    # More staged cards exist than this page shows when either the
+    # effective limit cut the fetched set, or the oversample window
+    # itself saturated (in which case even ``all_cards`` is missing
+    # the tail — see the warning above).
+    truncated = len(all_cards) > len(items) or (oversample_limit > 0 and len(all_cards) >= oversample_limit)
+
+    if not include_content:
+        # Lean default: drop the SKILL.md bodies from the page. The edit
+        # UI re-requests with ?include_content=true when it needs them.
+        for card in items:
+            card.content = None
+
+    return InboxListResponse(
+        tenant_id=tenant_id,
+        fleet_id=fleet_id,
+        count=len(items),
+        truncated=truncated,
+        items=items,
+    )
+
+
+@router.post("/{slug:path}/approve", response_model=ActionResponse)
+async def approve(
+    slug: str,
+    body: ApproveRequest | None = None,
+    # Tenant selector for admin credentials — see list_inbox / WT-4.
+    tenant_id: str | None = Query(None),
+    auth: AuthContext = Depends(get_auth_context),
+) -> ActionResponse:
+    """Promote ``staged → active``. Pre-apply rescan via Sentinel
+    blocks the transition if the doc became unsafe between propose
+    and apply.
+
+    With ``override_quarantine`` (M-120, owner decision 2026-10-05) a
+    reviewer may also approve a quarantined skill, or a staged one whose
+    rescan is critical. A fatal finding still refuses. The override, its
+    reason and the codes it overrode are kept on the doc and in a
+    critical audit row.
+    """
+    auth.enforce_read_only()
+    tenant_id = _require_tenant(auth, tenant_id)
+    settings = await _require_skills_factory_enabled(tenant_id)
+    _require_inbox_admin(auth)
+    sf = (settings or {}).get("skills_factory") if isinstance(settings, dict) else {}
+    body_max = (sf or {}).get("body_max_bytes", 40_000)
+    desc_max = (sf or {}).get("description_max_bytes", 160)
+
+    body = body or ApproveRequest()
+    override = body.override_quarantine
+    approvable = {"staged", "quarantined"} if override else {"staged"}
+
+    # Initial cheap pre-flight: bail out fast if the doc is obviously
+    # not in an approvable state. The expensive Sentinel rescan only runs
+    # against the doc we'll actually approve (see TOCTOU guard below).
+    doc = await _load_doc_or_404(tenant_id=tenant_id, slug=slug)
+    data = doc.get("data") or {}
+    if data.get("status") not in approvable:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"skill {slug!r} status={data.get('status')!r}; can only approve from 'staged'"
+                + (" or 'quarantined'" if override else " ('quarantined' needs override_quarantine)")
+            ),
+        )
+
+    # TOCTOU guard FIRST — a concurrent Edit between the initial load
+    # and the rescan would mean we scan the old content but stamp the
+    # rescan result onto the new content (post-edit). Reload, then
+    # scan the canonical doc.
+    #
+    # A second concurrent Edit between THIS reload and the upsert is
+    # still theoretically possible; the storage layer's per-row
+    # ordering keeps last write wins and an Edit during Approve is
+    # the operator's prerogative anyway. We narrow the window from
+    # "across rescan" to "across a single upsert", which is the
+    # tightest we can get without a per-doc lock.
+    doc = await _reload_and_assert_status(tenant_id=tenant_id, slug=slug, expected_statuses=approvable)
+    data = doc.get("data") or {}
+    # Snapshot the content_hash BEFORE the rescan. After the rescan
+    # we check that the content hasn't drifted — a concurrent Edit
+    # leaves status='staged' (the status guard wouldn't catch it) but
+    # changes ``content`` + ``content_hash``. Without this check the
+    # operator would persist a stale "clean" verdict on now-modified
+    # (possibly injected) content.
+    pre_scan_content_hash = data.get("content_hash")
+    if not isinstance(pre_scan_content_hash, str) or not pre_scan_content_hash:
+        # Fail closed: every Forge-written candidate gets a
+        # ``content_hash`` via the validator (SF-002). A staged doc
+        # without one is malformed and cannot be safely approved
+        # because the drift guard below would degenerate to
+        # ``None != None`` (always False) and silently pass.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"skill {slug!r} has no content_hash; cannot safely approve "
+                f"(rerun Forge to re-derive, or reject the candidate)"
+            ),
+        )
+
+    # Third TOCTOU reload — catches Reject/Quarantine races (status
+    # changed away from 'staged'). Plus the content_hash check below
+    # catches Edit races (status stayed 'staged' but content changed).
+    doc = await _reload_and_assert_status(tenant_id=tenant_id, slug=slug, expected_statuses=approvable)
+    third_data = doc.get("data") or {}
+    if third_data.get("content_hash") != pre_scan_content_hash:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"skill {slug!r} content was modified during the rescan; reload and retry approve"),
+        )
+
+    # Scan against ``third_data`` (the post-reload canonical doc), not
+    # the earlier ``data`` snapshot. The reload above already proved
+    # ``third_data.content_hash == pre_scan_content_hash`` so the
+    # content bytes are guaranteed identical to what we snapshotted,
+    # but scanning ``third_data`` is the honest shape: the ``data.scan``
+    # payload we persist is computed against the bytes we're about to
+    # crystallize. Call ``scan_skill_doc`` directly so the allow-verdict
+    # AND the persisted ``data.scan`` come from the SAME ``ScanResult``
+    # (``as_doc_field()`` rehydrates the full ``scanned_at`` / counters /
+    # findings shape).
+    scan_result = await scan_skill_doc(
+        third_data, mode="pre-apply", body_max_bytes=body_max, description_max_bytes=desc_max
+    )
+    # An override lifts a critical verdict, never a fatal finding: that is a
+    # size or path limit on what may be stored at all.
+    passes = scan_result.state == "clean" or (override and scan_result.state == "quarantined")
+    if scan_result.any_fatal or not passes:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"pre-apply rescan refused (state={scan_result.state}): "
+                f"{[(f.code, f.message) for f in scan_result.findings]}"
+            ),
+        )
+    rescan_payload = scan_result.as_doc_field()
+    # The rescan's verdict is persisted either way, so an overridden skill keeps
+    # the findings it was approved over, next to who approved it and why.
+    patches: dict[str, Any] = {"scan": rescan_payload}
+    if override:
+        patches["quarantine_override"] = {
+            "reason": body.reason,
+            "critical_codes": [f.code for f in scan_result.findings if f.severity == "critical"],
+            "approved_by": _approver(auth),
+            **{key: third_data[key] for key in _QUARANTINE_MARKERS if key in third_data},
+        }
+
+    prev, new_data = await _persist_status_transition(
+        tenant_id=tenant_id,
+        fleet_id=(doc or {}).get("fleet_id"),
+        slug=slug,
+        doc=doc,
+        new_status="active",
+        extra_data_patches=patches,
+        # Approving crystallizes the doc to ``active``; clear the
+        # transient defer markers so an active skill never carries
+        # a stale "deferred_at" timestamp. Mirrors the same pop in
+        # the edit handler. An override also clears the quarantine
+        # markers, which ``quarantine_override`` now holds.
+        remove_keys=("deferred_at", "defer_reason", *(_QUARANTINE_MARKERS if override else ())),
+    )
+    # Best-effort audit: the status transition already landed in
+    # storage via the upsert above. Failing to write the audit row
+    # should NOT 500 the operator — we log + swallow.
+    try:
+        await log_action(
+            tenant_id=tenant_id,
+            agent_id=auth.agent_id,
+            action="skill_inbox_approve",
+            resource_type="document",
+            # ``log_action`` types ``resource_id`` as ``UUID | None`` but
+            # its runtime accepts any truthy value (it stringifies via
+            # ``str(resource_id) if resource_id else None``). Slugs are
+            # human-readable and grep-friendly in the audit log; keep
+            # the directive intact and suppress the type warning.
+            resource_id=doc.get("doc_id") or slug,  # type: ignore[arg-type]
+            detail={
+                "slug": slug,
+                "previous_status": prev,
+                **({"override_quarantine": True, **patches["quarantine_override"]} if override else {}),
+            },
+            # An override is a compliance event: a full audit queue writes it
+            # synchronously instead of dropping it.
+            critical=override,
+        )
+    except Exception:
+        logger.error(
+            "skill_inbox: audit log failed for approve slug=%s",
+            slug,
+            exc_info=True,
+        )
+    return ActionResponse(slug=slug, previous_status=prev, new_status="active")
+
+
+@router.post("/{slug:path}/reject", response_model=ActionResponse)
+async def reject(
+    slug: str,
+    body: RejectRequest,
+    # Tenant selector for admin credentials — see list_inbox / WT-4.
+    tenant_id: str | None = Query(None),
+    auth: AuthContext = Depends(get_auth_context),
+) -> ActionResponse:
+    """Reject ``staged → rejected``. For a Forge candidate, also write its
+    cluster fingerprint to ``forge_rejected_fingerprints`` so the next
+    Forge run skips that cluster for ``cooloff_days``.
+
+    A skill an agent wrote through the documents API has no fingerprint:
+    Forge did not derive it from a cluster and will not propose it again,
+    so there is nothing to cool off. It is rejected without the poison
+    write, and an explicit ``cooloff_days`` is ignored, as the response's
+    ``detail`` says. The agent cannot stage it again under the same slug:
+    a non-admin write to a rejected slug is refused
+    (``PROTECTED_LIVE_STATUSES`` in ``skill_lifecycle``).
+
+    Fix 2 Ph5a: the poison write goes through core-storage-api
+    (``write_rejected_fingerprint`` → ``sc.forge_write_rejected_fingerprint``)
+    rather than a request-scoped DB session, so this route no longer
+    depends on ``get_db`` (the settings gate + audit log already ignore
+    their ``db`` arg and route through storage).
+    """
+    auth.enforce_read_only()
+    tenant_id = _require_tenant(auth, tenant_id)
+    settings = await _require_skills_factory_enabled(tenant_id)
+    _require_inbox_admin(auth)
+    sf = (settings or {}).get("skills_factory") if isinstance(settings, dict) else {}
+    default_cooloff = (sf or {}).get("rejection_cooloff_days", 30)
+    # ``or`` would treat ``cooloff_days=0`` (operator intent: don't
+    # cool off at all) as "fall back to default". Pydantic's ``ge=1``
+    # makes 0 unreachable today, but ``is not None`` is the future-
+    # safe shape and matches the rest of this module.
+    cooloff = body.cooloff_days if body.cooloff_days is not None else default_cooloff
+
+    doc = await _load_doc_or_404(tenant_id=tenant_id, slug=slug)
+    data = doc.get("data") or {}
+    if data.get("status") not in {"staged", "candidate", "quarantined"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"skill {slug!r} status={data.get('status')!r}; can only reject from staged/candidate/quarantined",
+        )
+    fingerprint = data.get("cluster_fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        # Only a Forge candidate has a cluster to poison. Any other skill,
+        # such as one an agent staged, is rejected without the poison
+        # write; this used to answer 422, so none of them could be.
+        fingerprint = None
+
+    # TOCTOU guard: re-fetch the doc and confirm it's still in a
+    # rejectable status BEFORE we poison the cluster. Without this,
+    # a concurrent Approve could flip the doc to ``active`` between
+    # our initial load and this point — we'd then poison a cluster
+    # that just shipped (and the next Forge run would refuse to
+    # re-derive the now-deleted+re-needed skill for cooloff_days).
+    # With no cluster, it still guards the status flip, which would
+    # otherwise overwrite that Approve with ``rejected``.
+    #
+    # Ph5a NOTE: the poison write now commits storage-side immediately
+    # (no shared SQLAlchemy transaction to roll back), so the pre-Ph5a
+    # "stage INSERT → reload → commit-or-rollback" dance is gone. We
+    # instead do BOTH reload guards up front and only issue the poison
+    # write once the doc is confirmed rejectable. The residual race
+    # (a concurrent Approve landing between this final reload and the
+    # poison write) leaves at most one harmless extra poison row — the
+    # exact worst case the pre-Ph5a code already documented and
+    # tolerated (the poison table dedups nothing and the cooloff on a
+    # shipped cluster is benign).
+    doc = await _reload_and_assert_status(
+        tenant_id=tenant_id,
+        slug=slug,
+        expected_statuses={"staged", "candidate", "quarantined"},
+    )
+    if fingerprint is not None:
+        # Re-derive fingerprint from the FRESH doc — an Edit may have
+        # changed adjacent fields but content_hash + fingerprint stay
+        # bound to the cluster identity, so this is belt-and-suspenders.
+        data = doc.get("data") or {}
+        fingerprint = data.get("cluster_fingerprint")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise HTTPException(
+                status_code=422,
+                detail=f"skill {slug!r} has no fingerprint after reload; cannot poison cluster",
+            )
+
+        # Second TOCTOU reload — narrows the window before the poison write.
+        doc = await _reload_and_assert_status(
+            tenant_id=tenant_id,
+            slug=slug,
+            expected_statuses={"staged", "candidate", "quarantined"},
+        )
+
+        try:
+            await write_rejected_fingerprint(
+                tenant_id=tenant_id,
+                fleet_id=doc.get("fleet_id"),
+                cluster_fingerprint=fingerprint,
+                rejected_by_agent=(canonical_service_agent_id(auth.agent_id) if auth.agent_id else "unknown"),
+                reason=body.reason,
+                cooloff_days=cooloff,
+            )
+        except ValueError as exc:
+            # ``write_rejected_fingerprint`` raises ValueError on cooloff_days < 1
+            # or an empty fingerprint. Pydantic's ``ge=1`` on the request body
+            # catches the former, but a stale org_settings.rejection_cooloff_days
+            # could still inject 0; surface as 422 rather than 500.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        prev, _ = await _persist_status_transition(
+            tenant_id=tenant_id,
+            fleet_id=doc.get("fleet_id"),
+            slug=slug,
+            doc=doc,
+            new_status="rejected",
+            extra_data_patches={"rejection_reason": body.reason},
+        )
+    except Exception:
+        if fingerprint is not None:
+            # The poison row already committed storage-side (no shared txn to
+            # roll back). If the status flip fails HERE, the cluster is poisoned
+            # for cooloff_days while the doc still reads as a rejectable status —
+            # an inconsistent state an operator must reconcile by hand. Surface
+            # it loudly rather than letting it read as a generic 500.
+            logger.error(
+                "skill_inbox: reject status-flip FAILED after poison write for slug=%s — "
+                "the poison row is committed but the doc was NOT flipped to 'rejected'; "
+                "the cluster is silently blocked for %d days. Manual intervention required.",
+                slug,
+                cooloff,
+                exc_info=True,
+            )
+        raise
+    # Best-effort audit. Any poison row already committed storage-side and
+    # the doc-status upsert already landed in storage; an audit-row
+    # failure must not 500 a successful reject.
+    try:
+        await log_action(
+            tenant_id=tenant_id,
+            action="skill_inbox_reject",
+            resource_type="document",
+            # ``log_action`` types ``resource_id`` as ``UUID | None`` but
+            # its runtime accepts any truthy value (it stringifies via
+            # ``str(resource_id) if resource_id else None``). Slugs are
+            # human-readable and grep-friendly in the audit log; keep
+            # the directive intact and suppress the type warning.
+            resource_id=doc.get("doc_id") or slug,  # type: ignore[arg-type]
+            detail={
+                "slug": slug,
+                "previous_status": prev,
+                "cooloff_days": cooloff if fingerprint is not None else None,
+                "fingerprint": fingerprint,
+            },
+        )
+    except Exception:
+        logger.error(
+            "skill_inbox: audit log failed for reject slug=%s",
+            slug,
+            exc_info=True,
+        )
+    if fingerprint is not None:
+        detail = f"cluster fingerprint poisoned for {cooloff} days"
+    else:
+        detail = "no cluster fingerprint, so no cooloff was set"
+        if body.cooloff_days is not None:
+            detail += "; cooloff_days was ignored"
+    return ActionResponse(
+        slug=slug,
+        previous_status=prev,
+        new_status="rejected",
+        detail=detail,
+    )
+
+
+@router.post("/{slug:path}/quarantine", response_model=ActionResponse)
+async def quarantine(
+    slug: str,
+    body: QuarantineRequest,
+    # Tenant selector for admin credentials — see list_inbox / WT-4.
+    tenant_id: str | None = Query(None),
+    auth: AuthContext = Depends(get_auth_context),
+) -> ActionResponse:
+    """Move to ``quarantined`` for security review. Does NOT touch the
+    poison table — quarantine is reversible by a security admin; only
+    Reject crystallizes a poison row.
+    """
+    auth.enforce_read_only()
+    tenant_id = _require_tenant(auth, tenant_id)
+    await _require_skills_factory_enabled(tenant_id)
+    _require_inbox_admin(auth)
+    doc = await _load_doc_or_404(tenant_id=tenant_id, slug=slug)
+    data = doc.get("data") or {}
+    if data.get("status") not in {"staged", "candidate"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"skill {slug!r} status={data.get('status')!r}; can only quarantine from staged/candidate",
+        )
+    # TOCTOU guard before the status flip.
+    doc = await _reload_and_assert_status(
+        tenant_id=tenant_id, slug=slug, expected_statuses={"staged", "candidate"}
+    )
+    prev, _ = await _persist_status_transition(
+        tenant_id=tenant_id,
+        fleet_id=doc.get("fleet_id"),
+        slug=slug,
+        doc=doc,
+        new_status="quarantined",
+        extra_data_patches={"quarantine_reason": body.reason},
+    )
+    # Best-effort audit; status transition already persisted.
+    try:
+        await log_action(
+            tenant_id=tenant_id,
+            action="skill_inbox_quarantine",
+            resource_type="document",
+            # ``log_action`` types ``resource_id`` as ``UUID | None`` but
+            # its runtime accepts any truthy value (it stringifies via
+            # ``str(resource_id) if resource_id else None``). Slugs are
+            # human-readable and grep-friendly in the audit log; keep
+            # the directive intact and suppress the type warning.
+            resource_id=doc.get("doc_id") or slug,  # type: ignore[arg-type]
+            detail={"slug": slug, "previous_status": prev, "reason": body.reason},
+        )
+    except Exception:
+        logger.error(
+            "skill_inbox: audit log failed for quarantine slug=%s",
+            slug,
+            exc_info=True,
+        )
+    return ActionResponse(slug=slug, previous_status=prev, new_status="quarantined")
+
+
+@router.post("/{slug:path}/defer", response_model=ActionResponse)
+async def defer(
+    slug: str,
+    # Optional: every DeferRequest field is optional, so a bodyless
+    # ``POST`` (curl operators, the documented "empty body" contract)
+    # must not 422 on the envelope itself.
+    body: DeferRequest | None = None,
+    # Tenant selector for admin credentials — see list_inbox / WT-4.
+    tenant_id: str | None = Query(None),
+    auth: AuthContext = Depends(get_auth_context),
+) -> ActionResponse:
+    """Defer — leaves the doc in ``staged`` so Forge can revise it on
+    the next run. Stamps ``deferred_at`` so the inbox can sort
+    deferred items to the bottom + show "deferred N days ago".
+    """
+    auth.enforce_read_only()
+    tenant_id = _require_tenant(auth, tenant_id)
+    await _require_skills_factory_enabled(tenant_id)
+    _require_inbox_admin(auth)
+    doc = await _load_doc_or_404(tenant_id=tenant_id, slug=slug)
+    data = doc.get("data") or {}
+    if data.get("status") != "staged":
+        raise HTTPException(
+            status_code=409,
+            detail=f"skill {slug!r} status={data.get('status')!r}; can only defer from 'staged'",
+        )
+    # TOCTOU guard before the deferred_at stamp.
+    doc = await _reload_and_assert_status(tenant_id=tenant_id, slug=slug, expected_statuses={"staged"})
+    data = doc.get("data") or {}
+    # Status stays 'staged'; only stamp deferred_at + optional reason.
+    new_data = dict(data)
+    new_data["deferred_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+    reason = body.reason if body else None
+    if reason:
+        new_data["defer_reason"] = reason
+    # Defer doesn't transition status (stays ``staged``), so it never
+    # reaches ``_persist_status_transition``'s ``updated_at`` bump.
+    # Stamp it here so a Deferred-but-not-status-changed doc still
+    # surfaces correctly in sort-by-modified-time queries.
+    new_data["updated_at"] = new_data["deferred_at"]
+    sc = get_storage_client()
+    await sc.upsert_document(
+        {
+            "tenant_id": tenant_id,
+            "fleet_id": doc.get("fleet_id"),
+            "collection": SKILLS_COLLECTION,
+            "doc_id": slug,
+            "data": new_data,
+        }
+    )
+    # Best-effort audit; defer mark already persisted.
+    try:
+        await log_action(
+            tenant_id=tenant_id,
+            action="skill_inbox_defer",
+            resource_type="document",
+            # ``log_action`` types ``resource_id`` as ``UUID | None`` but
+            # its runtime accepts any truthy value (it stringifies via
+            # ``str(resource_id) if resource_id else None``). Slugs are
+            # human-readable and grep-friendly in the audit log; keep
+            # the directive intact and suppress the type warning.
+            resource_id=doc.get("doc_id") or slug,  # type: ignore[arg-type]
+            detail={"slug": slug, "reason": reason},
+        )
+    except Exception:
+        logger.error(
+            "skill_inbox: audit log failed for defer slug=%s",
+            slug,
+            exc_info=True,
+        )
+    return ActionResponse(slug=slug, previous_status="staged", new_status="staged", detail="deferred")
+
+
+@router.post("/{slug:path}/edit", response_model=ActionResponse)
+async def edit(
+    slug: str,
+    body: EditRequest,
+    # Tenant selector for admin credentials — see list_inbox / WT-4.
+    tenant_id: str | None = Query(None),
+    auth: AuthContext = Depends(get_auth_context),
+) -> ActionResponse:
+    """Edit content / description / summary, then rehash + rescan.
+    Stays ``staged``. Plan §10 acceptance:
+
+        "Edit + save → new content_hash, scan rerun, stays staged".
+
+    Raw markdown only (per OQ-D — no WYSIWYG in MVP).
+    """
+    auth.enforce_read_only()
+    tenant_id = _require_tenant(auth, tenant_id)
+    settings = await _require_skills_factory_enabled(tenant_id)
+    _require_inbox_admin(auth)
+    sf = (settings or {}).get("skills_factory") if isinstance(settings, dict) else {}
+    desc_max = (sf or {}).get("description_max_bytes", 160)
+    body_max = (sf or {}).get("body_max_bytes", 40_000)
+
+    if not body.has_changes():
+        raise HTTPException(
+            status_code=422,
+            detail="edit requires at least one of content/description/summary",
+        )
+
+    # TOCTOU guard: edits are most likely to race against the
+    # lifecycle promoter (candidate→staged) and against concurrent
+    # Approve/Reject; we re-fetch to confirm the doc is still
+    # mutable here.
+    doc = await _reload_and_assert_status(tenant_id=tenant_id, slug=slug, expected_statuses={"staged"})
+    data = dict(doc.get("data") or {})
+    if body.content is not None:
+        data["content"] = body.content
+    if body.description is not None:
+        data["description"] = body.description
+    if body.summary is not None:
+        data["summary"] = body.summary
+
+    # Snapshot the server-controlled / RBAC-gated fields BEFORE
+    # validation. The validator's SF-002 RBAC checks would 403 a
+    # non-admin operator editing a Forge-minted candidate because
+    # it carries ``source='forge'`` (which only the internal Forge
+    # writer is allowed to set). The Inbox edit only edits the
+    # human-facing content fields; the rest survive untouched.
+    # Restored onto ``normalized`` after validation so the upsert
+    # writes back what we read in.
+    # ``source`` is INTENTIONALLY NOT in this list. The validator
+    # requires ``source`` in REQUIRED_TOP_LEVEL_KEYS and would 422 if
+    # we stripped it. Instead, the validator now respects
+    # ``ctx.is_inbox_edit=True`` (set below) which bypasses the
+    # source-RBAC mint-gate so a Forge-minted candidate can be edited
+    # without 403-ing on ``source='forge'``. The other fields below
+    # are server-controlled (no validator surface) — strip + restore
+    # cleanly around the validator call.
+    _RESERVED_FIELDS = (
+        "status",
+        "cluster_fingerprint",
+        "cites",
+        "origin",
+        "created_at",
+        "telemetry",
+    )
+    reserved_snapshot: dict[str, Any] = {k: data[k] for k in _RESERVED_FIELDS if k in data}
+    for k in _RESERVED_FIELDS:
+        data.pop(k, None)
+
+    # Re-run the validator — it recomputes content_hash + scan + size
+    # caps; same code path as the original write so we get the same
+    # guarantees on the EDITABLE fields. ``is_admin`` reads the same
+    # ``is_org_admin`` property ``_require_inbox_admin`` gates on, so the
+    # validator's admin-only branches (e.g. setting ``source='forge'`` for
+    # re-installs) stay consistent with what the surrounding endpoint allows.
+    ctx = SkillWriteContext(
+        caller_agent_id=(canonical_service_agent_id(auth.agent_id) if auth.agent_id else None),
+        is_admin=auth.is_org_admin,
+        is_internal_forge=False,
+        description_max_bytes=desc_max,
+        body_max_bytes=body_max,
+        # Tell the validator this is an inbox edit (preserves
+        # existing ``source``, doesn't mint a new one). Without this
+        # flag the validator's source-RBAC would 403 every Forge-
+        # minted candidate's edit because ``source='forge'`` is
+        # INTERNAL_ONLY and our caller is the operator (not the
+        # internal Forge writer). Admin enforcement is upstream via
+        # ``_require_inbox_admin``.
+        is_inbox_edit=True,
+    )
+    # For ``kind='update'`` candidates, hash-binding must validate
+    # against the live TARGET skill (the document at ``data.slug``),
+    # NOT the candidate itself. Passing the
+    # candidate as its own ``live_skill_doc`` would let
+    # ``target.target_content_hash`` self-match and silently bypass
+    # the binding. For ``kind='create'`` the validator ignores
+    # ``live_skill_doc``, so ``None`` is the safe default.
+    live_for_binding: dict | None = None
+    # Which key names the target, and why, is ``_binding_target_slug``'s own
+    # docstring — including the ``kind`` check, which is why there is no second
+    # one here.
+    target_slug = _binding_target_slug(data)
+    if target_slug:
+        sc_binding = get_storage_client()
+        live_for_binding = await sc_binding.get_document(
+            tenant_id=tenant_id,
+            collection=SKILLS_COLLECTION,
+            doc_id=target_slug,
+            # The edit is a read-modify-write against this document and the
+            # binding compares its content hash; a replica read can bind
+            # against a version that is already gone.
+            read=False,
+        )
+    normalized, scan = await validate_and_normalize_skill_write(
+        data, ctx=ctx, live_skill_doc=live_for_binding
+    )
+    # Capture the validator's quarantine verdict BEFORE the reserved
+    # snapshot restoration. The snapshot contains the pre-edit
+    # ``status`` (typically ``"staged"``); without this capture the
+    # restoration loop overwrites a fresh Sentinel ``"quarantined"``
+    # verdict and the quarantine guard below would never fire.
+    quarantine_triggered = normalized.get("status") == "quarantined"
+    quarantined_at_val = normalized.get("quarantined_at")
+
+    # Restore the server-controlled snapshot — these survive the
+    # validation round-trip unchanged. ``status`` may be overwritten
+    # immediately below by the quarantine guard.
+    for k, v in reserved_snapshot.items():
+        normalized[k] = v
+    # Force status='staged' UNLESS the validator's Sentinel pass found
+    # non-fatal critical content (prompt injection, shell injection).
+    # Overwriting that unconditionally would route quarantined content
+    # back into the staged inbox where Approve might still attempt it
+    # (the approve rescan would block, but the security-review queue
+    # is the correct surface).
+    if quarantine_triggered:
+        normalized["status"] = "quarantined"
+        if quarantined_at_val:
+            normalized["quarantined_at"] = quarantined_at_val
+    else:
+        normalized["status"] = "staged"
+    normalized["edited_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+    # An edit is an active intervention — clear the deferred marker
+    # and any stale defer_reason so the doc resurfaces at the top of
+    # the inbox sort (deferred items live at the bottom).
+    normalized.pop("deferred_at", None)
+    normalized.pop("defer_reason", None)
+
+    # Second TOCTOU guard — between handler entry and now, the
+    # validator ran (potentially slow on prompt-injection regexes);
+    # a concurrent Approve/Reject may have moved the doc. Without
+    # this reload, edit's upsert would silently revert a freshly-
+    # ``active`` doc back to ``staged``.
+    doc = await _reload_and_assert_status(tenant_id=tenant_id, slug=slug, expected_statuses={"staged"})
+    sc = get_storage_client()
+    await sc.upsert_document(
+        {
+            "tenant_id": tenant_id,
+            "fleet_id": doc.get("fleet_id"),
+            "collection": SKILLS_COLLECTION,
+            "doc_id": slug,
+            "data": normalized,
+        }
+    )
+    # Best-effort audit; edit already persisted via the upsert above.
+    try:
+        await log_action(
+            tenant_id=tenant_id,
+            action="skill_inbox_edit",
+            resource_type="document",
+            # ``log_action`` types ``resource_id`` as ``UUID | None`` but
+            # its runtime accepts any truthy value (it stringifies via
+            # ``str(resource_id) if resource_id else None``). Slugs are
+            # human-readable and grep-friendly in the audit log; keep
+            # the directive intact and suppress the type warning.
+            resource_id=doc.get("doc_id") or slug,  # type: ignore[arg-type]
+            detail={
+                "slug": slug,
+                "content_hash": normalized.get("content_hash"),
+                "scan_state": scan.state,
+            },
+        )
+    except Exception:
+        logger.error(
+            "skill_inbox: audit log failed for edit slug=%s",
+            slug,
+            exc_info=True,
+        )
+    # ``new_status`` reflects what we actually persisted — when the
+    # validator's Sentinel pass quarantined the doc, the upsert wrote
+    # ``status='quarantined'`` and the response must say so.
+    return ActionResponse(
+        slug=slug,
+        previous_status="staged",
+        new_status=normalized.get("status", "staged"),
+        detail=f"rehashed → {normalized.get('content_hash')}; scan={scan.state}",
+    )

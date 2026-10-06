@@ -1,0 +1,1770 @@
+"""Per-organization settings — storage + resolution.
+
+Settings are stored as a JSONB blob in ``organization_settings`` (one row
+per organization, overrides only). Every update additionally writes a flat
+diff to ``organization_settings_audit`` for attribution and history.
+
+Resolution order for any value:
+    org override (cached) → global env default (``core_api.config.Settings``)
+    → hardcoded Pydantic default
+
+The function parameters here are still named ``tenant_id`` for call-site
+back-compat (CAURA-654) — the value is treated as the org-key internally.
+In OSS-standalone the tenant_id IS the org_id (single implicit org per
+tenant); in enterprise callers should pass the actual org_id (parameter
+rename to ``org_id`` is a follow-up that will touch ~20 call sites).
+
+Reads go through a per-process ``TTLCache`` (5-min TTL). Writes invalidate
+the local cache entry immediately; other workers catch up on TTL expiry.
+Cross-worker invalidation is tracked as a follow-up (see CAURA-571).
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+
+from cachetools import TTLCache
+from croniter import CroniterBadCronError, croniter
+
+from common.constants import SEARCH_KNOBS
+from common.events.base import Event
+from common.events.factory import get_event_bus
+from common.events.lifecycle_purge_request import (
+    MEMORY_RETENTION_MAX_DAYS,
+    MEMORY_RETENTION_MIN_DAYS,
+)
+from common.events.org_settings_changed_event import OrgSettingsChangedEvent
+from common.events.topics import Topics
+from common.governance import PIICategory
+from common.organization_settings_merge import deep_merge as _deep_merge
+from common.provider_names import ProviderName
+from core_api.clients.storage_client import get_storage_client
+from core_api.config import settings as global_settings
+from core_api.constants import (
+    CRYSTALLIZER_DEDUP_THRESHOLD,
+    CRYSTALLIZER_MIN_CLUSTER_SIZE,
+)
+from core_api.services.settings_crypto import (
+    decrypt_api_key,
+    encrypt_api_keys,
+    encryption_enabled,
+    needs_encryption,
+)
+from core_api.services.task_tracker import tracked_task
+from core_api.tasks import track_task
+
+logger = logging.getLogger(__name__)
+
+
+# ── Settings schema defaults ──
+
+DEFAULT_SETTINGS: dict = {
+    "enrichment": {
+        "provider": None,
+        "model": None,
+        "enabled": None,
+        # pm-0918-c-04. MUST be listed here, not only as a ResolvedConfig
+        # property: ``_check_keys`` validates a settings write against this
+        # schema, so a knob absent from it is READ-ONLY — the resolver returns
+        # its default and every attempt to set it raises "Unknown settings
+        # key(s)". A switch nobody can switch is worse than no switch, because
+        # it reads as shipped.
+        "atomic_fact_fanout_enabled": None,
+    },
+    "recall": {
+        "provider": None,
+        "model": None,
+        "enabled": None,
+        # A64 — premise guard: instructs the recall answer LLM to challenge a
+        # question whose assumption the memories contradict or supersede,
+        # instead of going along with it. Off (None/False) keeps the recall
+        # prompt byte-identical to pre-A64. Evidence: STALE T2 31%->71%
+        # overall with the guard; true-premise control +1.9pp overall
+        # (findings: ``<multi-repo-workspace-root>/benchmark/
+        # a57-recall-experiments-findings.md`` -- WORKSPACE ROOT, one level
+        # above this repo; not in this repo on any ref).
+        "premise_guard": None,
+    },
+    "embedding": {
+        "provider": None,
+        "model": None,
+    },
+    "entity_extraction": {
+        "provider": None,
+        "model": None,
+        "enabled": None,
+    },
+    "fallback_llm": {
+        "provider": None,
+        "model": None,
+    },
+    # Cached per-agent activity digest (nightly generation; served read-only by
+    # GET /api/v1/reports/agent-activity). Opt-in — disabled by default because
+    # generation spends LLM tokens. See core_api.services.agent_digest.
+    "agent_digest": {
+        "enabled": False,
+        "cadence": "daily",  # daily | weekly | both — see AGENT_DIGEST_CADENCE_PERIODS
+        "provider": "openai",
+        "model": "gpt-5.4-mini",
+        "top_n": 25,
+        "max_memories_per_agent": 60,
+        # Durable floor (a single decision/fact is worth surfacing).
+        "min_activity_threshold": 1,
+        # Min non-noise events to summarize an agent whose work is episodic;
+        # below it the agent still appears as a count-only listed row.
+        "event_floor": 1,
+        # Cap on count-only rows past top_n (active-but-not-summarized agents).
+        "listed_max": 25,
+        "max_cost_per_run_usd": 2.0,
+        "retention_days": 90,
+    },
+    "search": {
+        # C27 — opt-in STRICT fleet scoping. Wire contract D4 (RATIFIED) defines
+        # a NULL ``fleet_id`` as tenant-shared BY DESIGN, so a fleet-scoped read
+        # returns null-fleet rows too. That is deliberate and stays the default;
+        # ``True`` drops the null-fleet disjunct for a tenant that wants hard
+        # fleet isolation. Off by default for the same reason as
+        # ``recall_for_asserted_identity`` below: turning it on HIDES rows that
+        # are visible today, so it is a decision a tenant makes, never one
+        # inherited. ``scope_org`` rows stay visible in both modes — that is an
+        # explicit visibility tier, not an accident of a missing fleet.
+        "strict_fleet_scoping": None,
+        "recall_boost": None,
+        # Whether a caller-ASSERTED identity (SearchRequest.caller_agent_id from
+        # a tenant-scoped key) may move recall_count, and so ranking. Off by
+        # default, and deliberately a tenant switch rather than a per-request
+        # one: the effect is tenant-wide — recall_boost defaults to True — so
+        # one integration adopting the field would otherwise reshuffle results
+        # for every other caller in the tenant that never asked. An
+        # AUTHENTICATED agent identity is unaffected and bumps as it always has.
+        "recall_for_asserted_identity": None,
+        "graph_retrieval": None,
+        # Master switch for query-time entity/graph retrieval. ``False`` blocks
+        # BOTH read entry points: the ``ENTITY_LOOKUP`` short-circuit in
+        # ``ClassifyQuery`` (which skips embedding + scored search entirely) and
+        # the hop-boost in ``ParallelEmbedAndEntityBoost``. Every read then
+        # resolves through the keyword/semantic cascade alone, and no entity FTS
+        # or graph-expansion call is issued at all.
+        #
+        # Supersedes ``graph_retrieval`` and the ``graph_max_hops`` profile knob
+        # — those only bound expansion depth AFTER an entity match, so they
+        # cannot switch entity retrieval off on their own.
+        #
+        # Read-side only: entity extraction, entity linking (see
+        # ``entity_linking.auto_entity_linking_enabled``) and relation inference
+        # keep populating the graph, so flipping this back on needs no backfill.
+        "entity_retrieval": None,
+        # pm-0918-c-03 — whether ``/search`` returns atomic-fact fan-out children
+        # (A70) alongside the rows the caller wrote. ``None`` resolves to the
+        # global default, which is TRUE: today's behaviour, unchanged for a
+        # tenant that never touches this.
+        #
+        # LISTED HERE, not only as a ``ResolvedConfig`` property, and the sibling
+        # row is why: ``_check_keys`` validates a settings write against this
+        # schema, so a knob missing from it is READ-ONLY — ``PUT /settings``
+        # answers 422 "Unknown settings key(s)" while the resolver cheerfully
+        # serves the default. pm-0918-c-04 shipped exactly that and it read as
+        # working. ``test_the_tenant_default_survives_a_real_settings_put``
+        # exercises the HTTP route rather than building a ``ResolvedConfig``,
+        # because constructing the config object directly is what hid it.
+        #
+        # A tenant crowded by fan-out children sets this to ``false`` and gets
+        # the behaviour of option (c) — exclude by default — for its own store,
+        # without a deploy and without imposing it on every other tenant. That is
+        # the same argument that justified A70's per-tenant write-side switch,
+        # ``enrichment.atomic_fact_fanout_enabled``, and the two are independent:
+        # this one hides existing children from reads, that one stops new ones
+        # being written.
+        "include_derived": None,
+        # Tenant-wide default search profile (A47). Any search_profile knob set
+        # here (min_similarity, top_k, freshness_floor, ...) becomes the fallback
+        # for EVERY agent in the tenant, filling the gap between a per-agent tuned
+        # profile and the global constants. Empty by default → global constants
+        # apply, unchanged. Validated by ``_validate_default_search_profile`` on
+        # write (strict, raises) and ``validate_search_profile`` on read (clamps).
+        "default_profile": {},
+    },
+    "crystallizer": {
+        "auto_crystallize": None,
+        # A72 — the crowding retune. Both default to None, which resolves to
+        # today's constants, so an untouched tenant sweeps exactly as before
+        # and costs exactly as much.
+        "dedup_threshold": None,
+        "min_cluster_size": None,
+    },
+    "dedup": {
+        "semantic_dedup_enabled": None,
+        # A71 — act on the near-duplicate band instead of only reporting it.
+        # ``DetectNearDuplicate`` already finds the nearest stored row on every
+        # fast write and stashes ``near_duplicate_of`` as advice nothing acts on,
+        # so a restated fact accumulates a sibling and both stay live. With this
+        # on, a hit that is provably the SAME CLAIM (same subject, same
+        # single-valued predicate, different object) supersedes its predecessor
+        # instead of appending beside it.
+        #
+        # Default OFF, like every switch that changes what a write PRODUCES
+        # rather than what it reports. Turning it on retires rows, and while the
+        # supersession is reversible through the existing lineage, a tenant
+        # should choose that rather than inherit it from a deploy.
+        "merge_near_duplicates": None,
+    },
+    "lifecycle": {
+        "lifecycle_automation_enabled": None,
+        # Days to keep soft-deleted memories before they're physically
+        # purged (CAURA-656). Daily cron reads this per-org and runs
+        # ``purge-soft-deleted``. ``None`` means "use the global
+        # default" (30 — see ResolvedConfig.memory_retention_days).
+        # Range constrained to 1-30 by the validator below; the UI
+        # numeric input mirrors that range.
+        "memory_retention_days": None,
+    },
+    "entity_linking": {
+        "auto_entity_linking_enabled": None,
+    },
+    # Periodic discovery insights (lifecycle-insights cron). Opt-in:
+    # default is False because each tick runs an LLM reasoning pass
+    # per fleet (or per tenant when fleet-less) and that cost is not
+    # justified for every corpus. An org flips this to True when it
+    # wants the daily ``generate_insights(focus='discover')`` pass.
+    # The activity gate inside the consumer additionally skips ticks
+    # where no non-insight memories have been written since the last
+    # insights run, so even an enabled tenant pays only when the
+    # corpus has grown.
+    "insights": {
+        "auto_insights_enabled": None,
+    },
+    "observability": {
+        # Opt-in (default off). When on, each agent-chosen ``caura_recall``
+        # call is logged (query + scope + candidate scores + below-floor
+        # near-misses) to ``recall_event`` / ``recall_candidate`` for "why
+        # aren't good memories recalled?" analysis.
+        "recall_logging_enabled": None,
+        # Opt-in (default off). When on, the plugin's automatic ``/search``
+        # path is ALSO logged — but in a lighter form: returned candidates
+        # only (id + scores), no below-floor near-misses, since ``/search``
+        # is high-volume. Independent of ``recall_logging_enabled`` so it can
+        # be enabled for a short diagnostic window on a couple of tenants and
+        # then turned back off.
+        "search_recall_logging_enabled": None,
+        # Fraction (0.0-1.0) of ``/search`` events for which below-floor
+        # near-misses ARE recorded (only relevant when
+        # ``search_recall_logging_enabled`` is on). Default 0.0 = never (pure
+        # returned-only light mode). Set e.g. 0.01 to keep near-misses on ~1%
+        # of search events — enough to estimate the "just-missed" distribution
+        # (was the good memory rank 7 at cosine 0.27?) without the full
+        # candidate-row volume on the bulk path. Capped at the same
+        # ``_NEAR_MISS_LIMIT`` per sampled event as ``mcp_recall``.
+        "search_recall_near_miss_sample_rate": None,
+    },
+    "chunking": {
+        "auto_chunk_enabled": None,
+    },
+    "write": {
+        "default_write_mode": None,  # None = "fast"; "fast" | "strong"
+        # CAURA-123 — RDF triple emission. When true (the default), a
+        # pre-write step extracts (subject_entity_id, predicate,
+        # object_value) from the request so the deterministic RDF
+        # contradiction path (contradiction_detector.py) can fire
+        # instead of falling through to the LLM. ``None`` resolves to
+        # the global default (true).
+        "triple_emission_enabled": None,
+        # A73 — one contradiction pass per SUBJECT on a bulk write, instead of
+        # one per row. A coherent batch (seeding a biography, importing a
+        # document) writes dozens of rows about the same subject in seconds, and
+        # each row is currently judged against a store its own siblings are still
+        # landing in. Complementary facts come back ``conflicted`` — ~40% of a
+        # 55-fact biography in one observed store, before the first conversation
+        # — and a conflicted row carries a 0.5 ranking penalty, so the store
+        # starts every retrieval handicapped.
+        #
+        # With this on, the batch's LAST row per subject is judged and the rest
+        # are not. That still catches both kinds of real conflict: an earlier
+        # sibling is already committed and so is a candidate for the last row's
+        # pass, and the pre-existing store is too. What it removes is the
+        # N-way churn of a batch conflicting with itself.
+        #
+        # Default OFF like every switch that changes what a write produces. It
+        # also REDUCES LLM calls (N rows -> one per subject), so it is not
+        # blocked by the no-new-LLM-calls hold.
+        "bulk_subject_batching": None,
+        # CAURA-130 (L3.8) — Path C retraction kill-switch. When true
+        # (the default), Path C's ``_attempt_entity_retraction`` runs
+        # the entity-aware judge and may revert a Path A verdict. When
+        # false, Path C skips retraction entirely and Path A's verdict
+        # stands. Ops escape valve for tenants whose retraction
+        # misbehaves; flip per-tenant without a deploy.
+        "retraction_enabled": None,
+        # lme-0929-m-05 (SIDE-58) — tenant master switch for contradiction
+        # detection. ``None``/``True`` (the default) is today's behaviour.
+        # ``False`` skips EVERY detection entry point for the tenant — Path A
+        # (write, bulk, update, re-embed, the ENRICHED/EMBEDDED back-channel)
+        # and Path C (post entity-extraction, including its retraction phase) —
+        # so no new row is marked ``outdated``/``conflicted`` and no judge LLM
+        # call is made. Writes are unaffected. Forward-only: rows already marked
+        # before the flip keep their status.
+        #
+        # For stores where every row is a verbatim source record (benchmark
+        # tenants: on LongMemEval, detection hid 4,374 stored turns across 500
+        # stores from default search) and customers that want an append-only
+        # store. The gate is read inside the two detector entries every trigger
+        # routes through (``contradiction_detector``), not at the dozen call
+        # sites, so a trigger added later is gated without anyone remembering.
+        #
+        # Listed here, not only as a ``ResolvedConfig`` property: a knob absent
+        # from this schema is rejected by ``_check_keys`` and so is unsettable
+        # (the pm-0918-c-04 lesson).
+        "contradiction_detection_enabled": None,
+    },
+    "agents": {
+        "require_agent_approval": None,
+    },
+    # CAURA-444 — plugin auto-upgrade. When `auto_upgrade_enabled` is
+    # true (the default), the heartbeat handler queues a `deploy`
+    # command for any node whose `plugin_version` is older than
+    # `MIN_RECOMMENDED_PLUGIN_VERSION` (version_compat.py).
+    # Per-tenant flip allows operators to opt out.
+    #
+    # The `KNOWN_BROKEN_DEPLOY_VERSIONS` denylist (in routes/fleet.py)
+    # is a separate global guard that prevents auto-deploy specifically
+    # for plugin versions whose deploy machinery is itself broken
+    # (currently: 2.3.0 — drift in srcFiles + missing version-stamp).
+    "memclaw": {  # legacy-name-floor: floor
+        "auto_upgrade_enabled": None,  # None = use global default (true)
+    },
+    "security_audit": {
+        "schedule_enabled": None,
+        "schedule_cron": None,
+        "alerts_enabled": None,
+        "alert_recipients": None,
+        "alert_score_below": None,
+        "alert_critical_findings_min": None,
+        "alert_score_drop_delta": None,
+    },
+    # Skill Factory SF-006 — per-tenant knobs for the lake-side skill
+    # production pipeline (Forge resident + HITL Inbox + Sentinel scan +
+    # harness install). Defaults are CONCRETE here (not None) so the
+    # OSS resolver and tests have predictable values; tenants override
+    # by writing a partial dict (existing _deep_merge + _check_keys
+    # plumbing). See skill-factory-implementation-plan.md §12, archived from
+    # HEAD with docs/live-memory-pitch/ (W2 of the sunset programme):
+    # git show 691659a:docs/live-memory-pitch/skill-factory-implementation-plan.md
+    "skills_factory": {
+        # Feature flag gating the SF-002 ``caura_doc`` skills-write
+        # adjustments. OSS default ``False`` so existing eToro and
+        # caura-dev-fleet tenants see ZERO behavior change until they
+        # explicitly opt in. Phase 0 ships the plumbing; per-tenant
+        # rollout flips this true.
+        "enabled": False,
+        # Hard caps. ``_check_keys`` and ``_LEAF_TYPES`` enforce shape;
+        # the routes/documents.py write path enforces values.
+        "description_max_bytes": 160,
+        "body_max_bytes": 40_000,
+        "inbox_max_pending": 50,
+        # Days a rejected cluster_fingerprint stays poison-flagged in
+        # forge_rejected_fingerprints before Forge may re-propose it.
+        "rejection_cooloff_days": 30,
+        # Sentinel scanner behavior. ``fail_on_critical=true`` → any
+        # critical finding flips the doc to ``status=quarantined``
+        # instead of letting it surface in the inbox.
+        "sentinel": {
+            "fail_on_critical": True,
+            # When True, a Forge candidate that passes ALL six
+            # auto-gates AND carries a clean Sentinel scan
+            # (``scan.state='clean'``, ``critical=0``) is promoted
+            # straight to ``status='active'`` — skipping the HITL
+            # Inbox approve step. Default False keeps the human in
+            # the loop. Flipping this true means the tenant TRUSTS
+            # the Sentinel scanner as the sole gate before a skill
+            # goes live; dirty / quarantined / warn-only candidates
+            # still route to ``staged`` and require human review.
+            "auto_promote_clean": False,
+        },
+        # Forge resident knobs. Phase 0 publishes the topic + stub
+        # handler; Phase 1 lands the real worker that reads these.
+        # ``min_cluster_size`` default 3 is the demo value (plan §5);
+        # production tenants flip to 10 once outcome volume justifies.
+        "forge": {
+            "cron_interval_hours": 6,
+            "min_cluster_size": 3,
+            "min_distinct_agents": 3,
+            "freshness_window_days": 14,
+            "max_writes_per_run": 20,
+            # THE ceiling on a run's LLM spend, and the only one — see
+            # ``test_forge_spend_is_bounded_by_attempts_not_tokens``.
+            # Attempt ceiling: how many clusters one run may distill,
+            # written or not. 0 = derive from ``max_writes_per_run``
+            # (see ``ForgeConfig.effective_max_clusters_per_run``).
+            # This, not ``max_writes_per_run``, is what bounds spend —
+            # every attempted cluster pays for a distill call before we
+            # can know whether it will be written.
+            #
+            # It bounds ATTEMPTS, not tokens and not dollars. There is
+            # no per-tenant token or cost ceiling anywhere in Forge, and
+            # this is the honest statement of that rather than an
+            # omission: a ``llm_tokens_per_run`` key used to sit above
+            # and was read by nothing (oss-0922-l-05), so an operator
+            # setting a token ceiling believed spend was capped when it
+            # was not. What actually bounds a run is attempts times a
+            # prompt whose size is itself capped by
+            # ``memory_excerpt_char_cap`` and ``min_cluster_size``.
+            "max_clusters_per_run": 0,
+        },
+        # OpenClaw PROPOSAL.md bridge (Phase 5). Default OFF — turning
+        # it on only matters once the OpenClaw workspace emitter ships.
+        "openclaw_bridge": {
+            "enabled": False,
+        },
+    },
+    # Interviewer (Phase 1) — scheduled reflective work-reports ingested as
+    # typed memories (docs/plans/interviewer-phase1-decisions.md). Default
+    # OFF: the core-operations scheduler only queues ``interview_request``
+    # commands for tenants that flip this on, and the submit endpoint
+    # re-checks it (defense in depth, same posture as skills_factory).
+    "interviewer": {
+        "enabled": False,
+        # Cadence the scheduler uses when queuing interview_request
+        # commands (the client ask: "once or twice daily").
+        "period_hours": 12,
+        # Report template identifier; Phase 1 ships only the static default.
+        "template_id": "default-v1",
+    },
+    "entity_blocklist": [
+        "team",
+        "meeting",
+        "project",
+        "system",
+        "process",
+        "approach",
+        "update",
+        "issue",
+        "change",
+        "result",
+        "group",
+        "company",
+        "person",
+        "user",
+        "client",
+        "thing",
+        "stuff",
+        "idea",
+        "work",
+        "code",
+    ],
+    # Ingestion-boundary content governance (eToro). Opt-in: booleans default
+    # False and the action/disposition default to the safe, non-destructive
+    # choice (flag / store) so enabling the feature later is a deliberate step.
+    # ``pii.categories`` toggles which detector categories are in scope; when
+    # PII is enabled with NO category selected, the gate scans ALL categories
+    # (the secure default — enabling protection shouldn't silently protect
+    # nothing). See ``ResolvedConfig.governance_pii``.
+    #
+    # Two paths back the PII ``action`` (mask/drop/flag), with different recall:
+    #   1. Deterministic, span-aware validators (``GovernanceScanContent``):
+    #      regex/Luhn/IBAN/entropy. The strong, fail-closed path for structured
+    #      PII (email/phone/cards/IBAN/keys), and the only one that can honestly
+    #      ``mask`` (it has span offsets). Precision confirmed; high recall on
+    #      the patterns it covers.
+    #   2. The enrichment LLM's free-form ``contains_pii`` signal
+    #      (``GovernanceDecision``): catches unstructured/contextual PII the
+    #      patterns can't (e.g. "X is in addiction recovery"), but its RECALL is
+    #      bounded by the enrichment model — a small/cheap model (e.g. *-nano)
+    #      under-detects subtly-phrased free-form PII. A tenant relying on
+    #      ``drop``/``mask`` to catch FREE-FORM PII should set a capable
+    #      ``enrichment.model``; the deterministic path stays the precise
+    #      backstop, but free-form coverage is only as strong as that model's
+    #      recall. (The LLM path has no offsets, so a ``mask`` policy can only
+    #      flag a free-form match — see ``llm_pii_audit_detail`` /
+    #      ``configured_action``.)
+    "governance": {
+        "pii": {
+            "enabled": False,
+            "action": None,  # None → "flag"; one of mask | drop | flag
+            "categories": {
+                "email": False,
+                "phone": False,
+                "credit_card": False,
+                "iban": False,
+                "national_id": False,
+                "api_key": False,
+                "secret": False,
+            },
+        },
+        "non_business": {
+            "enabled": False,
+            "disposition": None,  # None → "store"; one of drop | keep_private | store
+            # Fast pre-gate (opt-in): a cheap business-vs-personal go/no-go that
+            # runs BEFORE enrichment / embedding / entity extraction and rejects
+            # personal content early when ``disposition="drop"``. Disabled by
+            # default like every other security control. Its own provider/model
+            # so the signal is independent of the enrichment provider (survives
+            # ``enrichment_provider=none``, e.g. CI). ``min_confidence`` None →
+            # act on any "personal" verdict. Raising it makes the pre-gate SKIP
+            # the early drop for low-confidence "personal" verdicts and defer
+            # them to the more accurate post-enrichment gate; it does NOT add a
+            # confidence floor to the final decision (that backstop drops any
+            # "personal" verdict unconditionally — there is no enrichment
+            # confidence to gate on). So it trades a little extra compute for
+            # fewer *early* rejects on borderline content, not a blanket
+            # reduction in drops. ``fail_closed`` False → fail-open: a classifier
+            # failure/timeout never blocks a write (the post-enrichment gate
+            # remains the backstop). Set ``fail_closed`` True so a tenant that
+            # requires enforcement REJECTS writes (503) when the classifier is
+            # unavailable rather than storing unclassified content.
+            "pregate": {
+                "enabled": False,
+                "provider": None,
+                "model": None,
+                "min_confidence": None,
+                "fail_closed": False,
+            },
+        },
+    },
+    "api_keys": {},
+}
+
+# Keys are ``ProviderName`` enum values (.value) so a typo here is caught
+# at import time rather than silently producing an entry UI that no tenant
+# can select.
+PROVIDER_OPTIONS = {
+    "enrichment": {
+        ProviderName.OPENAI.value: ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-4.1-nano", "gpt-4o-mini"],
+        ProviderName.GEMINI.value: [
+            "gemini-3.1-flash-lite-preview",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+        ],
+    },
+    "recall": {
+        ProviderName.OPENAI.value: ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-4.1-nano", "gpt-4o-mini"],
+        ProviderName.GEMINI.value: [
+            "gemini-3.1-flash-lite-preview",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+        ],
+    },
+    "embedding": {
+        ProviderName.OPENAI.value: ["text-embedding-3-small", "text-embedding-3-large"],
+    },
+    "entity_extraction": {
+        ProviderName.OPENAI.value: ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-4.1-nano", "gpt-4o-mini"],
+        ProviderName.GEMINI.value: [
+            "gemini-3.1-flash-lite-preview",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+        ],
+    },
+    "fallback_llm": {
+        ProviderName.OPENAI.value: ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-4.1-nano", "gpt-4o-mini"],
+        ProviderName.GEMINI.value: [
+            "gemini-3.1-flash-lite-preview",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+        ],
+        ProviderName.ANTHROPIC.value: ["claude-haiku-4-5-20251001"],
+        ProviderName.OPENROUTER.value: ["openai/gpt-5.4-nano", "openai/gpt-4.1-nano"],
+    },
+}
+
+
+def _remap_vertex(provider: str) -> str:
+    """Remap deprecated tenant-tier ``vertex`` provider to ``openai``.
+
+    Existing tenants with ``provider="vertex"`` saved in DB settings hit
+    ``ValueError`` on every LLM call after the tenant-tier removal.
+    ``call_with_fallback`` catches those but logs misleadingly and may
+    silently drop to FakeLLMProvider for GCP-only tenants. Remap at the
+    read-side so stored settings degrade gracefully.
+    """
+    if provider == "vertex":
+        logger.warning(
+            "Tenant has provider='vertex' in stored settings; "
+            "vertex is platform-tier only. Remapping to 'openai'."
+        )
+        return "openai"
+    return provider
+
+
+# ── TTL cache: org_id → settings dict ──
+#
+# Per-process cache; each uvicorn worker has its own. Staleness across workers
+# is bounded by the TTL (5 min). Writes on the current worker invalidate
+# locally; others catch up on expiry. See CAURA-571 for cross-worker NOTIFY.
+#
+# No locking: cache misses may issue duplicate DB reads under concurrency, but
+# the query is an indexed PK lookup and the result is identical, so racing
+# populations are harmless.
+_settings_cache: TTLCache[str, dict] = TTLCache(maxsize=10_000, ttl=300)
+
+
+def _validate_cron(expr: str) -> None:
+    """Raise ``ValueError`` if *expr* is not a valid cron expression."""
+    try:
+        croniter(expr)
+    except (CroniterBadCronError, ValueError) as exc:
+        raise ValueError(f"Invalid cron expression {expr!r}: {exc}") from exc
+
+
+_PII_ACTIONS = frozenset({"mask", "drop", "flag"})
+_NON_BUSINESS_DISPOSITIONS = frozenset({"drop", "keep_private", "store"})
+# The fast pre-gate accepts any known LLM provider name (incl. ``none``/``fake``
+# for disable/test). Membership-checked so a typo can't silently disable the gate.
+_PREGATE_PROVIDERS = frozenset(p.value for p in ProviderName)
+#: Which digest runs (``period``) each ``agent_digest.cadence`` takes (M-113).
+AGENT_DIGEST_CADENCE_PERIODS: dict[str, frozenset[str]] = {
+    "daily": frozenset({"day"}),
+    "weekly": frozenset({"week"}),
+    "both": frozenset({"day", "week"}),
+}
+
+
+def _validate_governance_enums(payload: dict) -> None:
+    """Raise ``ValueError`` for governance enum values outside their allowed set.
+
+    ``_validate_leaf_types`` already pins these to ``str``; this pins the
+    actual allowed values (the leaf-type machinery checks Python types, not
+    value membership).
+    """
+    gov = payload.get("governance")
+    if not isinstance(gov, dict):
+        return
+    action = gov.get("pii", {}).get("action")
+    if action is not None and action not in _PII_ACTIONS:
+        raise ValueError(f"governance.pii.action must be one of {sorted(_PII_ACTIONS)}, got {action!r}")
+    nb = gov.get("non_business", {})
+    disposition = nb.get("disposition")
+    if disposition is not None and disposition not in _NON_BUSINESS_DISPOSITIONS:
+        raise ValueError(
+            f"governance.non_business.disposition must be one of "
+            f"{sorted(_NON_BUSINESS_DISPOSITIONS)}, got {disposition!r}"
+        )
+    pregate = nb.get("pregate", {})
+    provider = pregate.get("provider")
+    if provider is not None and provider not in _PREGATE_PROVIDERS:
+        raise ValueError(
+            f"governance.non_business.pregate.provider must be one of "
+            f"{sorted(_PREGATE_PROVIDERS)}, got {provider!r}"
+        )
+    min_conf = pregate.get("min_confidence")
+    if min_conf is not None and not (0.0 <= min_conf <= 1.0):
+        raise ValueError(
+            f"governance.non_business.pregate.min_confidence must be in [0.0, 1.0], got {min_conf!r}"
+        )
+
+
+def _validate_agent_digest_cadence(payload: dict) -> None:
+    """Raise ``ValueError`` for an ``agent_digest.cadence`` outside its three values.
+
+    ``None`` passes: it resets the override to the default, as for every key. A
+    non-string is refused here too: a dict passes ``_validate_leaf_types``, which
+    recurses into dicts, and would reach the lookup below unhashable.
+    """
+    digest = payload.get("agent_digest")
+    cadence = digest.get("cadence") if isinstance(digest, dict) else None
+    if cadence is not None and (not isinstance(cadence, str) or cadence not in AGENT_DIGEST_CADENCE_PERIODS):
+        raise ValueError(
+            f"agent_digest.cadence must be one of {sorted(AGENT_DIGEST_CADENCE_PERIODS)}, got {cadence!r}"
+        )
+
+
+def _validate_default_search_profile(payload: dict) -> None:
+    """Strictly validate the tenant-wide ``search.default_profile`` on write.
+
+    Unlike ``validate_search_profile`` (which silently clamps/drops for the
+    agent-tune path), an org-wide setting write should fail loudly so an
+    operator gets a 422 rather than a value that was quietly clamped. Unknown
+    keys, wrong types, and out-of-range values all raise. Keys and ranges are
+    the same source of truth as agent profiles (``SEARCH_KNOBS``).
+    """
+    dp = payload.get("search", {}).get("default_profile")
+    if dp is None:
+        return
+    if not isinstance(dp, dict):
+        raise ValueError("search.default_profile must be an object")
+    for key, value in dp.items():
+        knob = SEARCH_KNOBS.get(key)
+        if knob is None:
+            raise ValueError(f"search.default_profile: unknown key {key!r} (allowed: {sorted(SEARCH_KNOBS)})")
+        # ``null`` on a KNOWN knob is the reset shape: storage deletes the key
+        # (``merge_settings_update``) and the resolver falls back to the global
+        # default. The unknown-key check above runs first, so a typo sent as
+        # null still 422s rather than "resetting" a knob that does not exist.
+        if value is None:
+            continue
+        expected_type, (lo, hi) = knob.value_type, knob.bounds
+        # Accept an int where a float is expected (e.g. min_similarity=0 → 0.0),
+        # but never a bool (bool is an int subclass and would slip through).
+        if expected_type is float and isinstance(value, int) and not isinstance(value, bool):
+            value = float(value)
+        wrong_bool = isinstance(value, bool) and expected_type is not bool
+        if wrong_bool or not isinstance(value, expected_type):
+            raise ValueError(
+                f"search.default_profile.{key} must be {expected_type.__name__}, got {type(value).__name__}"
+            )
+        if value < lo or value > hi:
+            raise ValueError(f"search.default_profile.{key} must be in [{lo}, {hi}], got {value}")
+    # Cross-key rule the per-key loop cannot see: the two pool selectors are
+    # mutually exclusive. Storage lets ``ann_pool_size`` win if both arrive
+    # (skew safety), but an org-wide setting write should fail loudly instead
+    # of persisting a config whose A49 half is silently dead.
+    if int(dp.get("ann_pool_size") or 0) > 0 and int(dp.get("candidate_pool_size") or 0) > 0:
+        raise ValueError(
+            "search.default_profile: ann_pool_size and candidate_pool_size are "
+            "mutually exclusive pool selectors — set at most one of them > 0"
+        )
+
+
+# Object-valued settings that may be sent as ``null`` to drop the whole object
+# back to its default. An allowlist rather than "any object" on purpose: most
+# resolvers read ``self._ts.get("<section>", {}).get(...)``, which crashes on a
+# stored ``None`` if a storage build that predates ``merge_settings_update``
+# stores the null instead of deleting it. The ``default_profile`` resolver reads
+# ``... or {}`` and is null-safe either way.
+_NULLABLE_OBJECT_KEYS: frozenset[str] = frozenset({"search.default_profile"})
+
+
+def _check_keys(payload: dict, schema: dict, path: str = "") -> None:
+    """Raise ``ValueError`` for any key in *payload* not present in *schema*.
+
+    Recurses into nested dicts so sub-keys are also validated.
+    """
+    unknown = set(payload) - set(schema)
+    if unknown:
+        prefix = f"{path}." if path else ""
+        raise ValueError(f"Unknown settings key(s): {sorted(prefix + k for k in unknown)}")
+    for k, v in payload.items():
+        schema_v = schema.get(k)
+        if isinstance(schema_v, dict):
+            full_key = f"{path}.{k}" if path else k
+            if v is None and full_key in _NULLABLE_OBJECT_KEYS:
+                continue
+            if not isinstance(v, dict):
+                raise ValueError(f"Settings key {full_key!r} must be an object, got {type(v).__name__}")
+            if schema_v:
+                _check_keys(v, schema_v, path=f"{path}.{k}" if path else k)
+
+
+# Expected Python types for leaf values that need validation beyond key presence.
+# Dotted paths match the nested structure in DEFAULT_SETTINGS.
+_LEAF_TYPES: dict[str, type | tuple[type, ...]] = {
+    # Per-service on/off switches. ``DEFAULT_SETTINGS`` holds ``None`` for
+    # these (unset → platform default), so a string "false" would otherwise
+    # be stored, echoed back as off, and resolve TRUTHY in every consumer.
+    "enrichment.enabled": bool,
+    "recall.enabled": bool,
+    "recall.premise_guard": bool,
+    "entity_extraction.enabled": bool,
+    "enrichment.atomic_fact_fanout_enabled": bool,
+    "agent_digest.enabled": bool,
+    "agent_digest.cadence": str,
+    "agent_digest.provider": str,
+    "agent_digest.model": str,
+    "agent_digest.top_n": int,
+    "agent_digest.max_memories_per_agent": int,
+    "agent_digest.min_activity_threshold": int,
+    "agent_digest.event_floor": int,
+    "agent_digest.listed_max": int,
+    "agent_digest.max_cost_per_run_usd": (int, float),
+    "agent_digest.retention_days": int,
+    "security_audit.schedule_enabled": bool,
+    "security_audit.schedule_cron": str,
+    "security_audit.alerts_enabled": bool,
+    "security_audit.alert_recipients": list,
+    "security_audit.alert_score_below": (int, float),
+    "security_audit.alert_critical_findings_min": int,
+    "security_audit.alert_score_drop_delta": (int, float),
+    "search.strict_fleet_scoping": bool,
+    "search.recall_boost": bool,
+    "search.recall_for_asserted_identity": bool,
+    "search.graph_retrieval": bool,
+    "search.entity_retrieval": bool,
+    # bool, NOT just "present": a string "false" is TRUTHY, so without this a
+    # tenant that set it off would resolve to ON while the dashboard rendered
+    # their "off" back to them. Same trap as the c-04 switch above.
+    "search.include_derived": bool,
+    "crystallizer.auto_crystallize": bool,
+    "crystallizer.dedup_threshold": float,
+    "crystallizer.min_cluster_size": int,
+    "dedup.semantic_dedup_enabled": bool,
+    "dedup.merge_near_duplicates": bool,
+    "lifecycle.lifecycle_automation_enabled": bool,
+    "lifecycle.memory_retention_days": int,
+    "entity_linking.auto_entity_linking_enabled": bool,
+    "insights.auto_insights_enabled": bool,
+    "observability.recall_logging_enabled": bool,
+    "observability.search_recall_logging_enabled": bool,
+    "observability.search_recall_near_miss_sample_rate": (int, float),
+    "chunking.auto_chunk_enabled": bool,
+    "agents.require_agent_approval": bool,
+    "entity_blocklist": list,
+    "memclaw.auto_upgrade_enabled": bool,  # legacy-name-floor: floor
+    "write.triple_emission_enabled": bool,
+    "write.bulk_subject_batching": bool,
+    "write.retraction_enabled": bool,
+    "write.contradiction_detection_enabled": bool,
+    # Skill Factory SF-006 — type validators for the skills_factory namespace.
+    "skills_factory.enabled": bool,
+    "skills_factory.description_max_bytes": int,
+    "skills_factory.body_max_bytes": int,
+    "skills_factory.inbox_max_pending": int,
+    "skills_factory.rejection_cooloff_days": int,
+    "skills_factory.sentinel.fail_on_critical": bool,
+    "skills_factory.sentinel.auto_promote_clean": bool,
+    "skills_factory.forge.cron_interval_hours": int,
+    "skills_factory.forge.min_cluster_size": int,
+    "skills_factory.forge.min_distinct_agents": int,
+    "skills_factory.forge.freshness_window_days": int,
+    "skills_factory.forge.max_writes_per_run": int,
+    "skills_factory.forge.max_clusters_per_run": int,
+    "skills_factory.openclaw_bridge.enabled": bool,
+    # Interviewer Phase 1.
+    "interviewer.enabled": bool,
+    "interviewer.period_hours": int,
+    "interviewer.template_id": str,
+    # Governance content policy (eToro). Enum values (action / disposition) are
+    # type-checked here as str; their allowed values are checked by
+    # ``_validate_governance_enums`` in update_settings.
+    "governance.pii.enabled": bool,
+    "governance.pii.action": str,
+    "governance.pii.categories.email": bool,
+    "governance.pii.categories.phone": bool,
+    "governance.pii.categories.credit_card": bool,
+    "governance.pii.categories.iban": bool,
+    "governance.pii.categories.national_id": bool,
+    "governance.pii.categories.api_key": bool,
+    "governance.pii.categories.secret": bool,
+    "governance.non_business.enabled": bool,
+    "governance.non_business.disposition": str,
+    "governance.non_business.pregate.enabled": bool,
+    "governance.non_business.pregate.provider": str,
+    "governance.non_business.pregate.model": str,
+    "governance.non_business.pregate.min_confidence": (int, float),
+    "governance.non_business.pregate.fail_closed": bool,
+}
+
+# Inclusive range constraints applied AFTER type validation. Listed
+# separately rather than encoded in ``_LEAF_TYPES`` so types stay
+# Python-class types (cleanly testable with ``isinstance``). Range
+# constants are imported from the publisher-side payload so a future
+# widening only needs to touch one source of truth.
+_LEAF_RANGES: dict[str, tuple[int, int]] = {
+    "lifecycle.memory_retention_days": (
+        MEMORY_RETENTION_MIN_DAYS,
+        MEMORY_RETENTION_MAX_DAYS,
+    ),
+    # ``rejection_cooloff_days`` must be >= 1: the poison-table
+    # writer (``services/forge/poison.py:write_rejected_fingerprint``)
+    # raises ValueError on < 1, which the inbox reject endpoint now
+    # surfaces as 422. Capping at 365 prevents a tenant from
+    # accidentally writing a near-permanent poison entry.
+    "skills_factory.rejection_cooloff_days": (1, 365),
+    # Interviewer cadence: 1 hour .. weekly.
+    "interviewer.period_hours": (1, 168),
+    # Size caps must be > 0: a tenant misconfiguring these to 0 or
+    # negative would silently break ALL skills writes (every doc
+    # would trip BODY_TOO_LARGE / DESCRIPTION_TOO_LARGE in Sentinel's
+    # size check). Upper bounds chosen well above any realistic
+    # SKILL.md (10 MB body, 10 KB description) — high enough that
+    # legitimate tenants never hit them, low enough that an operator
+    # typo can't pin a DoS-shaped write through the validator.
+    "skills_factory.body_max_bytes": (1, 10_000_000),
+    "skills_factory.description_max_bytes": (1, 10_000),
+    # 0 is the "derive from max_writes_per_run" sentinel, so the floor is
+    # 0 rather than 1. Upper bound is a spend guard: every attempt buys a
+    # distill LLM call, and 1000 of them in one tick is already far past
+    # any sane window's cluster count.
+    "skills_factory.forge.max_clusters_per_run": (0, 1000),
+}
+
+
+def _validate_api_keys(payload: dict) -> None:
+    """Raise ``ValueError`` for a provider key that is neither a string nor ``null``.
+
+    ``api_keys`` declares no keys, so ``_check_keys`` accepts any value under it.
+    Only strings are encrypted, so a key sent inside a list or an object would be
+    stored as submitted, and it could not work as a key anyway (M-99).
+    """
+    api_keys = payload.get("api_keys")
+    if not isinstance(api_keys, dict):
+        return
+    for name, value in api_keys.items():
+        if value is not None and not isinstance(value, str):
+            raise ValueError(
+                f"Settings key 'api_keys.{name}' must be a string or null, got {type(value).__name__}"
+            )
+
+
+def _validate_leaf_types(payload: dict, prefix: str = "") -> None:
+    """Raise ``ValueError`` if any leaf value has the wrong Python type
+    or falls outside its declared inclusive range.
+    """
+    for k, v in payload.items():
+        path = f"{prefix}{k}"
+        if isinstance(v, dict):
+            _validate_leaf_types(v, prefix=f"{path}.")
+        elif v is not None and path in _LEAF_TYPES:
+            expected = _LEAF_TYPES[path]
+            # Python's ``bool`` is a subclass of ``int``, so a payload
+            # like ``{"memory_retention_days": true}`` silently passes
+            # the isinstance check on int-typed fields and then falls
+            # through to the range check with a confusing "must be in
+            # [1, 30], got True" message. Treat bool as a type
+            # mismatch unless the field's declared type explicitly
+            # includes bool.
+            expected_types = expected if isinstance(expected, tuple) else (expected,)
+            wrong_bool = isinstance(v, bool) and bool not in expected_types
+            if wrong_bool or not isinstance(v, expected_types):
+                type_name = (
+                    expected.__name__
+                    if isinstance(expected, type)
+                    else " or ".join(t.__name__ for t in expected)
+                )
+                raise ValueError(f"Settings key {path!r} must be {type_name}, got {type(v).__name__}")
+            if path in _LEAF_RANGES:
+                lo, hi = _LEAF_RANGES[path]
+                if not (lo <= v <= hi):
+                    raise ValueError(f"Settings key {path!r} must be in [{lo}, {hi}], got {v!r}")
+
+
+_PII_CATEGORY_VALUES: frozenset[str] = frozenset(c.value for c in PIICategory)
+
+
+@dataclass(frozen=True)
+class _GovPII:
+    """Resolved PII governance policy. ``enabled_categories=None`` means scan
+    ALL categories (the secure default when the feature is on but no category
+    was narrowed); otherwise scan only the listed ones."""
+
+    enabled: bool
+    action: str  # "mask" | "drop" | "flag"
+    enabled_categories: frozenset[PIICategory] | None
+
+
+@dataclass(frozen=True)
+class _GovNB:
+    """Resolved non-business (personal-content) governance policy."""
+
+    enabled: bool
+    disposition: str  # "drop" | "keep_private" | "store"
+
+
+@dataclass(frozen=True)
+class _GovNBPregate:
+    """Resolved fast pre-gate policy: a business/personal go/no-go before
+    enrichment. ``provider``/``model`` None → resolved by the step (falls back to
+    the enrichment provider). ``min_confidence`` None → act on any "personal"
+    verdict; raising it defers low-confidence verdicts to the post-enrichment
+    backstop rather than dropping them early (it does not floor the final drop).
+    ``fail_closed`` → reject the write (503) when the classifier is unavailable
+    instead of failing open."""
+
+    enabled: bool
+    provider: str | None
+    model: str | None
+    min_confidence: float | None
+    fail_closed: bool
+
+
+class ResolvedConfig:
+    """Resolves LLM/feature config from organization overrides + global fallbacks."""
+
+    def __init__(
+        self,
+        org_settings: dict | None = None,
+        tenant_settings: dict | None = None,
+    ):
+        # ``tenant_settings`` is a back-compat alias for callers that
+        # still pass the pre-CAURA-654 keyword. Silently absorbs them
+        # rather than raising TypeError; consistent with the module
+        # docstring's promise to keep call-site signatures stable until
+        # the parameter rename follow-up lands.
+        self._ts = org_settings or tenant_settings or {}
+
+    # Governance (eToro content policy)
+    @property
+    def governance_pii(self) -> _GovPII:
+        g = self._ts.get("governance", {}).get("pii", {})
+        cats = g.get("categories", {})
+        selected = frozenset(
+            PIICategory(name) for name, on in cats.items() if on and name in _PII_CATEGORY_VALUES
+        )
+        return _GovPII(
+            enabled=bool(g.get("enabled", False)),
+            action=g.get("action") or "flag",
+            # Empty selection → None → scan all categories (secure default).
+            enabled_categories=selected or None,
+        )
+
+    @property
+    def governance_non_business(self) -> _GovNB:
+        g = self._ts.get("governance", {}).get("non_business", {})
+        return _GovNB(
+            enabled=bool(g.get("enabled", False)),
+            disposition=g.get("disposition") or "store",
+        )
+
+    @property
+    def governance_non_business_pregate(self) -> _GovNBPregate:
+        g = self._ts.get("governance", {}).get("non_business", {}).get("pregate", {})
+        return _GovNBPregate(
+            enabled=bool(g.get("enabled", False)),
+            provider=g.get("provider") or None,
+            model=g.get("model") or None,
+            min_confidence=g.get("min_confidence"),
+            fail_closed=bool(g.get("fail_closed", False)),
+        )
+
+    # Enrichment
+    @property
+    def enrichment_provider(self) -> str:
+        return _remap_vertex(
+            self._ts.get("enrichment", {}).get("provider") or global_settings.entity_extraction_provider
+        )
+
+    @property
+    def enrichment_model(self) -> str:
+        return self._ts.get("enrichment", {}).get("model") or global_settings.entity_extraction_model
+
+    @property
+    def enrichment_enabled(self) -> bool:
+        val = self._ts.get("enrichment", {}).get("enabled")
+        if val is not None:
+            return val
+        return global_settings.use_llm_for_memory_creation
+
+    # Recall
+    @property
+    def recall_provider(self) -> str:
+        return _remap_vertex(
+            self._ts.get("recall", {}).get("provider") or global_settings.entity_extraction_provider
+        )
+
+    @property
+    def recall_model(self) -> str:
+        return self._ts.get("recall", {}).get("model") or global_settings.entity_extraction_model
+
+    @property
+    def recall_premise_guard(self) -> bool:
+        return bool(self._ts.get("recall", {}).get("premise_guard"))
+
+    @property
+    def recall_enabled(self) -> bool:
+        val = self._ts.get("recall", {}).get("enabled")
+        if val is not None:
+            return val
+        return global_settings.use_llm_for_memory_creation
+
+    # Embedding
+    @property
+    def embedding_provider(self) -> str:
+        return self._ts.get("embedding", {}).get("provider") or global_settings.embedding_provider
+
+    @property
+    def embedding_model(self) -> str | None:
+        return self._ts.get("embedding", {}).get("model")
+
+    # Entity extraction
+    @property
+    def entity_extraction_provider(self) -> str:
+        return _remap_vertex(
+            self._ts.get("entity_extraction", {}).get("provider")
+            or global_settings.entity_extraction_provider
+        )
+
+    @property
+    def entity_extraction_model(self) -> str:
+        return self._ts.get("entity_extraction", {}).get("model") or global_settings.entity_extraction_model
+
+    @property
+    def entity_extraction_enabled(self) -> bool:
+        val = self._ts.get("entity_extraction", {}).get("enabled")
+        if val is not None:
+            return val
+        return global_settings.entity_extraction_provider != ProviderName.NONE
+
+    # Fallback LLM
+    @property
+    def fallback_llm_provider(self) -> str | None:
+        return self._ts.get("fallback_llm", {}).get("provider")
+
+    @property
+    def fallback_llm_model(self) -> str | None:
+        return self._ts.get("fallback_llm", {}).get("model")
+
+    def resolve_fallback(self) -> tuple[str | None, str | None]:
+        provider = self.fallback_llm_provider
+        model = self.fallback_llm_model
+        if provider:
+            return provider, model
+        primary = self.enrichment_provider
+        candidates = [
+            (ProviderName.OPENAI.value, self.openai_api_key),
+            (ProviderName.ANTHROPIC.value, self.anthropic_api_key),
+            (ProviderName.GEMINI.value, self.gemini_api_key),
+            (ProviderName.OPENROUTER.value, self.openrouter_api_key),
+            (ProviderName.ATLASCLOUD.value, self.atlascloud_api_key),
+        ]
+        for prov, key in candidates:
+            if prov != primary and key:
+                return prov, model
+        return None, None
+
+    # API keys (from global config only in OSS)
+    @property
+    def openai_api_key(self) -> str | None:
+        return (
+            decrypt_api_key(self._ts.get("api_keys", {}).get("openai_api_key"))
+            or global_settings.openai_api_key
+        )
+
+    @property
+    def anthropic_api_key(self) -> str | None:
+        return (
+            decrypt_api_key(self._ts.get("api_keys", {}).get("anthropic_api_key"))
+            or global_settings.anthropic_api_key
+        )
+
+    @property
+    def openrouter_api_key(self) -> str | None:
+        return (
+            decrypt_api_key(self._ts.get("api_keys", {}).get("openrouter_api_key"))
+            or global_settings.openrouter_api_key
+        )
+
+    @property
+    def atlascloud_api_key(self) -> str | None:
+        return (
+            decrypt_api_key(self._ts.get("api_keys", {}).get("atlascloud_api_key"))
+            or global_settings.atlascloud_api_key
+        )
+
+    @property
+    def gemini_api_key(self) -> str | None:
+        return (
+            decrypt_api_key(self._ts.get("api_keys", {}).get("gemini_api_key"))
+            or global_settings.gemini_api_key
+        )
+
+    # Search
+    @property
+    def strict_fleet_scoping(self) -> bool:
+        """Drop the null-fleet disjunct from fleet-scoped reads (default OFF).
+
+        Defaults FALSE like ``recall_for_asserted_identity``, and for a stronger
+        reason: every other search knob changes what RANKS, while this one
+        changes what is VISIBLE. Defaulting it on would retroactively hide rows
+        a tenant deliberately wrote fleet-less under contract D4.
+        """
+        val = self._ts.get("search", {}).get("strict_fleet_scoping")
+        return val if val is not None else False
+
+    @property
+    def recall_boost(self) -> bool:
+        val = self._ts.get("search", {}).get("recall_boost")
+        return val if val is not None else True
+
+    @property
+    def recall_for_asserted_identity(self) -> bool:
+        # Defaults FALSE, unlike its neighbours here. Every other search knob
+        # defaults on because it improves results for everyone; this one changes
+        # whose recalls shape ranking, which is a decision a tenant makes rather
+        # than one inherited from a client adopting a request field.
+        val = self._ts.get("search", {}).get("recall_for_asserted_identity")
+        return val if val is not None else False
+
+    @property
+    def graph_expand(self) -> bool:
+        val = self._ts.get("search", {}).get("graph_retrieval")
+        return val if val is not None else True
+
+    @property
+    def entity_retrieval(self) -> bool:
+        """Query-time entity lookup + graph search (default ON).
+
+        ``False`` routes every read through keyword/semantic search alone. Falls
+        back to the ``ENTITY_RETRIEVAL_ENABLED`` env default (also ``True``) when
+        the tenant has no override, so the switch can be thrown fleet-wide on an
+        on-prem box without touching per-tenant settings.
+        """
+        val = self._ts.get("search", {}).get("entity_retrieval")
+        return val if val is not None else global_settings.entity_retrieval_enabled
+
+    @property
+    def search_include_derived(self) -> bool | None:
+        """Whether ``/search`` returns atomic-fact fan-out children (pm-0918-c-03).
+
+        Returns ``None`` — NOT a resolved boolean — when the tenant has not set
+        it, and that is the whole point of the signature. This property is the
+        MIDDLE layer of a three-layer resolution (request flag > tenant setting >
+        ``INCLUDE_DERIVED_DEFAULT``), so it has to be able to say "not set" and
+        let ``resolve_include_derived`` fall through. Collapsing it to ``return
+        val if val is not None else True`` — the shape every neighbour here
+        uses — would make an unset tenant indistinguishable from one that
+        explicitly asked for derived rows, and the global default would then be
+        unreachable and untestable.
+
+        It is also why this is one of the few properties on this class that is
+        not typed ``bool``. Read it through ``resolve_include_derived``; reading
+        it directly and treating a falsy ``None`` as "off" inverts the default.
+        """
+        return self._ts.get("search", {}).get("include_derived")
+
+    @property
+    def default_search_profile(self) -> dict:
+        """Tenant-wide default search profile (A47).
+
+        Sits below a per-agent tuned profile and above the global constants in
+        ``resolve_search_profile``. Sanitised via ``validate_search_profile`` on
+        read so a malformed stored value can never crash the search pipeline —
+        unknown/out-of-range knobs are clamped or dropped. Empty ⇒ constants.
+        """
+        return validate_search_profile(self._ts.get("search", {}).get("default_profile", {}) or {})
+
+    # Crystallizer
+    @property
+    def auto_crystallize_enabled(self) -> bool:
+        val = self._ts.get("crystallizer", {}).get("auto_crystallize")
+        return val if val is not None else True
+
+    @property
+    def crystallizer_dedup_threshold(self) -> float:
+        """Cosine floor for the near-duplicate sweep (default 0.95).
+
+        A72. The sweep exists to be the janitor for overlapping memories, and at
+        0.95 it only catches near-verbatim copies — the composites that actually
+        crowd recall sit around 0.75-0.90, so the pathology it was built for
+        passes underneath it untouched.
+
+        Lowering this is the retune, and it is per-tenant and default-unset for
+        one reason: every extra pair the band admits is an extra LLM
+        mergeability judgement. A tenant that wants the janitor to reach the
+        crowding band opts in and pays for it; nobody inherits that bill from a
+        deploy. ~0.80 is the value the report proposes; it is deliberately not
+        the default.
+
+        Clamped to [0.5, 1.0]. Below 0.5 the sweep stops being a duplicate
+        check and becomes a topic clusterer, which would merge unrelated rows.
+        """
+        val = self._ts.get("crystallizer", {}).get("dedup_threshold")
+        if val is None:
+            return CRYSTALLIZER_DEDUP_THRESHOLD
+        return min(1.0, max(0.5, float(val)))
+
+    @property
+    def crystallizer_min_cluster_size(self) -> int:
+        """Smallest cluster the sweep will crystallize (default 3).
+
+        A72. At 3 the most common overlap — a pair — is skipped entirely, so
+        two rows saying the same thing survive every sweep. 2 is the value that
+        closes that, and again it is opt-in: admitting pairs multiplies the
+        cluster count, and each cluster is an LLM re-extraction.
+
+        Floored at 2. A cluster of 1 is not a cluster, and allowing it would
+        hand single memories to the re-extractor.
+        """
+        val = self._ts.get("crystallizer", {}).get("min_cluster_size")
+        if val is None:
+            return CRYSTALLIZER_MIN_CLUSTER_SIZE
+        return max(2, int(val))
+
+    @property
+    def atomic_fact_fanout_enabled(self) -> bool:
+        """Create a child memory per extracted atomic fact (default ON).
+
+        A70 shipped this on the strength of a measurement that it almost never
+        fires, taken on conversational content. pm-0918-c-04 asked whether it
+        should be gated off for document-shaped writes, on the theory that
+        2,000-character chunks are the shape it fires on.
+
+        That question is still OPEN. The attempt to settle it against the local
+        corpus failed for reasons worth knowing before anyone tries again: every
+        fan-out child in that database came from benchmark conversation data,
+        the non-benchmark slice produced none at all, and the corpus predates
+        A70 — so it contains no worker-path fan-out, and pre-A70 deferred writes
+        discarded their facts, which reads as "did not fan out". See
+        docs/atomic-fact-fanout/pm-c04-fanout-rate-findings.md.
+
+        So this is a switch and not a threshold, because there is no evidence
+        for where a threshold would go — not because the evidence rules one out.
+
+        A switch is worth having regardless of how that question lands: a tenant
+        whose results are crowded by fan-out children turns them off for its own
+        store, immediately, without a deploy and without inheriting a number
+        somebody guessed. Default ON is today's behaviour; changing every
+        tenant's store to address one store's regression would be the wrong
+        default whichever way the measurement eventually goes.
+
+        Off is cheaper but not free of consequence: it skips the children's
+        embeddings and writes, NOT the enrichment call that extracted the facts
+        — that has already happened by the time this is read.
+        """
+        val = self._ts.get("enrichment", {}).get("atomic_fact_fanout_enabled")
+        return val if val is not None else True
+
+    # Dedup
+    @property
+    def semantic_dedup_enabled(self) -> bool:
+        val = self._ts.get("dedup", {}).get("semantic_dedup_enabled")
+        return val if val is not None else True
+
+    @property
+    def merge_near_duplicates(self) -> bool:
+        """Supersede a same-claim near-duplicate instead of appending (default OFF).
+
+        Gated OFF because it changes what a write produces, not what it reports:
+        an enabled tenant sees its older row move to ``outdated``. Reversible via
+        the same lineage a contradiction supersession uses, but still a tenant's
+        choice rather than something inherited from a deploy.
+        """
+        val = self._ts.get("dedup", {}).get("merge_near_duplicates")
+        return val if val is not None else False
+
+    # Lifecycle
+    @property
+    def lifecycle_automation_enabled(self) -> bool:
+        val = self._ts.get("lifecycle", {}).get("lifecycle_automation_enabled")
+        return val if val is not None else True
+
+    @property
+    def memory_retention_days(self) -> int:
+        """Days to keep soft-deleted memories before they're purged
+        (CAURA-656). Default 30 matches the UI numeric input's upper
+        bound — generous on the safe side; an org tightens it down to
+        as low as 1 day if their compliance posture demands it. The
+        validator on settings PUT already constrains the override to
+        [1, 30].
+        """
+        val = self._ts.get("lifecycle", {}).get("memory_retention_days")
+        return val if val is not None else 30
+
+    # Entity linking
+    @property
+    def auto_entity_linking_enabled(self) -> bool:
+        val = self._ts.get("entity_linking", {}).get("auto_entity_linking_enabled")
+        return val if val is not None else True
+
+    # Insights — opt-in (default False). Sibling of auto_crystallize /
+    # auto_entity_linking but with the inverse default because the
+    # discovery LLM pass is expensive and not universally useful.
+    @property
+    def auto_insights_enabled(self) -> bool:
+        val = self._ts.get("insights", {}).get("auto_insights_enabled")
+        return val if val is not None else False
+
+    # Recall logging — opt-in (default False). When on, agent-chosen
+    # ``caura_recall`` calls are logged to recall_event / recall_candidate.
+    @property
+    def recall_logging_enabled(self) -> bool:
+        val = self._ts.get("observability", {}).get("recall_logging_enabled")
+        return val if val is not None else False
+
+    # Search-path recall logging — opt-in (default False). When on, the
+    # automatic ``/search`` path is logged too (lighter: returned-only, no
+    # near-misses). Independent of ``recall_logging_enabled``.
+    @property
+    def search_recall_logging_enabled(self) -> bool:
+        val = self._ts.get("observability", {}).get("search_recall_logging_enabled")
+        return val if val is not None else False
+
+    # Fraction of ``/search`` events that keep below-floor near-misses
+    # (default 0.0). Clamped to [0.0, 1.0]. Only consulted when
+    # ``search_recall_logging_enabled`` is on.
+    @property
+    def search_recall_near_miss_sample_rate(self) -> float:
+        val = self._ts.get("observability", {}).get("search_recall_near_miss_sample_rate")
+        if val is None:
+            return 0.0
+        return max(0.0, min(1.0, float(val)))
+
+    # Chunking
+    @property
+    def auto_chunk_enabled(self) -> bool:
+        val = self._ts.get("chunking", {}).get("auto_chunk_enabled")
+        return val if val is not None else False
+
+    # Entity blocklist
+    @property
+    def entity_blocklist(self) -> frozenset[str]:
+        custom = self._ts.get("entity_blocklist")
+        if custom is not None:
+            # Lower-case normalisation so this is symmetric with the
+            # ``name.lower() not in bl`` check in
+            # ``entity_extraction_worker._is_valid_entity``. Tenant-
+            # supplied entries with mixed case (``"Team"``,
+            # ``"SYSTEM"``) would otherwise silently miss the filter.
+            return frozenset(entry.lower() for entry in custom)
+        return frozenset(DEFAULT_SETTINGS["entity_blocklist"])
+
+    # Write mode
+    @property
+    def default_write_mode(self) -> str:
+        val = self._ts.get("write", {}).get("default_write_mode")
+        if val in ("fast", "strong"):
+            return val
+        return "fast"  # default to fast when unset
+
+    @property
+    def bulk_subject_batching(self) -> bool:
+        """One contradiction pass per subject on a bulk write (default OFF).
+
+        Off by default because it changes which rows get judged. Turning it on
+        both fixes the false-conflict storm on coherent batches AND reduces LLM
+        calls, so it is a tenant's choice rather than a cost trade.
+        """
+        val = self._ts.get("write", {}).get("bulk_subject_batching")
+        return val if val is not None else False
+
+    @property
+    def triple_emission_enabled(self) -> bool:
+        # CAURA-123 — default ON. Tenants can opt out per-org without
+        # a deploy (instant rollback path).
+        val = self._ts.get("write", {}).get("triple_emission_enabled")
+        return bool(val) if val is not None else True
+
+    @property
+    def retraction_enabled(self) -> bool:
+        # CAURA-130 (L3.8) — default ON. Per-tenant kill-switch for
+        # Path C's retraction phase. Flip to False to leave Path A's
+        # verdict in place unconditionally for this tenant; useful as
+        # an ops escape valve if a tenant's retraction misbehaves.
+        val = self._ts.get("write", {}).get("retraction_enabled")
+        return bool(val) if val is not None else True
+
+    @property
+    def contradiction_detection_enabled(self) -> bool:
+        """Tenant master switch for contradiction detection (default ON).
+
+        lme-0929-m-05 (SIDE-58). ``False`` makes both detector entries (Path A
+        ``detect_contradictions_async``, Path C
+        ``detect_contradictions_by_entities_async``) return before any storage
+        read, lock, admission slot or LLM call, so nothing is marked
+        ``outdated``/``conflicted`` for this tenant. When off it subsumes
+        ``retraction_enabled``: with Path C skipped there is nothing to retract.
+        Forward-only — existing statuses are left as they are.
+        """
+        val = self._ts.get("write", {}).get("contradiction_detection_enabled")
+        return bool(val) if val is not None else True
+
+    # Agents
+    @property
+    def require_agent_approval(self) -> bool:
+        val = self._ts.get("agents", {}).get("require_agent_approval")
+        return bool(val) if val is not None else False
+
+
+def validate_search_profile(profile: dict) -> dict:
+    """Validate and sanitise a search_profile dict against ``SEARCH_KNOBS``.
+
+    Lenient by design, unlike ``_validate_default_search_profile``: a known key
+    out of range is clamped and a known key of the wrong type is dropped, but an
+    UNKNOWN key is passed through untouched. That last one looks backwards — an
+    unknown key survives where a known-but-malformed one does not — and the
+    reason is persistence, not laxity. Both write ingresses are closed Pydantic
+    models, so an unknown key can only come from a row written by a DIFFERENT
+    build; dropping it here would make a rollback silently erase a tenant's
+    tuning for a knob this build has not heard of.
+    """
+    if not profile:
+        return {}
+
+    cleaned: dict = {}
+    for key, value in profile.items():
+        knob = SEARCH_KNOBS.get(key)
+        if knob is None:
+            cleaned[key] = value
+            continue
+
+        # ``null`` means "unset" (the settings reset shape), not a malformed
+        # value: drop it without the wrong-type warning. A row only holds one if
+        # a storage build that predates ``merge_settings_update`` stored it.
+        if value is None:
+            continue
+
+        expected_type, (lo, hi) = knob.value_type, knob.bounds
+
+        if expected_type is float and isinstance(value, int):
+            value = float(value)
+
+        if not isinstance(value, expected_type):
+            logger.warning(
+                "search_profile key '%s' has wrong type %s (expected %s), dropping key",
+                key,
+                type(value).__name__,
+                expected_type.__name__,
+            )
+            continue
+
+        if value < lo or value > hi:
+            clamped = max(lo, min(hi, value))
+            logger.warning(
+                "search_profile key '%s' value %s out of range [%s, %s], clamped to %s",
+                key,
+                value,
+                lo,
+                hi,
+                clamped,
+            )
+            cleaned[key] = clamped
+            continue
+
+        cleaned[key] = value
+
+    return cleaned
+
+
+# ── Storage-backed read/write ──
+
+
+def invalidate_cache(tenant_id: str) -> None:
+    """Evict a tenant's cached settings. Exposed for tests + future NOTIFY hook."""
+    _settings_cache.pop(tenant_id, None)
+    logger.info("organization_settings cache invalidated for %s", tenant_id)
+
+
+async def resolve_config(tenant_id: str) -> ResolvedConfig:
+    """Resolve config for a tenant: tenant override → global env default.
+
+    Settings load through core-storage-api (Fix 2 Phase 0).
+    """
+    raw = await get_raw_settings(tenant_id)
+    return ResolvedConfig(raw)
+
+
+async def get_raw_settings(tenant_id: str) -> dict:
+    """Return the tenant's raw override dict, or ``{}`` if no overrides set.
+
+    Cache-first (5-min TTL); on a miss, fetched via core-storage-api (Fix 2
+    Phase 0 routed this through the storage client — no direct DB read).
+    """
+    cached = _settings_cache.get(tenant_id)
+    if cached is not None:
+        logger.debug("organization_settings cache hit for %s", tenant_id)
+        return cached
+    return await _load_and_cache(tenant_id)
+
+
+async def _load_and_cache(tenant_id: str) -> dict:
+    # The WRITER, on every miss — and this is the whole fix, not half of it.
+    #
+    # A miss here is rarely cold. ``update_settings`` invalidates, then
+    # broadcasts, and EVERY process — the publisher included, since
+    # ``subscribe(broadcast=True)`` gives each its own subscription — drops its
+    # copy and reloads through this function. That reload is the race: served by
+    # a replica it can return the PRE-update settings and cache them for the
+    # full 5 minutes, so a write meant to tighten a governance control appears
+    # to land and does not take effect. Re-caching a stale value is strictly
+    # worse than not caching at all — the TTL then hides the mistake for exactly
+    # as long as the cache was meant to help.
+    #
+    # Priming the entry post-write instead was tried and is not equivalent: the
+    # publisher receives its own broadcast and evicts what it just primed, so
+    # the reload happens anyway and has to be correct on its own.
+    #
+    # The cost is bounded by the thing the cache already guarantees: at most one
+    # read per tenant per TTL per process. That is what makes taking it from the
+    # primary affordable here and not elsewhere.
+    stored = await get_storage_client().get_org_settings(tenant_id)
+    resolved = await _encrypt_legacy_api_keys(tenant_id, stored)
+    _settings_cache[tenant_id] = resolved
+    logger.info("organization_settings cache miss for %s; loaded via storage-api and cached", tenant_id)
+    return resolved
+
+
+async def _encrypt_legacy_api_keys(tenant_id: str, stored: dict) -> dict:
+    """Encrypt provider keys stored before ``api_keys`` were encrypted (M-99).
+
+    ``update_settings`` encrypts every key it saves, but a key saved before that
+    stays plaintext until its tenant saves again. The first load after the
+    deploy swaps it, so every tenant in use is converted without a cross-tenant
+    sweep. Storage swaps a key only while it still holds the plaintext read
+    here, so a tenant saving a new key meanwhile keeps it, and workers loading
+    together swap each key once. Without ``SETTINGS_ENCRYPTION_KEY`` nothing
+    changes, as the save path then stores plaintext too. A failure leaves the
+    keys as they were, which ``decrypt_api_key`` reads, and the next load retries.
+    """
+    api_keys = stored.get("api_keys")
+    if not encryption_enabled() or not isinstance(api_keys, dict):
+        return stored
+    plaintext = {name: value for name, value in api_keys.items() if needs_encryption(value)}
+    if not plaintext:
+        return stored
+    encrypted = encrypt_api_keys(plaintext)
+    try:
+        swapped = await get_storage_client().encrypt_org_api_keys(
+            tenant_id, expected=plaintext, encrypted=encrypted, changed_by="system:encrypt-legacy-api-keys"
+        )
+    except Exception:
+        logger.warning(
+            "legacy api_keys encryption failed for %s; keys left as stored", tenant_id, exc_info=True
+        )
+        return stored
+    return {**stored, "api_keys": {**api_keys, **{name: encrypted[name] for name in swapped}}}
+
+
+# C36 — provider keys must never leave the server readable. Display replaces
+# every non-empty ``api_keys`` value with the constant ``****`` — set/unset
+# stays visible, and NOTHING in the display tree derives from the stored
+# key. (Both a last-4 slice and a hash fingerprint put key-derived bytes in
+# the tree; CodeQL then rightly tracks the whole display dict as
+# credential-tainted, and last-4 IS literal key material.) The write path
+# treats a ``****``-prefixed value as "unchanged", so a read-modify-write
+# round-trip (the dashboard sends the whole ``api_keys`` group when any one
+# key is edited) can't overwrite a stored key with its own mask. No real
+# provider key starts with ``****``, so the sentinel can't collide.
+_DISPLAY_MASK = "****"
+
+
+def _display_mask_for(value: str) -> str:
+    return _DISPLAY_MASK
+
+
+def _is_display_mask(value: object) -> bool:
+    return isinstance(value, str) and value.startswith(_DISPLAY_MASK)
+
+
+def _settings_display_view(settings: dict) -> dict:
+    # Deliberately iterates ``items()`` and matches the section NAME as a
+    # plain string instead of reading ``settings["api_keys"]``: a
+    # credential-named read makes static analysis treat the whole returned
+    # tree as tainted, cascading false clear-text-logging alerts onto every
+    # consumer that logs any settings-derived value.
+    out: dict = {}
+    for section, content in settings.items():
+        if section == "api_keys" and isinstance(content, dict):
+            out[section] = {
+                k: (_display_mask_for(v) if isinstance(v, str) and v else v) for k, v in content.items()
+            }
+        else:
+            out[section] = content
+    return out
+
+
+async def get_settings_for_display(tenant_id: str) -> dict:
+    """Return ``DEFAULT_SETTINGS`` merged with the tenant's overrides for UI display.
+
+    ``api_keys`` values are masked (C36) — internal readers that need the real
+    keys go through ``ResolvedConfig`` / ``get_raw_settings``, never this view.
+    """
+    raw = await get_raw_settings(tenant_id)
+    return _settings_display_view(_deep_merge(DEFAULT_SETTINGS, raw))
+
+
+#: The crystallizer settings a dedup stamp was settled under (M-38).
+_SWEEP_POLICY_KEYS = frozenset({"min_cluster_size", "dedup_threshold", "auto_crystallize"})
+
+
+async def _reopen_dedup_sweep(tenant_id: str) -> None:
+    """Clear the tenant's dedup stamps, one bounded storage call at a time (M-38).
+
+    A storage build without ``done`` cleared every row in one call, so its
+    answer ends the loop.
+    """
+    sc = get_storage_client()
+    while True:
+        result = await sc.reset_dedup_checked(tenant_id)
+        if result.get("done", True):
+            return
+
+
+async def update_settings(
+    tenant_id: str,
+    new_settings: dict,
+    *,
+    changed_by: str | None = None,
+) -> dict:
+    """Upsert tenant overrides + write an audit row with the flat diff.
+
+    Writes are a deep MERGE, so an omitted key keeps its current value. The
+    reset shape is an explicit ``null``: validation passes ``None`` through
+    deliberately (for a ``search.default_profile`` knob too, provided the knob
+    exists), and storage applies the payload with ``merge_settings_update``,
+    which DELETES the override so the resolver falls back to the default.
+    ``search.default_profile`` itself may also be sent as ``null`` to drop every
+    tenant-default knob at once; other object-valued sections may not (see
+    ``_NULLABLE_OBJECT_KEYS``). ``{}`` for a section merges nothing and is a
+    no-op — it looks like a clear and is not one, which is the trap worth
+    knowing about.
+
+    Returns the merged display view (``DEFAULT_SETTINGS`` ⊕ tenant overrides)
+    so callers can echo back the resulting state. No-ops when the submitted
+    payload introduces no actual changes.
+
+    The transactional upsert (``FOR UPDATE`` read → flat diff → JSONB ``||``
+    merge → audit row, one transaction) runs server-side in core-storage-api
+    (Fix 2 Phase 0). Validation, the TTL-cache invalidate, and the
+    ``SETTINGS_CHANGED`` broadcast stay here.
+    """
+    # C36 — a masked value coming back in is the display mask, not a new
+    # key: drop it so the stored key stays untouched. The dashboard sends
+    # the whole ``api_keys`` group when any single key changes, so unedited
+    # siblings arrive masked on every save. Same items()-iteration shape as
+    # ``_settings_display_view`` (and for the same reason).
+    filtered: dict = {}
+    for section, content in new_settings.items():
+        if section == "api_keys" and isinstance(content, dict):
+            kept = {k: v for k, v in content.items() if not _is_display_mask(v)}
+            if kept:
+                filtered[section] = kept
+        else:
+            filtered[section] = content
+    new_settings = filtered
+
+    _check_keys(new_settings, DEFAULT_SETTINGS)
+    _validate_api_keys(new_settings)
+    _validate_leaf_types(new_settings)
+    _validate_governance_enums(new_settings)
+    _validate_agent_digest_cadence(new_settings)
+    _validate_default_search_profile(new_settings)
+    cron_override = new_settings.get("security_audit", {}).get("schedule_cron")
+    if cron_override is not None:
+        _validate_cron(cron_override)
+
+    # The diff-against-current + upsert + audit happen in one server-side
+    # transaction (the FOR UPDATE lost-update guard can't span an HTTP read +
+    # write, so it lives in storage-api). ``merged`` is the resulting raw
+    # overrides; ``changed`` is False when the payload was a no-op.
+    # Provider keys are encrypted before they leave this service, so neither
+    # the settings row nor its audit diff ever holds them in plaintext.
+    if isinstance(new_settings.get("api_keys"), dict):
+        new_settings = {**new_settings, "api_keys": encrypt_api_keys(new_settings["api_keys"])}
+    result = await get_storage_client().update_org_settings(tenant_id, new_settings, changed_by=changed_by)
+    merged = result["settings"]
+    if not result.get("changed"):
+        # Identical payload — storage wrote nothing; nothing to invalidate or broadcast.
+        return _settings_display_view(_deep_merge(DEFAULT_SETTINGS, merged))
+
+    # Invalidate THIS process's cache immediately...
+    invalidate_cache(tenant_id)
+    # ...and broadcast so every other worker/instance drops its copy promptly
+    # too (CAURA-571), instead of serving the stale value for up to the TTL —
+    # which matters for a tightened governance control. Best-effort: a publish
+    # failure must not fail a settings write that already committed; siblings
+    # then fall back to the TTL, exactly as before this change.
+    try:
+        await get_event_bus().publish(
+            Topics.Org.SETTINGS_CHANGED,
+            Event(
+                event_type=Topics.Org.SETTINGS_CHANGED,
+                tenant_id=tenant_id,
+                payload=OrgSettingsChangedEvent(org_id=tenant_id).model_dump(mode="json"),
+            ),
+        )
+    except Exception:
+        logger.warning(
+            "failed to publish settings-changed for %s; sibling workers will "
+            "pick up the change within the cache TTL",
+            tenant_id,
+            exc_info=True,
+        )
+
+    # M-38: a crystallizer sweep setting is the policy a dedup stamp was settled
+    # under, so a change to one reopens the stamped rows for the next run. Keyed
+    # on the payload, as storage returns no diff: a save that resends an
+    # unchanged value costs one re-scan. In the background, so the save does not
+    # wait on a large tenant, and never failing the write, which has committed.
+    # A failure is logged at ERROR and recorded in ``background_task_log``:
+    # re-saving the same value is a no-op, so nothing else would retry it.
+    if _SWEEP_POLICY_KEYS & set(new_settings.get("crystallizer") or {}):
+        track_task(tracked_task(_reopen_dedup_sweep(tenant_id), "crystallizer_reopen_sweep", None, tenant_id))
+
+    return _settings_display_view(_deep_merge(DEFAULT_SETTINGS, merged))

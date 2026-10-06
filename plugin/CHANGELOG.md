@@ -1,0 +1,283 @@
+# Changelog
+
+Only the most recent releases are listed below. Every release, including those
+no longer shown here, is published with its full notes at
+[github.com/caura-ai/caura/releases](https://github.com/caura-ai/caura/releases).
+
+## [2.24.0](https://github.com/caura-ai/caura/compare/plugin-v2.23.7...plugin-v2.24.0) (2026-10-06)
+
+
+### Features
+
+* **plugin:** label requests with the openclaw_plugin audit surface ([#1945](https://github.com/caura-ai/caura/issues/1945)) ([8230464](https://github.com/caura-ai/caura/commit/8230464dbd8e5a3af6d875be0433582df8eb724f))
+
+## [2.23.7](https://github.com/caura-ai/caura/compare/plugin-v2.23.6...plugin-v2.23.7) (2026-10-06)
+
+
+### Bug Fixes
+
+* thirteen reviewed OSS audit fixes, combined to merge in one CI run ([#1909](https://github.com/caura-ai/caura/issues/1909)) ([675baa5](https://github.com/caura-ai/caura/commit/675baa5596fce9d31d701b5683d9ce261c9883c8))
+
+## [2.23.6](https://github.com/caura-ai/caura/compare/plugin-v2.23.5...plugin-v2.23.6) (2026-10-06)
+
+
+### Bug Fixes
+
+* **documents:** refuse agents awaiting approval and the interview collections ([#1865](https://github.com/caura-ai/caura/issues/1865)) ([348270d](https://github.com/caura-ai/caura/commit/348270d85ccf6a964143afdd724911de62119f47))
+* **plugin:** the memory-flush turn honors the auto-write opt-out ([#1868](https://github.com/caura-ai/caura/issues/1868)) ([ea13ec8](https://github.com/caura-ai/caura/commit/ea13ec8570952375824d09493101587f5e13f1c4))
+
+## [2.23.5](https://github.com/caura-ai/caura/compare/plugin-v2.23.4...plugin-v2.23.5) (2026-10-04)
+
+
+### Bug Fixes
+
+* **plugin:** accept no server-pushed code or instructions over plain HTTP ([#1808](https://github.com/caura-ai/caura/issues/1808)) ([6c4bc6b](https://github.com/caura-ai/caura/commit/6c4bc6b9addaf06b9cd61a1b7fc5a41b722e0a58))
+
+## [2.23.4](https://github.com/caura-ai/caura/compare/plugin-v2.23.3...plugin-v2.23.4) (2026-10-03)
+
+
+### Bug Fixes
+
+* apply the same identity, trust, fleet and visibility rules across write paths, lifecycle and audit ([#1775](https://github.com/caura-ai/caura/issues/1775)) ([b58759f](https://github.com/caura-ai/caura/commit/b58759f0da0b2a6921a070723c25f6c353a5a7bf))
+* **plugin:** align tool parameters and document requests with REST ([#1779](https://github.com/caura-ai/caura/issues/1779)) ([b3ef98d](https://github.com/caura-ai/caura/commit/b3ef98d40ab931c7bbf5c3b89cab7b3aafedffd6))
+* **plugin:** bound credential provisioning and reject API redirects ([#1780](https://github.com/caura-ai/caura/issues/1780)) ([8bf503d](https://github.com/caura-ai/caura/commit/8bf503d13031ea48c2027d228b5f12a66f028c97))
+* **plugin:** honor auto-write opt-out for conversation persistence ([#1778](https://github.com/caura-ai/caura/issues/1778)) ([ad8f8c3](https://github.com/caura-ai/caura/commit/ad8f8c3501325a8a908a56fdab800d6a5334c60b))
+* **plugin:** preserve keystone truncation and normalize tool results ([#1781](https://github.com/caura-ai/caura/issues/1781)) ([1adae88](https://github.com/caura-ai/caura/commit/1adae8887701723b81e3d570d4ed9eb319aa7a34))
+* **plugin:** refuse to send the API key over plain HTTP to non-loopback hosts (oss-0917-m-01) ([#1745](https://github.com/caura-ai/caura/issues/1745)) ([4981f45](https://github.com/caura-ai/caura/commit/4981f45cab1029d1f33009c0529302b9309a093b))
+* tighten fleet command validation, installer URL handling and settings storage ([#1769](https://github.com/caura-ai/caura/issues/1769)) ([f96768c](https://github.com/caura-ai/caura/commit/f96768c7fe1fd46c903c130946b841ba5fe07a33))
+
+## [2.23.3](https://github.com/caura-ai/caura/compare/plugin-v2.23.2...plugin-v2.23.3) (2026-09-26)
+
+
+### Bug Fixes
+
+* **plugin:** stop re-requesting agent keys after the provision route 404s ([#1718](https://github.com/caura-ai/caura/issues/1718)) ([b5fe391](https://github.com/caura-ai/caura/commit/b5fe3911047379cd812373a4e7e47a41e6d8f909))
+
+## [2.23.2](https://github.com/caura-ai/caura/compare/plugin-v2.23.1...plugin-v2.23.2) (2026-09-23)
+
+
+### Bug Fixes
+
+* **memory:** make caller ownership of summary/tags durable on the row (09/02 L-08) ([#1693](https://github.com/caura-ai/caura/issues/1693)) ([6cce76a](https://github.com/caura-ai/caura/commit/6cce76aad6fc7df4d0c89a1e9e4b0aa85c87e845))
+
+## [2.23.1](https://github.com/caura-ai/caura/compare/plugin-v2.23.0...plugin-v2.23.1) (2026-09-23)
+
+
+### Dependencies
+
+* **plugin:** bump @types/node from 26.5.1 to 26.6.1 in /plugin in the npm-minor-patch group ([#1658](https://github.com/caura-ai/caura/issues/1658)) ([b4c43f2](https://github.com/caura-ai/caura/commit/b4c43f2620ac9e275630fbe47f5e344e5c911f2d))
+
+
+### Documentation
+
+* align setup and agent guides with live contracts ([#1643](https://github.com/caura-ai/caura/issues/1643)) ([c52d517](https://github.com/caura-ai/caura/commit/c52d517f52db3a644f7308b5d40d1df60da10143))
+* **api:** correct the fleet-less recall claim and name all four scope axes (ax-0917-m-19/m-20) ([#1697](https://github.com/caura-ai/caura/issues/1697)) ([8b235f7](https://github.com/caura-ai/caura/commit/8b235f7459bcedfff81c466e33534ce1145b66ff))
+* **documents:** disclose that a doc write mints a memory (ax-0917-m-15) ([#1695](https://github.com/caura-ai/caura/issues/1695)) ([005e607](https://github.com/caura-ai/caura/commit/005e607a4c07ecd3dfe8a795354251c7f106498a))
+* **rebrand:** classify skill and migration legacy names ([#1671](https://github.com/caura-ai/caura/issues/1671)) ([87f9bde](https://github.com/caura-ai/caura/commit/87f9bdeba16a5df69b5095efa09e3c1e15cf773a))
+
+## [2.23.0](https://github.com/caura-ai/caura/compare/plugin-v2.22.3...plugin-v2.23.0) (2026-09-19)
+
+
+### Features
+
+* **plugin:** identify the plugin with a User-Agent header ([#1578](https://github.com/caura-ai/caura/issues/1578)) ([3cdb2f7](https://github.com/caura-ai/caura/commit/3cdb2f73e6a2ead2a2d4de23b70fcb9683d4d734))
+
+## [2.22.3](https://github.com/caura-ai/caura/compare/plugin-v2.22.2...plugin-v2.22.3) (2026-09-18)
+
+
+### Bug Fixes
+
+* **plugin:** create openclaw.json so a fresh install has callable tools ([#1556](https://github.com/caura-ai/caura/issues/1556)) ([9df2379](https://github.com/caura-ai/caura/commit/9df2379ad41df98ba1b791d3208a7a7056f1dd8a))
+
+## [2.22.2](https://github.com/caura-ai/caura/compare/plugin-v2.22.1...plugin-v2.22.2) (2026-09-14)
+
+
+### Bug Fixes
+
+* **plugin:** evict the least recently used session, not the oldest one (F1) ([#1507](https://github.com/caura-ai/caura/issues/1507)) ([138b2d9](https://github.com/caura-ai/caura/commit/138b2d9ac452ff54e99c227dd099223ed0da24d8))
+
+## [2.22.1](https://github.com/caura-ai/caura/compare/plugin-v2.22.0...plugin-v2.22.1) (2026-09-14)
+
+
+### Dependencies
+
+* **plugin:** bump @types/node from 26.4.1 to 26.5.1 in /plugin in the npm-minor-patch group ([#1482](https://github.com/caura-ai/caura/issues/1482)) ([5caf8ef](https://github.com/caura-ai/caura/commit/5caf8ef04cffb10e01a7abe2692f5468ea74eff8))
+
+## [2.22.0](https://github.com/caura-ai/caura/compare/plugin-v2.21.1...plugin-v2.22.0) (2026-09-10)
+
+
+### Features
+
+* **search:** freshness_reference — As-Of Recall for backfilled corpora ([#1471](https://github.com/caura-ai/caura/issues/1471)) ([c13b720](https://github.com/caura-ai/caura/commit/c13b720336bdcf926d6dc43fb93347693570ec69))
+
+## [2.21.1](https://github.com/caura-ai/caura/compare/plugin-v2.21.0...plugin-v2.21.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* **search:** budget and label successor injection (D16) ([#1439](https://github.com/caura-ai/caura/issues/1439)) ([b17771f](https://github.com/caura-ai/caura/commit/b17771f5ebf65aaec3fda67533b1301ace31b094))
+
+## [2.21.0](https://github.com/caura-ai/caura/compare/plugin-v2.20.3...plugin-v2.21.0) (2026-09-09)
+
+
+### Features
+
+* **search:** raise the top_k ceiling to 200 and give it one source of truth ([#1411](https://github.com/caura-ai/caura/issues/1411)) ([1d86102](https://github.com/caura-ai/caura/commit/1d86102e3ca70bb04c8a05fd61e26f35addf0296))
+
+## [2.20.3](https://github.com/caura-ai/caura/compare/plugin-v2.20.2...plugin-v2.20.3) (2026-09-08)
+
+
+### Bug Fixes
+
+* **plugin:** make a missing op branch a build error, and pin every op's route ([#1379](https://github.com/caura-ai/caura/issues/1379)) ([fbf68d0](https://github.com/caura-ai/caura/commit/fbf68d0dfdba7bc3337b04f0c25e012ddf55d3b6))
+* **plugin:** stop an unrecognised op falling through to a write ([#1376](https://github.com/caura-ai/caura/issues/1376)) ([23a9895](https://github.com/caura-ai/caura/commit/23a98953b71575c4744c1991c09ee03975c594f1))
+
+
+### Performance
+
+* **tools:** stop buying five op roll-calls twice in tools/list ([#1381](https://github.com/caura-ai/caura/issues/1381)) ([05f39e8](https://github.com/caura-ai/caura/commit/05f39e8a4d2812b7ea00ac1ac1b6089187d4187f))
+
+## [2.20.2](https://github.com/caura-ai/caura/compare/plugin-v2.20.1...plugin-v2.20.2) (2026-09-08)
+
+
+### Bug Fixes
+
+* **tools:** declare the two caura_manage ops the manifest already advertised ([#1373](https://github.com/caura-ai/caura/issues/1373)) ([c14b812](https://github.com/caura-ai/caura/commit/c14b81267961e4af70d12d783f641ba4e4bc2323))
+
+## [2.20.1](https://github.com/caura-ai/caura/compare/plugin-v2.20.0...plugin-v2.20.1) (2026-09-07)
+
+
+### Dependencies
+
+* **plugin:** bump @types/node from 26.4.0 to 26.4.1 in /plugin in the npm-minor-patch group ([#1327](https://github.com/caura-ai/caura/issues/1327)) ([93d9974](https://github.com/caura-ai/caura/commit/93d9974fb60d9a9168252443ee31dc321a8f0d02))
+
+## [2.20.0](https://github.com/caura-ai/caura/compare/plugin-v2.19.7...plugin-v2.20.0) (2026-09-04)
+
+
+### Features
+
+* dual-path serve the bundled and standalone skills under caura alongside memclaw ([#1261](https://github.com/caura-ai/caura/issues/1261)) ([43cb230](https://github.com/caura-ai/caura/commit/43cb230ae9f897d2f0009e68d7fc54fdd1c62f9e))
+* dual-read alias the six gateway RPC commands from memclaw.* to caura.* ([#1263](https://github.com/caura-ai/caura/issues/1263)) ([a087c7a](https://github.com/caura-ai/caura/commit/a087c7a2ee9017e384b454b13c82e20e58769f73))
+
+
+### Documentation
+
+* **skills:** stop telling agents to discover permissions by attempting the operation ([#1264](https://github.com/caura-ai/caura/issues/1264)) ([4693c42](https://github.com/caura-ai/caura/commit/4693c42695f36e7ecf26c8eab3ce1473fbdc59d6))
+
+## [2.19.7](https://github.com/caura-ai/caura/compare/plugin-v2.19.6...plugin-v2.19.7) (2026-09-01)
+
+
+### Dependencies
+
+* **plugin:** bump @types/node from 26.2.0 to 26.4.0 in /plugin in the npm-minor-patch group across 1 directory ([#1130](https://github.com/caura-ai/caura/issues/1130)) ([f354e6b](https://github.com/caura-ai/caura/commit/f354e6b147f955095f1bffdcc9932000b1515856))
+
+## [2.19.6](https://github.com/caura-ai/caura/compare/plugin-v2.19.5...plugin-v2.19.6) (2026-08-31)
+
+
+### Documentation
+
+* **plugin:** correct legacy floor classifications ([#1128](https://github.com/caura-ai/caura/issues/1128)) ([51c33d9](https://github.com/caura-ai/caura/commit/51c33d9fceafd78880b214498dcae472ed00ac99))
+
+## [2.19.5](https://github.com/caura-ai/caura/compare/plugin-v2.19.4...plugin-v2.19.5) (2026-08-30)
+
+
+### Documentation
+
+* **plugin:** correct pre-A1 matcher history ([#1113](https://github.com/caura-ai/caura/issues/1113)) ([a750d35](https://github.com/caura-ai/caura/commit/a750d35ea36cc0eb3d742371925e9bc2ed9561fd))
+
+## [2.19.4](https://github.com/caura-ai/caura/compare/plugin-v2.19.3...plugin-v2.19.4) (2026-08-29)
+
+
+### Code Refactoring
+
+* **plugin:** clean stale legacy-name prose ([#1051](https://github.com/caura-ai/caura/issues/1051)) ([3c346e6](https://github.com/caura-ai/caura/commit/3c346e6a0b4d03b479c59e9cbb8768c7431a49b5))
+
+## [2.19.3](https://github.com/caura-ai/caura/compare/plugin-v2.19.2...plugin-v2.19.3) (2026-08-29)
+
+
+### Code Refactoring
+
+* **ratchet:** file permanent names under the floor marker ([#1046](https://github.com/caura-ai/caura/issues/1046)) ([b4e4525](https://github.com/caura-ai/caura/commit/b4e452535144d21dfb8cd6823064958a274cb7b1))
+
+## [2.19.2](https://github.com/caura-ai/caura/compare/plugin-v2.19.1...plugin-v2.19.2) (2026-08-27)
+
+
+### Documentation
+
+* **rebrand:** two comments that use the old brand as the product's name ([#1015](https://github.com/caura-ai/caura/issues/1015)) ([e836d7b](https://github.com/caura-ai/caura/commit/e836d7b948f69338454059f81daeeb6574cde731))
+
+
+### Code Refactoring
+
+* **plugin:** rename the default export, reword stale comments ([#1013](https://github.com/caura-ai/caura/issues/1013)) ([b2518e6](https://github.com/caura-ai/caura/commit/b2518e6b45ea91ad49ced72d8f3ccae4c24a73da))
+
+## [2.19.1](https://github.com/caura-ai/caura/compare/plugin-v2.19.0...plugin-v2.19.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* **api:** reject unknown fields on write bodies instead of dropping them (SAFE-01) ([#1005](https://github.com/caura-ai/caura/issues/1005)) ([94cd4f1](https://github.com/caura-ai/caura/commit/94cd4f1d5a2fbfb72dea157a49a5212990bdabf7))
+* **keystones:** correct keystone_trust_hint's stored-shape claim ([#1004](https://github.com/caura-ai/caura/issues/1004)) ([92768f4](https://github.com/caura-ai/caura/commit/92768f4459f30a453db8c460f43312c05c3e4cb1))
+
+
+### Documentation
+
+* **keystones:** the self-author tier needs an explicit agent_id ([#1001](https://github.com/caura-ai/caura/issues/1001)) ([a79a2ea](https://github.com/caura-ai/caura/commit/a79a2eaa1e0c2855c8650f8c786e949bedb0e4f8))
+
+## [2.19.0](https://github.com/caura-ai/caura/compare/plugin-v2.18.0...plugin-v2.19.0) (2026-08-25)
+
+
+### Features
+
+* **api:** MCP/REST search parity per the ratified wire contract (C31) ([#962](https://github.com/caura-ai/caura/issues/962)) ([d9bf825](https://github.com/caura-ai/caura/commit/d9bf825041d3ffa317ae4c47921d0dade2ff6a1c))
+
+
+### Bug Fixes
+
+* the four P1 behavior defects from the sunset report ([#964](https://github.com/caura-ai/caura/issues/964)) ([fd756e8](https://github.com/caura-ai/caura/commit/fd756e89f3e960ff94f962947738cc9c79cb616d))
+
+## [2.18.0](https://github.com/caura-ai/caura/compare/plugin-v2.17.0...plugin-v2.18.0) (2026-08-25)
+
+
+### Features
+
+* **api:** structured errors, safe deletes, and client alias packages ([#950](https://github.com/caura-ai/caura/issues/950)) ([e9ae581](https://github.com/caura-ai/caura/commit/e9ae58141e5c96be6d9146b6dc238bdcde813cab))
+
+
+### Bug Fixes
+
+* **mcp:** stop the identity surface misdescribing itself ([#951](https://github.com/caura-ai/caura/issues/951)) ([a28938d](https://github.com/caura-ai/caura/commit/a28938d34af3b501ec097dcacadb83f35e307f6f))
+* **plugin:** caura_list scope='all' spans fleets instead of narrowing to one ([#904](https://github.com/caura-ai/caura/issues/904)) ([2bdf359](https://github.com/caura-ai/caura/commit/2bdf35933e747cda1f57fb21a30b2d52e8c9b684))
+* **plugin:** the strings the plugin emits used the previous brand name ([#902](https://github.com/caura-ai/caura/issues/902)) ([b8450a6](https://github.com/caura-ai/caura/commit/b8450a64c2780206fae5e65d0d40442487e492f0))
+* stop minting old-brand strings into new installs and registrations ([#928](https://github.com/caura-ai/caura/issues/928)) ([f877e09](https://github.com/caura-ai/caura/commit/f877e098076eae1d570b03a4c5e0c0c01fed1b2b))
+
+
+### Documentation
+
+* **mcp:** scope has no single default, so the SoT descriptions stop naming one ([#910](https://github.com/caura-ai/caura/issues/910)) ([754336e](https://github.com/caura-ai/caura/commit/754336e950573ad08ef5f936f0ec8cf904d3e64c))
+* **plugin:** an omitted scope is not scope='agent' on caura_list/caura_stats ([#906](https://github.com/caura-ai/caura/issues/906)) ([41ee5a6](https://github.com/caura-ai/caura/commit/41ee5a685fa62ad02c4fae9562cf8066feb4a1a8))
+* teach the CAURA_* names everywhere humans read ([#929](https://github.com/caura-ai/caura/issues/929)) ([815221d](https://github.com/caura-ai/caura/commit/815221de4ac44e1db01e8b4c30b5eb53c1be9743))
+
+
+### Code Refactoring
+
+* **plugin:** collapse the plugin id to one constant and pin both ends ([#941](https://github.com/caura-ai/caura/issues/941)) ([3e62c74](https://github.com/caura-ai/caura/commit/3e62c749afd8280c6c4911191f1cbfd844baa9f6))
+
+## [2.17.0](https://github.com/caura-ai/caura/compare/plugin-v2.16.1...plugin-v2.17.0) (2026-08-23)
+
+
+### Features
+
+* **env:** read CAURA_* everywhere the old names are read ([#886](https://github.com/caura-ai/caura/issues/886)) ([74b8a07](https://github.com/caura-ai/caura/commit/74b8a07386cbd2338c4816c0a0eeb049c7d2bb6c))
+
+## [2.16.1](https://github.com/caura-ai/caura/compare/plugin-v2.16.0...plugin-v2.16.1) (2026-08-13)
+
+
+### Dependencies
+
+* **plugin:** bump @types/node from 26.1.1 to 26.2.0 in /plugin in the npm-minor-patch group across 1 directory ([#688](https://github.com/caura-ai/caura/issues/688)) ([a40ca4a](https://github.com/caura-ai/caura/commit/a40ca4ab6b7e8f2b9cf9f9aa7c5e16af0092c232))
+
+
+### Documentation
+
+* **write:** document embedding_pending and the strong-mode opt-out ([#706](https://github.com/caura-ai/caura/issues/706)) ([187b5b5](https://github.com/caura-ai/caura/commit/187b5b5465d7659624e13f455e662c9fce67c483))

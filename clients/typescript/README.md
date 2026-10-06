@@ -1,0 +1,119 @@
+# @caura/client
+
+Official TypeScript/JavaScript client for [Caura](https://caura.ai) —
+governed shared memory for AI agent fleets (multi-agent, multi-tenant,
+MCP-native).
+
+A thin wrapper over the Caura REST API. Point it at a managed
+(`https://caura.ai`) or self-hosted (`http://localhost:8000`) deployment.
+Zero runtime dependencies — uses native `fetch` (Node 18+).
+
+## Install
+
+```bash
+npm install @caura/client
+```
+
+## Quickstart
+
+```ts
+import { Caura } from "@caura/client";
+
+const mc = new Caura("mc_xxx", { tenantId: "my-team", agentId: "my-agent" });
+
+// Write a memory — enriched server-side with type, title, tags, importance.
+await mc.write("Q3 revenue target is $4M, set on 2026-04-15.");
+
+// Search (ranked raw results)
+for (const m of await mc.search("Q3 revenue target", { topK: 5 })) {
+  console.log(m.title, "—", m.content);
+}
+
+// Recall (LLM-synthesized context brief)
+console.log((await mc.recall("Q3 revenue target")).summary);
+```
+
+Self-hosted? Pass `baseUrl`:
+
+```ts
+const mc = new Caura("standalone", { tenantId: "default", baseUrl: "http://localhost:8000" });
+```
+
+Plain `http://` sends the API key in clear, so the client allows it only to a
+loopback host (`localhost`, `127.0.0.0/8`, `::1`) and otherwise throws, naming
+the host. Use `https://`, or pass `allowInsecureHttp: true` (or set
+`CAURA_ALLOW_INSECURE_HTTP=true`) to accept the risk, e.g. on a trusted private
+network. Requests refuse redirects, so the key is never re-sent elsewhere: point
+`baseUrl` at the final URL.
+
+## API
+
+| Method | Endpoint | Returns |
+|---|---|---|
+| `write(content, opts?)` | `POST /api/v1/memories` | `Memory` |
+| `search(query, opts?)` | `POST /api/v1/search` | `Memory[]` |
+| `recall(query, opts?)` | `POST /api/v1/recall` | `RecallResult` |
+| `getDocument(docId, opts)` | `GET /api/v1/documents/{docId}` | `object` |
+| `health()` | `GET /api/v1/health` | `object` |
+
+Failures throw `AuthError` (401/403), `NotFoundError` (404), or
+`CauraApiError` for HTTP errors. Network failures and timeouts while awaiting
+response headers or consuming the response body throw `TransportError`, with
+the original rejection in `cause`. All extend `CauraError`, so one catch can
+handle both HTTP and transport failures. Transport errors have no HTTP status
+code; requests are not retried. Every result also exposes the full API payload
+on `.raw`.
+
+### Fetching a document
+
+`getDocument()` returns the full `DocOut` envelope — the stored record is
+nested under the `"data"` key, not returned directly. `collection` is a
+required option, and a missing document raises `NotFoundError`:
+
+```ts
+const doc = await mc.getDocument("doc-123", { collection: "interviews" });
+const record = doc.data; // the stored record lives under "data"
+```
+
+### Unknown fields on writes are rejected
+
+`write()` spreads any unrecognised option into the request body. The API
+rejects a field it does not declare with **422**, naming it in
+`error.details.unknown_fields`:
+
+```ts
+// `tags` is not a write field — this throws CauraApiError (422).
+await mc.write("a memory", { tags: ["alpha"] } as any);
+
+// Caller-owned keys belong under `metadata`.
+await mc.write("a memory", { metadata: { tags: ["alpha"] } });
+```
+
+This used to return `201` with the field silently discarded, so an integration
+that "worked" may start failing here — the data it sent was never being stored.
+`search()` and `recall()` are unaffected: filter bodies still accept unknown
+fields, deliberately. See
+[api-surfaces.md](https://github.com/caura-ai/caura/blob/main/docs/api-surfaces.md#request-body-contract-writes-are-strict-searches-are-not).
+
+For credentials, scopes, and the full API surface, see the
+[Caura docs](https://caura.ai/docs). Production fleets should use
+[per-agent keys](https://caura.ai/docs/integrations/per-agent-keys).
+
+## Request headers
+
+Every request carries `X-API-Key` (your key), `Content-Type: application/json`
+and a `User-Agent` of the form `caura-client-node/<version> (node/<major>)`.
+The `User-Agent` lets a Caura server count which SDK families talk to it; it
+names only the package, its version and the Node major (browsers drop the
+header, which is fine). The client sends nothing to any host other than the
+`baseUrl` you configure. The version is also exported as `VERSION`.
+
+## Not `npm install caura`
+
+The unscoped name is unavailable. npm's registry rejects it as too similar to
+`csurf`, a long-established package, and that rejection is not appealable in
+practice — the scoped name is the supported route rather than a workaround.
+
+## License
+
+Apache-2.0

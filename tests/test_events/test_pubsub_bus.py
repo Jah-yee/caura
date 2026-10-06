@@ -1,0 +1,2681 @@
+"""PubSubEventBus behaviour with the SDK mocked out.
+
+Covers the parts that live in our code — envelope encoding, decode
+robustness, ack/nack selection on handler outcome. The SDK-facing calls
+are replaced by stand-ins so these tests run without GCP.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import multiprocessing
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from queue import Empty
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+
+from common.events import Event, PubSubEventBus, Topics
+from common.events.pubsub import (
+    BROADCAST_MAX_SLOTS,
+    BROADCAST_SUBSCRIPTION_TTL_SECONDS,
+    _claim_broadcast_slot,
+    _process_broadcast_slot_id,
+)
+from tests._legacy_contracts import frozen_topic
+
+EMBEDDED_TOPIC = frozen_topic("memory.embedded")
+EMBEDDED_EVENT_BYTES = json.dumps({"event_type": EMBEDDED_TOPIC}).encode()
+
+
+@pytest.fixture
+def bus() -> PubSubEventBus:
+    # ``dual_subscribe=True`` here and at every other construction in this file.
+    # With ``memory`` flipped, the construction guard refuses ``dual=False``
+    # (a flipped family would publish under a name the bus does not bind), so
+    # the default is no longer constructible in this repo. None of the tests
+    # here are ABOUT that default — they cover topic prefixing, tunables, env
+    # normalisation, the pull loop and broadcast bookkeeping — so they take the
+    # setting all 12 running deployables use rather than neutralising the guard.
+    # The dual default itself is covered in ``test_topic_rename_cutover.py``,
+    # which keeps a dedicated fixture for it.
+    b = PubSubEventBus(
+        project_id="proj", subscription_prefix="test", dual_subscribe=True
+    )
+    # Pre-install a fake publisher so publish() doesn't touch the SDK.
+    # spec-limited to the real PublisherClient surface we rely on: a
+    # permissive MagicMock happily accepts .close(), which is exactly
+    # how the stop()-calls-nonexistent-close() bug survived these tests
+    # (PublisherClient has stop(), not close()).
+    fake_publisher = MagicMock(spec=["topic_path", "publish", "stop"])
+    fake_publisher.topic_path = lambda proj, topic: f"projects/{proj}/topics/{topic}"
+    future = MagicMock()
+    future.result = MagicMock(return_value="msg-id-1")
+    fake_publisher.publish = MagicMock(return_value=future)
+    b._publisher = fake_publisher
+    return b
+
+
+async def test_publish_encodes_envelope_as_json(bus: PubSubEventBus) -> None:
+    event = Event(
+        event_type=Topics.Memory.EMBED_REQUESTED,
+        tenant_id="t1",
+        payload={"memory_id": "abc"},
+    )
+    await bus.publish(Topics.Memory.EMBED_REQUESTED, event)
+
+    bus._publisher.publish.assert_called_once()
+    topic_path, data = bus._publisher.publish.call_args[0]
+    assert topic_path == "projects/proj/topics/caura.memory.embed-requested"
+    parsed = json.loads(data.decode())
+    assert parsed["event_type"] == Topics.Memory.EMBED_REQUESTED
+    assert parsed["tenant_id"] == "t1"
+    assert parsed["payload"] == {"memory_id": "abc"}
+
+
+async def test_topic_prefix_scopes_publish(bus: PubSubEventBus) -> None:
+    # With an env-scoped topic prefix set, publish targets the prefixed topic id —
+    # so an env's publishers/subscribers stay isolated from another env sharing the
+    # GCP project (cross-env fan-out fix).
+    bus._topic_prefix = "prod"
+    event = Event(
+        event_type=Topics.Memory.EMBEDDED, tenant_id="t1", payload={"memory_id": "abc"}
+    )
+    await bus.publish(Topics.Memory.EMBEDDED, event)
+    topic_path, _ = bus._publisher.publish.call_args[0]
+    assert topic_path == "projects/proj/topics/prod--caura.memory.embedded"
+
+
+def test_topic_name_prefix_and_no_op() -> None:
+    scoped = PubSubEventBus(
+        project_id="proj",
+        subscription_prefix="prod-core-api",
+        topic_prefix="prod",
+        dual_subscribe=True,
+    )
+    assert scoped._topic_name(EMBEDDED_TOPIC) == f"prod--{EMBEDDED_TOPIC}"
+    # Empty/unset prefix ⇒ the raw topic name (byte-identical to today's behaviour).
+    noop = PubSubEventBus(
+        project_id="proj", subscription_prefix="test", dual_subscribe=True
+    )
+    assert noop._topic_name(EMBEDDED_TOPIC) == EMBEDDED_TOPIC
+
+
+def _decode_any(data: bytes) -> Event | None:
+    """``_decode`` with throwaway log context.
+
+    Only ``test_decode_failure_logs_subscription_and_message_id`` asserts on
+    the context, so every other call site passes placeholders through here
+    rather than restating the signature five times.
+    """
+    return PubSubEventBus._decode(data, subscription="sub-a", message_id="m-1")
+
+
+async def test_decode_accepts_well_formed_envelope() -> None:
+    src = Event(event_type=Topics.Memory.ENRICHED, tenant_id="t1", payload={"k": "v"})
+    bytes_ = src.model_dump_json().encode("utf-8")
+    decoded = _decode_any(bytes_)
+    assert decoded is not None
+    assert decoded.event_type == src.event_type
+    assert decoded.tenant_id == "t1"
+    assert decoded.payload == {"k": "v"}
+
+
+async def test_decode_returns_none_on_garbage() -> None:
+    assert _decode_any(b"not json at all") is None
+    assert _decode_any(b'{"missing": "event_type"}') is None
+
+
+async def test_decode_failure_logs_subscription_and_message_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A dropped malformed message must be traceable to its source.
+
+    The traceback names the syntax fault but not WHICH message or subscription
+    produced it, and a payload this broken yields no event_type or tenant_id to
+    identify it by. The sibling foreign-env drop branch in ``_pull_loop``
+    already logs structured context; this is the same guarantee for the other
+    drop path.
+    """
+    with caplog.at_level("ERROR"):
+        _decode_any(b"not json at all")
+
+    # ``is None`` is already covered by test_decode_returns_none_on_garbage.
+    recs = [r for r in caplog.records if "failed to decode" in r.getMessage()]
+    assert len(recs) == 1, "exactly one record, so recs[0] below is unambiguous"
+    rec = recs[0]
+    # The JSON arm keeps its traceback — it is safe to render and it names the
+    # syntax fault. Breaks if someone downgrades it to logger.error.
+    assert rec.exc_info is not None
+    assert rec.subscription == "sub-a"
+    assert rec.message_id == "m-1"
+    # ``dropped`` is the estate-wide marker for a silent discard; core-api and
+    # core-worker consumers set it on their own ack-drops and assert on it.
+    assert rec.dropped is True
+
+
+async def test_decode_validation_failure_never_logs_the_payload() -> None:
+    """A schema-invalid payload must not reach the log. This one can leak.
+
+    Pydantic renders the offending input into ``str(exc)`` as
+    ``input_value=...`` — the whole decoded document when a required field is
+    missing — so a ``logger.exception`` on this arm ships tenant data into
+    Cloud Logging and Datadog on every malformed message.
+
+    Asserted against the FULLY FORMATTED record, not ``getMessage()``:
+    ``LogRecord.getMessage()`` renders only ``msg % args`` and structurally
+    excludes ``exc_info``, so a test written against it passes while the
+    payload ships. That is not a hypothetical — it is the first version of
+    this test, and it stayed green against a leaking implementation.
+    """
+    import json as _json
+    import logging
+
+    secret = "ssn-123-45-6789"
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture()
+    bus_logger = logging.getLogger("common.events.pubsub")
+    bus_logger.addHandler(handler)
+    try:
+        # Valid JSON, invalid Event: takes the pydantic arm, not the JSON one.
+        assert _decode_any(_json.dumps({"note": secret}).encode()) is None
+    finally:
+        bus_logger.removeHandler(handler)
+
+    assert len(records) == 1
+    rec = records[0]
+    rendered = logging.Formatter().format(rec)
+    assert secret not in rendered, "tenant payload reached the log"
+    assert "input_value" not in rendered, "pydantic echoed the input document"
+    # The diagnostic that makes the drop actionable must survive the scrubbing:
+    # which field failed, and why.
+    errors = rec.validation_errors
+    assert [e["loc"] for e in errors] == [("event_type",)]
+    assert errors[0]["type"] == "missing"
+    assert all("input" not in e for e in errors)
+
+
+async def test_dispatch_all_returns_true_when_all_handlers_succeed(
+    bus: PubSubEventBus,
+) -> None:
+    called = 0
+
+    async def h1(_e: Event) -> None:
+        nonlocal called
+        called += 1
+
+    async def h2(_e: Event) -> None:
+        nonlocal called
+        called += 1
+
+    result = await bus._dispatch_all([h1, h2], Event(event_type=Topics.Memory.ENRICHED))
+    assert result is True
+    assert called == 2
+
+
+async def test_dispatch_all_returns_false_when_any_handler_raises(
+    bus: PubSubEventBus,
+) -> None:
+    async def bad(_e: Event) -> None:
+        raise RuntimeError("intentional test failure")
+
+    async def good(_e: Event) -> None:
+        pass
+
+    result = await bus._dispatch_all(
+        [good, bad], Event(event_type=Topics.Memory.ENRICHED)
+    )
+    assert result is False
+
+
+async def test_dispatch_all_reraises_cancellation(bus: PubSubEventBus) -> None:
+    # ``asyncio.CancelledError`` is a BaseException subclass (Py 3.8+)
+    # so ``gather(return_exceptions=True)`` converts it to a returned
+    # value rather than re-raising. Without an explicit CancelledError
+    # branch in _dispatch_all, ``isinstance(result, Exception)`` misses
+    # it and the message is silently acked — the handler was cancelled
+    # mid-run and never completed, but Pub/Sub would mark it done.
+    # _dispatch_all re-raises so the pull loop unwinds cleanly on
+    # shutdown.
+    async def handler(_e: Event) -> None:
+        raise asyncio.CancelledError("simulated stop()")
+
+    with pytest.raises(asyncio.CancelledError):
+        await bus._dispatch_all([handler], Event(event_type=Topics.Memory.ENRICHED))
+
+
+async def test_dispatch_all_logs_all_exceptions_before_reraising_cancellation(
+    bus: PubSubEventBus, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Mixed batch: a CancelledError and an Exception from different
+    handlers. The cancellation must propagate (so the pull loop
+    unwinds), but the Exception still has to be logged — eager re-raise
+    on first cancellation would silently drop the failure log."""
+
+    async def cancelled_handler(_e: Event) -> None:
+        raise asyncio.CancelledError("simulated stop()")
+
+    async def failing_handler(_e: Event) -> None:
+        raise RuntimeError("genuine handler bug")
+
+    with caplog.at_level("ERROR"), pytest.raises(asyncio.CancelledError):
+        await bus._dispatch_all(
+            [cancelled_handler, failing_handler],
+            Event(event_type=Topics.Memory.ENRICHED),
+        )
+
+    assert any(
+        "genuine handler bug" in (rec.exc_info[1].args[0] if rec.exc_info else "")
+        for rec in caplog.records
+    ), "RuntimeError must be logged before CancelledError propagates"
+
+
+async def test_dispatch_all_runs_every_handler_even_after_earlier_raise(
+    bus: PubSubEventBus,
+) -> None:
+    # Mirrors InProcessEventBus semantics: one handler's exception must
+    # not prevent subsequent handlers from running. This is the
+    # cross-backend contract that makes code validated against the
+    # inprocess bus behave identically on Pub/Sub.
+    ran: list[str] = []
+
+    async def bad_first(_e: Event) -> None:
+        ran.append("bad_first")
+        raise RuntimeError("intentional test failure")
+
+    async def good_after_bad(_e: Event) -> None:
+        ran.append("good_after_bad")
+
+    async def bad_last(_e: Event) -> None:
+        ran.append("bad_last")
+        raise RuntimeError("another intentional failure")
+
+    result = await bus._dispatch_all(
+        [bad_first, good_after_bad, bad_last],
+        Event(event_type=Topics.Memory.ENRICHED),
+    )
+    assert ran == ["bad_first", "good_after_bad", "bad_last"]
+    assert result is False
+
+
+async def test_ensure_pubsub_sdk_raises_runtime_error_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Block the import so we can exercise the graceful-failure path even
+    # on environments where the SDK is present.
+    import builtins
+
+    original_import = builtins.__import__
+
+    def blocked(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name.startswith("google.cloud"):
+            raise ImportError("blocked for test")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    with pytest.raises(RuntimeError, match="google-cloud-pubsub"):
+        PubSubEventBus._ensure_pubsub_sdk()
+
+
+async def test_subscribe_before_start_records_handlers(bus: PubSubEventBus) -> None:
+    async def h(_e: Event) -> None:
+        return None
+
+    bus.subscribe(Topics.Memory.ENRICHED, h)
+    bus.subscribe(Topics.Memory.ENRICHED, h)
+    bus.subscribe(Topics.Memory.EMBEDDED, h)
+
+    assert len(bus._handlers[Topics.Memory.ENRICHED]) == 2
+    assert len(bus._handlers[Topics.Memory.EMBEDDED]) == 1
+    # No SDK was touched — start() isn't called here.
+    assert bus._subscriber is None
+
+
+async def test_stop_cancels_pending_pull_tasks_cleanly(bus: PubSubEventBus) -> None:
+    # Simulate an in-flight pull by planting a sleeping task in the
+    # bus's pull-task list. stop() must cancel + await it without
+    # propagating CancelledError.
+    async def long_sleep() -> None:
+        # 60s is intentional: it must exceed any conceivable test
+        # runtime so the task NEVER completes naturally — a regression
+        # in stop()'s cancellation path is detected by the outer
+        # ``wait_for`` timing out rather than the sleep completing.
+        await asyncio.sleep(60)
+
+    task = asyncio.create_task(long_sleep())
+    bus._pull_tasks.append(task)
+    # Audit T4: bound the test's runtime against a regression in
+    # ``stop()`` cancellation. Without this, a future change that
+    # silently drops the cancel call would hang the test for the full
+    # ``sleep(60)`` duration instead of failing within seconds. The
+    # production contract is "stop() returns quickly after cancelling
+    # all pull tasks" — 2s is a generous ceiling on that.
+    await asyncio.wait_for(bus.stop(), timeout=2.0)
+    assert task.cancelled() or task.done()
+
+
+async def test_stop_closes_publisher_and_subscriber(bus: PubSubEventBus) -> None:
+    # Both clients own gRPC channels + threads; stop() must shut each
+    # down via its REAL API and null the references out. The APIs are
+    # asymmetric: SubscriberClient has close(); PublisherClient has
+    # stop() (commits outstanding batches + joins the commit thread —
+    # the only flush in the pipeline, since publish() is fire-and-
+    # forget). The fixture's publisher mock is spec-limited so calling
+    # a nonexistent close() on it would raise instead of silently
+    # passing.
+    fake_subscriber = MagicMock()
+    bus._subscriber = fake_subscriber
+    # bus._publisher is already a spec-limited MagicMock from the fixture.
+    publisher_ref = bus._publisher
+
+    await bus.stop()
+
+    publisher_ref.stop.assert_called_once()
+    fake_subscriber.close.assert_called_once()
+    assert bus._publisher is None
+    assert bus._subscriber is None
+
+
+async def test_stop_teardown_order(
+    bus: PubSubEventBus,
+) -> None:
+    # Pull and publish sides have opposite tradeoffs during shutdown:
+    #   - PULL:    close subscriber FIRST so blocking pull() calls wake
+    #              immediately with a closed channel, then drain exec.
+    #              `_pull_loop` short-circuits on `_stopping` so the
+    #              gRPC error is absorbed quietly.
+    #   - PUBLISH: drain exec FIRST so in-flight publish() threads
+    #              complete on a live channel, then publisher.stop()
+    #              commits the outstanding client batches. Reverse
+    #              order would lose messages already en route.
+    # Expected call order:
+    #   subscriber.close → pull-exec.shutdown
+    #     → publish-exec.shutdown → publisher.stop
+    calls: list[str] = []
+
+    pull_exec = MagicMock()
+    pull_exec.shutdown = MagicMock(
+        side_effect=lambda wait: calls.append("pull-exec.shutdown"),
+    )
+    pub_exec = MagicMock()
+    pub_exec.shutdown = MagicMock(
+        side_effect=lambda wait: calls.append("pub-exec.shutdown"),
+    )
+    bus._pull_executor = pull_exec
+    bus._publish_executor = pub_exec
+
+    fake_subscriber = MagicMock()
+    fake_subscriber.close = MagicMock(
+        side_effect=lambda: calls.append("subscriber.close"),
+    )
+    bus._subscriber = fake_subscriber
+
+    publisher = bus._publisher
+    publisher.stop = MagicMock(side_effect=lambda: calls.append("publisher.stop"))
+
+    await bus.stop()
+
+    assert calls == [
+        "subscriber.close",
+        "pull-exec.shutdown",
+        "pub-exec.shutdown",
+        "publisher.stop",
+    ]
+    pull_exec.shutdown.assert_called_once_with(True)
+    pub_exec.shutdown.assert_called_once_with(True)
+    # Executor attrs cleared before their awaits, so a concurrent call
+    # that lands mid-shutdown lazy-inits a fresh one instead of racing.
+    assert bus._publish_executor is None
+    assert bus._pull_executor is None
+
+
+async def test_stop_allows_clean_restart(bus: PubSubEventBus) -> None:
+    # After stop(), the bus must be reusable: pull_tasks cleared, the
+    # stopping flag reset, subscribe() accepting new handlers again,
+    # and the executor recreated on next access. Without these resets,
+    # subscribe() would raise and start() would silently no-op — the
+    # bus becomes permanently defunct after one lifecycle.
+    async def noop() -> None:
+        return None
+
+    # Simulate "bus has started once already"
+    bus._pull_tasks.append(asyncio.create_task(noop()))
+    bus._stopping = True
+    original_executor = bus._get_publish_executor()
+
+    await bus.stop()
+
+    assert bus._pull_tasks == []
+    assert bus._stopping is False
+    assert bus._publish_executor is None
+
+    async def handler(_e: Event) -> None:
+        return None
+
+    # subscribe() no longer raises; the guard reads _pull_tasks which is
+    # now empty.
+    bus.subscribe(Topics.Memory.ENRICHED, handler)
+    # Lazy access recreates a fresh executor — different object than
+    # the one we got before stop().
+    new_executor = bus._get_publish_executor()
+    assert new_executor is not original_executor
+    assert not new_executor._shutdown
+
+
+async def test_publish_uses_bounded_executor(bus: PubSubEventBus) -> None:
+    # Reach into the lazy-init to confirm we don't fall back on asyncio's
+    # default executor (which is effectively unbounded).
+    ex = bus._get_publish_executor()
+    assert ex._max_workers == 32
+
+
+async def test_subscribe_after_start_raises(bus: PubSubEventBus) -> None:
+    # Simulate start() having already run by flipping ``_started``.
+    # A publisher-only bus ends up with empty ``_pull_tasks`` even
+    # post-start, so the guard uses ``_started`` as the authoritative
+    # signal — same field ``start()`` checks for its own idempotency.
+    bus._started = True
+
+    async def handler(_e: Event) -> None:
+        return None
+
+    with pytest.raises(RuntimeError, match="before start"):
+        bus.subscribe(Topics.Memory.ENRICHED, handler)
+
+
+async def test_subscribe_after_start_raises_even_for_publisher_only(
+    bus: PubSubEventBus,
+) -> None:
+    """Regression guard: the old subscribe() guard used ``_pull_tasks``
+    which is empty for publisher-only buses — a late subscribe() on
+    such a bus would silently orphan the handler. The switch to
+    ``_started`` catches this case."""
+    bus._started = True
+    # Publisher-only: no pull tasks exist, but start() HAS run.
+    assert bus._pull_tasks == []
+
+    async def handler(_e: Event) -> None:
+        return None
+
+    with pytest.raises(RuntimeError, match="before start"):
+        bus.subscribe(Topics.Memory.ENRICHED, handler)
+
+
+async def test_start_is_idempotent(bus: PubSubEventBus) -> None:
+    # A second start() must not leak the first SubscriberClient or
+    # spawn duplicate pull tasks.
+    async def noop() -> None:
+        return None
+
+    # Pretend start() already ran. The ``_started`` flag is what the
+    # idempotency guard checks — a publisher-only bus ends up with
+    # empty ``_pull_tasks`` even after a successful start, so the
+    # older guard form silently re-ran.
+    sentinel_subscriber = MagicMock()
+    bus._subscriber = sentinel_subscriber
+    bus._pull_tasks.append(asyncio.create_task(noop()))
+    bus._started = True
+
+    await bus.start()
+
+    # Same subscriber instance — start() did not replace it.
+    assert bus._subscriber is sentinel_subscriber
+    assert len(bus._pull_tasks) == 1
+
+    await asyncio.gather(*bus._pull_tasks, return_exceptions=True)
+
+
+async def test_publish_warns_when_subscribers_registered_without_start(
+    bus: PubSubEventBus, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Service that subscribes but forgets to await start() never receives
+    # events — a silent misconfiguration. First publish should log a
+    # warning, subsequent ones stay quiet.
+    async def handler(_e: Event) -> None:
+        return None
+
+    bus.subscribe(Topics.Memory.ENRICHED, handler)
+
+    with caplog.at_level("WARNING"):
+        await bus.publish(
+            Topics.Memory.ENRICHED, Event(event_type=Topics.Memory.ENRICHED)
+        )
+        first_warnings = [
+            r for r in caplog.records if "start() was never awaited" in r.message
+        ]
+        await bus.publish(
+            Topics.Memory.ENRICHED, Event(event_type=Topics.Memory.ENRICHED)
+        )
+        all_warnings = [
+            r for r in caplog.records if "start() was never awaited" in r.message
+        ]
+
+    assert len(first_warnings) == 1
+    assert len(all_warnings) == 1  # Didn't repeat on second publish
+
+
+async def test_publish_does_not_warn_when_no_subscribers_registered(
+    bus: PubSubEventBus, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Publisher-only service (no subscribe calls) is a legitimate pattern
+    # — no warning there.
+    with caplog.at_level("WARNING"):
+        await bus.publish(
+            Topics.Memory.ENRICHED, Event(event_type=Topics.Memory.ENRICHED)
+        )
+    assert not any("start()" in r.message for r in caplog.records)
+
+
+async def test_stop_resets_missing_start_warning_flag(bus: PubSubEventBus) -> None:
+    # If the bus is stopped + reused, a fresh misconfiguration on the
+    # second lifecycle must re-fire the warning. Previously this flag
+    # was sticky across stop(), silencing the second cycle entirely.
+    bus._warned_missing_start = True
+    await bus.stop()
+    assert bus._warned_missing_start is False
+
+
+async def test_stop_keeps_pull_tasks_populated_through_teardown(
+    bus: PubSubEventBus,
+) -> None:
+    # A concurrent start() during stop() must see `_pull_tasks` as
+    # non-empty so the idempotency guard keeps it from creating a fresh
+    # subscriber that stop() would then close out from under it. Assert
+    # _pull_tasks stays populated until *after* the last close() call.
+
+    async def dummy_task() -> None:
+        return None
+
+    seen_during_teardown: list[int] = []
+
+    def record_len_during_close() -> None:
+        seen_during_teardown.append(len(bus._pull_tasks))
+
+    # Plant a cancelled-completed task so the cancel/gather at the top
+    # of stop() doesn't block, then capture len(_pull_tasks) from each
+    # close()/shutdown hook.
+    completed = asyncio.create_task(dummy_task())
+    await completed
+    bus._pull_tasks.append(completed)
+
+    exec_mock = MagicMock()
+    exec_mock.shutdown = MagicMock(side_effect=lambda wait: record_len_during_close())
+    bus._publish_executor = exec_mock
+
+    sub_mock = MagicMock()
+    sub_mock.close = MagicMock(side_effect=record_len_during_close)
+    bus._subscriber = sub_mock
+
+    bus._publisher.stop = MagicMock(side_effect=record_len_during_close)
+
+    await bus.stop()
+
+    # Every teardown step saw _pull_tasks still populated.
+    assert seen_during_teardown == [1, 1, 1]
+    # Only cleared at the very end.
+    assert bus._pull_tasks == []
+
+
+async def test_get_publish_executor_refuses_while_stopped(bus: PubSubEventBus) -> None:
+    # Simulate a concurrent publish() landing after stop() flipped the
+    # flag: _get_publish_executor must refuse instead of spinning up a
+    # new pool that stop()'s teardown would never join.
+    bus._publish_executor = None  # force lazy-init path
+    bus._stopped = True
+    with pytest.raises(RuntimeError, match="stopped"):
+        bus._get_publish_executor()
+
+
+async def test_pull_loop_refuses_when_bus_stopped(bus: PubSubEventBus) -> None:
+    # Same guard on the pull side: _pull_loop must raise rather than
+    # set up a new pull sequence after stop() begins.
+    bus._stopped = True
+
+    async def noop(_e: Event) -> None:
+        return None
+
+    with pytest.raises(RuntimeError, match="stopped"):
+        await bus._pull_loop("sub-x", [noop])
+
+
+async def test_stop_resets_stopped_flag_for_restart(bus: PubSubEventBus) -> None:
+    # After stop() completes, the flag resets so the bus can be
+    # restarted cleanly (matches the existing restart contract).
+    await bus.stop()
+    assert bus._stopped is False
+
+
+async def test_is_healthy_reflects_failed_subscriptions(bus: PubSubEventBus) -> None:
+    # Fresh bus is healthy.
+    assert bus.is_healthy is True
+    # Simulate a pull loop hitting a permanent error on subscription X.
+    bus._failed_subscriptions.add("sub-x")
+    assert bus.is_healthy is False
+    # A restart via stop() clears the failed-subscription set.
+    await bus.stop()
+    assert bus.is_healthy is True
+
+
+async def test_is_healthy_false_while_stop_in_progress(bus: PubSubEventBus) -> None:
+    """``_stopped`` flips True at the top of ``stop()`` before any await
+    point. is_healthy must observe that immediately so health probes
+    during graceful shutdown don't still see green while the bus is
+    actively tearing down."""
+    bus._stopped = True
+    assert bus.is_healthy is False
+    # Resetting _stopped (end of stop()) returns control to the other
+    # checks — with no handlers + no failures, the bus is healthy again.
+    bus._stopped = False
+    assert bus.is_healthy is True
+
+
+async def test_is_healthy_false_when_handlers_registered_but_not_started(
+    bus: PubSubEventBus,
+) -> None:
+    """Handlers without ``start()`` = pull loops don't exist → every
+    inbound event is silently dropped. is_healthy must surface this
+    as unhealthy so the readiness probe catches it. Regression guard
+    for a review finding where is_healthy only checked
+    ``_failed_subscriptions`` (empty in this scenario)."""
+
+    async def _handler(_event):
+        return None
+
+    bus.subscribe("test-topic", _handler)
+    # start() was NOT awaited.
+    assert bus.is_healthy is False
+
+
+async def test_start_constructs_subscriber_off_event_loop(
+    bus: PubSubEventBus,
+) -> None:
+    """SubscriberClient construction can trigger Workload Identity
+    credential refresh (metadata-server round trip) which blocks the
+    asyncio event loop on service boot. start() must offload it to
+    ``run_in_executor``. PublisherClient is NOT constructed here — a
+    subscriber-only service shouldn't hold an unused publisher."""
+    import types
+    from unittest.mock import AsyncMock, patch
+
+    async def _h(_e: Event) -> None:
+        return None
+
+    bus.subscribe(Topics.Memory.ENRICHED, _h)
+
+    sub_ctor_calls = 0
+
+    class FakePublisherClient:
+        def __init__(self):
+            raise AssertionError("PublisherClient must NOT be constructed in start()")
+
+    class FakeSubscriberClient:
+        def __init__(self):
+            nonlocal sub_ctor_calls
+            sub_ctor_calls += 1
+
+    fake_sdk = types.SimpleNamespace(
+        PublisherClient=FakePublisherClient,
+        SubscriberClient=FakeSubscriberClient,
+    )
+
+    bus._publisher = None  # would explode if start() touched it
+
+    offloaded: list[str] = []
+
+    async def _spy_run_in_executor(executor, fn, *args):
+        offloaded.append(fn.__name__)
+        return fn(*args)
+
+    loop = asyncio.get_running_loop()
+    with (
+        patch.object(PubSubEventBus, "_ensure_pubsub_sdk", return_value=fake_sdk),
+        patch.object(
+            loop, "run_in_executor", new=AsyncMock(side_effect=_spy_run_in_executor)
+        ),
+        patch.object(bus, "_pull_loop", new=AsyncMock()),
+    ):
+        await bus.start()
+
+    assert sub_ctor_calls == 1
+    assert "FakeSubscriberClient" in offloaded
+    assert bus._publisher is None, "publisher must stay lazy"
+
+
+async def test_publish_constructs_publisher_off_event_loop(
+    bus: PubSubEventBus,
+) -> None:
+    """Same Workload-Identity concern as the subscriber, but for the
+    publisher. Lazy + off-loop: the first publish() pays the cost via
+    ``run_in_executor``; subsequent publishes hit the cached client."""
+    import types
+    from unittest.mock import AsyncMock, patch
+
+    pub_ctor_calls = 0
+
+    class FakePublisherClient:
+        def __init__(self):
+            nonlocal pub_ctor_calls
+            pub_ctor_calls += 1
+
+        def topic_path(self, project, topic):
+            return f"projects/{project}/topics/{topic}"
+
+        def publish(self, topic_path, data):
+            future = MagicMock()
+            future.result = MagicMock(return_value="msg-id-1")
+            return future
+
+    fake_sdk = types.SimpleNamespace(PublisherClient=FakePublisherClient)
+
+    offloaded: list[str] = []
+    real_run = asyncio.get_running_loop().run_in_executor
+
+    async def _spy_run_in_executor(executor, fn, *args):
+        offloaded.append(getattr(fn, "__name__", type(fn).__name__))
+        return await real_run(executor, fn, *args)
+
+    bus._publisher = None  # force first-publish construction path
+
+    loop = asyncio.get_running_loop()
+    with (
+        patch.object(PubSubEventBus, "_ensure_pubsub_sdk", return_value=fake_sdk),
+        patch.object(
+            loop, "run_in_executor", new=AsyncMock(side_effect=_spy_run_in_executor)
+        ),
+    ):
+        await bus.publish(
+            Topics.Memory.EMBED_REQUESTED,
+            Event(event_type=Topics.Memory.EMBED_REQUESTED, tenant_id="t1"),
+        )
+        await bus.publish(
+            Topics.Memory.EMBED_REQUESTED,
+            Event(event_type=Topics.Memory.EMBED_REQUESTED, tenant_id="t1"),
+        )
+
+    assert pub_ctor_calls == 1, "publisher must be constructed exactly once"
+    assert "FakePublisherClient" in offloaded
+
+
+async def test_ensure_publisher_closes_losing_candidate_on_toctou_race(
+    bus: PubSubEventBus,
+) -> None:
+    """Concurrent first-publish callers can both pass the nil-check and
+    both build a PublisherClient. The loser's gRPC channel + flush
+    thread must be explicitly closed — non-deterministic GC isn't an
+    acceptable cleanup story for a Cloud-Run-resident service."""
+    import types
+    from unittest.mock import AsyncMock, patch
+
+    closed: list[object] = []
+
+    class FakePublisherClient:
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            # The real PublisherClient teardown API (it has no close()).
+            self.stopped = True
+            closed.append(self)
+
+    fake_sdk = types.SimpleNamespace(PublisherClient=FakePublisherClient)
+
+    bus._publisher = None
+    # Simulate the race: while the first ``run_in_executor`` is
+    # awaiting, populate ``bus._publisher`` from a "concurrent" caller.
+    winning = FakePublisherClient()
+
+    real_run = asyncio.get_running_loop().run_in_executor
+
+    async def _race_run_in_executor(executor, fn, *args):
+        # First call (PublisherClient()): inject the winner before the
+        # await resolves so the second nil-check finds it populated.
+        if fn is FakePublisherClient:
+            bus._publisher = winning
+        return await real_run(executor, fn, *args)
+
+    loop = asyncio.get_running_loop()
+    with (
+        patch.object(PubSubEventBus, "_ensure_pubsub_sdk", return_value=fake_sdk),
+        patch.object(
+            loop, "run_in_executor", new=AsyncMock(side_effect=_race_run_in_executor)
+        ),
+    ):
+        # Snapshot pending tasks so we can identify (and await) the
+        # fire-and-forget close-loser task spawned inside
+        # ``_ensure_publisher``. Sleep-loop polling is flaky under CI
+        # (executor-thread scheduling latency varies); awaiting the
+        # specific task is deterministic.
+        before = asyncio.all_tasks()
+        result = await bus._ensure_publisher()
+        spawned = asyncio.all_tasks() - before - {asyncio.current_task()}
+        for t in spawned:
+            await t
+
+    assert result is winning, "the pre-populated client must win"
+    assert len(closed) == 1, "loser must be explicitly closed"
+    assert closed[0] is not winning, "winner must NOT be closed"
+
+
+async def test_ensure_publisher_returns_winner_when_stop_races_close(
+    bus: PubSubEventBus,
+) -> None:
+    """3-way race: TOCTOU loser awaits ``candidate.stop()`` and during
+    that yield ``stop()`` clears ``_publisher``. The loser must return
+    the captured winner — not the now-None ``_publisher`` — otherwise
+    ``publish()`` crashes on ``None.topic_path(...)``."""
+    import types
+    from unittest.mock import AsyncMock, patch
+
+    class FakePublisherClient:
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            # The real PublisherClient teardown API (it has no close()).
+            self.stopped = True
+
+    fake_sdk = types.SimpleNamespace(PublisherClient=FakePublisherClient)
+    bus._publisher = None
+    winning = FakePublisherClient()
+
+    real_run = asyncio.get_running_loop().run_in_executor
+
+    async def _race_run_in_executor(executor, fn, *args):
+        if fn is FakePublisherClient:
+            # Inject the winner before the candidate-construction await resolves.
+            bus._publisher = winning
+            return await real_run(executor, fn, *args)
+        # Second call is candidate.stop() — simulate stop() racing in.
+        bus._publisher = None
+        return await real_run(executor, fn, *args)
+
+    loop = asyncio.get_running_loop()
+    with (
+        patch.object(PubSubEventBus, "_ensure_pubsub_sdk", return_value=fake_sdk),
+        patch.object(
+            loop, "run_in_executor", new=AsyncMock(side_effect=_race_run_in_executor)
+        ),
+    ):
+        result = await bus._ensure_publisher()
+
+    assert result is winning, (
+        "must return the captured winner even when stop() nulled _publisher mid-close"
+    )
+
+
+async def test_start_aborts_when_stop_races_subscriber_construction(
+    bus: PubSubEventBus,
+) -> None:
+    """The new ``await loop.run_in_executor(None, SubscriberClient)`` is
+    the first yield in ``start()``. If ``stop()`` flips ``_stopped``
+    during this window, ``start()`` must close the just-constructed
+    subscriber AND raise — silently returning would let a lifespan
+    handler think the bus is operational while ``is_healthy`` slowly
+    flips False on the next probe."""
+    import types
+    from unittest.mock import AsyncMock, patch
+
+    sub_close_calls = 0
+
+    class FakeSubscriberClient:
+        def close(self):
+            nonlocal sub_close_calls
+            sub_close_calls += 1
+
+    fake_sdk = types.SimpleNamespace(SubscriberClient=FakeSubscriberClient)
+
+    async def _h(_e: Event) -> None:
+        return None
+
+    bus.subscribe(Topics.Memory.ENRICHED, _h)
+
+    real_run = asyncio.get_running_loop().run_in_executor
+
+    async def _stop_during_subscriber_construct(executor, fn, *args):
+        if fn is FakeSubscriberClient:
+            # Simulate a concurrent stop() completing while start() is
+            # awaiting the SubscriberClient executor call.
+            bus._stopped = True
+        return await real_run(executor, fn, *args)
+
+    loop = asyncio.get_running_loop()
+    with (
+        patch.object(PubSubEventBus, "_ensure_pubsub_sdk", return_value=fake_sdk),
+        patch.object(
+            loop,
+            "run_in_executor",
+            new=AsyncMock(side_effect=_stop_during_subscriber_construct),
+        ),
+        pytest.raises(RuntimeError, match="aborted: stop\\(\\) ran concurrently"),
+    ):
+        await bus.start()
+
+    assert bus._subscriber is None, "raced subscriber must be cleared"
+    assert sub_close_calls == 1, "raced subscriber must be explicitly closed"
+    assert bus._pull_executor is None, "pull executor must NOT be created"
+    assert bus._pull_tasks == [], "pull tasks must NOT be spawned"
+
+
+async def test_pull_loop_records_failed_subscription_on_unexpected_cancellation(
+    bus: PubSubEventBus,
+) -> None:
+    """A handler that raises CancelledError outside ``stop()`` (programming
+    error: awaited a separately-cancelled task) must propagate AND mark
+    the subscription failed so ``is_healthy`` flips False — silently
+    halting consumption is the worst possible failure mode."""
+    from unittest.mock import AsyncMock, patch
+
+    async def cancelling_dispatch(_handlers, _event):
+        raise asyncio.CancelledError("not from stop()")
+
+    fake_subscriber = MagicMock()
+    fake_subscriber.subscription_path = lambda proj, sub: (
+        f"projects/{proj}/subscriptions/{sub}"
+    )
+    # Pull returns one fake message so dispatch fires.
+    fake_msg = MagicMock()
+    fake_msg.message.data = b'{"event_type": "memclaw.memory.enriched"}'  # legacy-name-ok: rule 3 — pins the wire format a live subscriber must still decode
+    fake_msg.ack_id = "ack-1"
+    fake_response = MagicMock(received_messages=[fake_msg])
+    fake_subscriber.pull = MagicMock(return_value=fake_response)
+
+    bus._subscriber = fake_subscriber
+    bus._pull_executor = MagicMock()
+    bus._pull_executor.shutdown = MagicMock()
+
+    loop = asyncio.get_running_loop()
+
+    async def _direct_run(_executor, fn, *args):
+        return fn(*args) if not args else fn(*args)
+
+    with (
+        patch.object(bus, "_dispatch_all", new=cancelling_dispatch),
+        patch.object(loop, "run_in_executor", new=AsyncMock(side_effect=_direct_run)),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await bus._pull_loop("test-sub", [lambda _e: None])
+
+    assert "test-sub" in bus._failed_subscriptions
+    assert bus.is_healthy is False
+
+
+async def test_start_idempotency_guard_uses_started_flag(bus: PubSubEventBus) -> None:
+    """Publisher-only bus has empty ``_pull_tasks`` even after start().
+    The idempotency guard must check ``_started`` instead — otherwise a
+    second start() silently re-runs the sequence. Regression guard for
+    a review finding."""
+    from unittest.mock import patch
+
+    # Simulate a completed publisher-only start(): no handlers, no
+    # pull tasks, _started flipped. Avoids depending on the real
+    # Pub/Sub SDK being installed (the first start() would need it).
+    bus._started = True
+    assert bus._pull_tasks == []  # publisher-only confirmation
+
+    # Second start() must short-circuit via the ``_started`` guard.
+    # We detect a silent re-run by asserting _ensure_pubsub_sdk is
+    # never invoked — if the guard used the old ``_pull_tasks`` check,
+    # this would fire.
+    with patch.object(
+        PubSubEventBus, "_ensure_pubsub_sdk", side_effect=AssertionError("re-ran!")
+    ):
+        await bus.start()  # must not raise
+
+
+async def test_dispatch_all_runs_handlers_concurrently(bus: PubSubEventBus) -> None:
+    # Sequential dispatch would sum the sleeps; concurrent keeps total
+    # wall time close to the slowest handler. This guards against a
+    # regression that serialises handlers.
+    import time
+
+    async def slow(_e: Event) -> None:
+        await asyncio.sleep(0.05)
+
+    t0 = time.perf_counter()
+    result = await bus._dispatch_all(
+        [slow, slow, slow, slow], Event(event_type=Topics.Memory.ENRICHED)
+    )
+    elapsed = time.perf_counter() - t0
+    assert result is True
+    # Concurrent: ≈ 0.05 s total. Sequential: ≈ 0.20 s. 0.15 is a generous bound.
+    assert elapsed < 0.15
+
+
+async def test_constructor_tunables_default_and_override() -> None:
+    default = PubSubEventBus(
+        project_id="proj", subscription_prefix="test", dual_subscribe=True
+    )
+    assert default._max_messages == 25
+    assert default._pull_timeout == 20.0
+    assert default._error_backoff == 5.0
+
+    custom = PubSubEventBus(
+        project_id="proj",
+        subscription_prefix="test",
+        max_messages=100,
+        pull_timeout=5.0,
+        error_backoff=1.0,
+        dual_subscribe=True,
+    )
+    assert custom._max_messages == 100
+    assert custom._pull_timeout == 5.0
+    assert custom._error_backoff == 1.0
+
+
+async def test_decode_handles_pydantic_validation_error() -> None:
+    # Valid JSON that doesn't match the Event schema must be dropped
+    # (returns None), not propagate — otherwise _pull_loop backs off
+    # without acking and Pub/Sub redelivers forever.
+    import json as _json
+
+    # Missing the required `event_type` field.
+    bad_payload = _json.dumps({"tenant_id": "t1", "payload": {}}).encode()
+    assert _decode_any(bad_payload) is None
+
+    # Wrong type for `occurred_at` — invalid datetime string.
+    bad_ts = _json.dumps(
+        {"event_type": "memclaw.memory.enriched", "occurred_at": "not-a-date"}  # legacy-name-ok: rule 3 — pins the wire format a live subscriber must still decode
+    ).encode()
+    assert _decode_any(bad_ts) is None
+
+
+# ---------------------------------------------------------------------------
+# Cross-environment fan-out guard
+#
+# Two environments sharing one GCP project share its topic namespace, so
+# Pub/Sub fans every message out to *both* envs' subscriptions. The bus
+# stamps a ``source_env`` attribute on publish and drops foreign-env copies
+# in ``_pull_loop`` before they reach a handler.
+# ---------------------------------------------------------------------------
+
+
+def _make_received(
+    data: bytes,
+    ack_id: str,
+    attributes: dict[str, str],
+    message_id: str = "msg-default",
+) -> Any:
+    """Build a fake Pub/Sub ReceivedMessage with real-dict attributes.
+
+    A bare ``MagicMock`` would make ``message.attributes.get(...)`` return a
+    truthy mock, defeating the guard's "attribute absent" branch — so the
+    attributes must be a real mapping. ``message_id`` is real for the same
+    reason: ``_pull_loop`` forwards it to ``_decode`` for the drop log, and a
+    MagicMock there would satisfy any assertion.
+    """
+    received = MagicMock()
+    received.ack_id = ack_id
+    received.message.data = data
+    received.message.attributes = attributes
+    received.message.message_id = message_id
+    return received
+
+
+async def _drive_one_batch(bus: PubSubEventBus, received: list[Any]) -> dict[str, Any]:
+    """Run ``_pull_loop`` for exactly one batch and return what happened.
+
+    Returns ``{"dispatched": [...events], "acked": [...ack_ids],
+    "nacked": [...ack_ids]}``. The first pull yields *received*; the second
+    flips ``_stopping`` and returns nothing so the loop exits cleanly.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    dispatched: list[Event] = []
+
+    async def recording_dispatch(_handlers: Any, event: Event) -> bool:
+        dispatched.append(event)
+        return True
+
+    acked: list[str] = []
+    nacked: list[str] = []
+
+    fake_subscriber = MagicMock()
+    fake_subscriber.subscription_path = lambda proj, sub: (
+        f"projects/{proj}/subscriptions/{sub}"
+    )
+
+    calls = {"n": 0}
+
+    def fake_pull(request: Any = None, timeout: Any = None) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return MagicMock(received_messages=received)
+        bus._stopping = True
+        return MagicMock(received_messages=[])
+
+    fake_subscriber.pull = MagicMock(side_effect=fake_pull)
+    fake_subscriber.acknowledge = MagicMock(
+        side_effect=lambda request: acked.extend(request["ack_ids"])
+    )
+    fake_subscriber.modify_ack_deadline = MagicMock(
+        side_effect=lambda request: nacked.extend(request["ack_ids"])
+    )
+
+    bus._subscriber = fake_subscriber
+    bus._pull_executor = MagicMock()
+
+    loop = asyncio.get_running_loop()
+
+    async def _direct_run(_executor: Any, fn: Any, *args: Any) -> Any:
+        return fn(*args)
+
+    with (
+        patch.object(bus, "_dispatch_all", new=recording_dispatch),
+        patch.object(loop, "run_in_executor", new=AsyncMock(side_effect=_direct_run)),
+    ):
+        await bus._pull_loop("test-sub", [lambda _e: None])
+
+    return {"dispatched": dispatched, "acked": acked, "nacked": nacked}
+
+
+async def test_publish_stamps_source_env_attribute() -> None:
+    bus = PubSubEventBus(
+        project_id="proj",
+        subscription_prefix="test",
+        env="production",
+        dual_subscribe=True,
+    )
+    fake_publisher = MagicMock()
+    fake_publisher.topic_path = lambda proj, topic: f"projects/{proj}/topics/{topic}"
+    fake_publisher.publish = MagicMock(return_value=MagicMock())
+    bus._publisher = fake_publisher
+
+    await bus.publish(
+        Topics.Memory.EMBED_REQUESTED,
+        Event(event_type=Topics.Memory.EMBED_REQUESTED, payload={"memory_id": "abc"}),
+    )
+
+    # Attribute rides as a kwarg, leaving the positional (topic, data)
+    # wire format intact.
+    assert fake_publisher.publish.call_args.kwargs == {"source_env": "production"}
+
+
+async def test_publish_omits_source_env_when_env_unset(bus: PubSubEventBus) -> None:
+    # The shared fixture constructs the bus without an env.
+    await bus.publish(
+        Topics.Memory.EMBED_REQUESTED,
+        Event(event_type=Topics.Memory.EMBED_REQUESTED),
+    )
+    assert "source_env" not in bus._publisher.publish.call_args.kwargs
+
+
+async def test_env_is_normalised_and_empty_collapses_to_none() -> None:
+    assert (
+        PubSubEventBus(
+            project_id="p",
+            subscription_prefix="s",
+            env=" production ",
+            dual_subscribe=True,
+        )._env
+        == "production"
+    )
+    assert (
+        PubSubEventBus(
+            project_id="p", subscription_prefix="s", env="   ", dual_subscribe=True
+        )._env is None
+    )
+    assert PubSubEventBus(
+        project_id="p", subscription_prefix="s", env="", dual_subscribe=True
+    )._env is None
+    assert PubSubEventBus(
+        project_id="p", subscription_prefix="s", dual_subscribe=True
+    )._env is None
+
+
+async def test_foreign_source_env_decision_matrix() -> None:
+    prod = PubSubEventBus(
+        project_id="p", subscription_prefix="s", env="production", dual_subscribe=True
+    )
+    # Guard disabled when this bus has no env.
+    no_env = PubSubEventBus(
+        project_id="p", subscription_prefix="s", dual_subscribe=True
+    )
+
+    def msg(attrs: dict[str, str]) -> Any:
+        m = MagicMock()
+        m.attributes = attrs
+        return m
+
+    # Foreign → returns the offending env (drop).
+    assert prod._foreign_source_env(msg({"source_env": "sandbox"})) == "sandbox"
+    # Same env → None (process).
+    assert prod._foreign_source_env(msg({"source_env": "production"})) is None
+    # Attribute absent → None (backward-compatible, process).
+    assert prod._foreign_source_env(msg({})) is None
+    # Bus has no env → None regardless of the attribute.
+    assert no_env._foreign_source_env(msg({"source_env": "sandbox"})) is None
+
+
+async def test_pull_loop_drops_foreign_env_message_before_dispatch() -> None:
+    bus = PubSubEventBus(
+        project_id="proj",
+        subscription_prefix="test",
+        env="production",
+        dual_subscribe=True,
+    )
+    foreign = _make_received(
+        EMBEDDED_EVENT_BYTES,
+        "ack-foreign",
+        {"source_env": "sandbox"},
+    )
+
+    result = await _drive_one_batch(bus, [foreign])
+
+    # Never handled (no wasted provider call), acked so it isn't redelivered.
+    assert result["dispatched"] == []
+    assert result["acked"] == ["ack-foreign"]
+    assert result["nacked"] == []
+
+
+async def test_pull_loop_malformed_message_acks_and_logs_real_context() -> None:
+    """Pin the ONLY production call site of ``_decode``.
+
+    The unit test above proves ``_decode`` logs what it is handed. This proves
+    ``_pull_loop`` hands it the right things — the short ``subscription_name``
+    rather than ``sub_path`` (``projects/proj/subscriptions/test-sub``), and
+    the message's real id. Both are plausible to get wrong and neither is
+    caught by a test that calls ``_decode`` directly with literals.
+    """
+    import logging
+
+    bus = PubSubEventBus(
+        project_id="proj",
+        subscription_prefix="test",
+        env="production",
+        dual_subscribe=True,
+    )
+    junk = _make_received(
+        b"not a valid envelope",
+        "ack-junk",
+        {"source_env": "production"},
+        message_id="msg-from-the-wire",
+    )
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture()
+    bus_logger = logging.getLogger("common.events.pubsub")
+    bus_logger.addHandler(handler)
+    try:
+        result = await _drive_one_batch(bus, [junk])
+    finally:
+        bus_logger.removeHandler(handler)
+
+    # Ack-dropped, never dispatched, never nacked — a poison payload must not
+    # loop the subscription.
+    assert result["dispatched"] == []
+    assert result["acked"] == ["ack-junk"]
+    assert result["nacked"] == []
+
+    drops = [r for r in records if "failed to decode" in r.getMessage()]
+    assert len(drops) == 1, "exactly one drop log per malformed message"
+    assert drops[0].subscription == "test-sub"
+    assert drops[0].message_id == "msg-from-the-wire"
+
+
+async def test_pull_loop_processes_same_env_message() -> None:
+    bus = PubSubEventBus(
+        project_id="proj",
+        subscription_prefix="test",
+        env="production",
+        dual_subscribe=True,
+    )
+    local = _make_received(
+        EMBEDDED_EVENT_BYTES,
+        "ack-local",
+        {"source_env": "production"},
+    )
+
+    result = await _drive_one_batch(bus, [local])
+
+    assert len(result["dispatched"]) == 1
+    assert result["acked"] == ["ack-local"]
+
+
+async def test_pull_loop_processes_message_without_source_env_attribute() -> None:
+    # A publisher that predates the attribute (or an external producer) must
+    # still be processed — the guard only drops *provably* foreign messages.
+    bus = PubSubEventBus(
+        project_id="proj",
+        subscription_prefix="test",
+        env="production",
+        dual_subscribe=True,
+    )
+    legacy = _make_received(
+        EMBEDDED_EVENT_BYTES,
+        "ack-legacy",
+        {},
+    )
+
+    result = await _drive_one_batch(bus, [legacy])
+
+    assert len(result["dispatched"]) == 1
+    assert result["acked"] == ["ack-legacy"]
+
+
+# ── broadcast subscriptions (CAURA-571) ──────────────────────────────
+
+
+def test_subscribe_broadcast_records_topic() -> None:
+    # broadcast=True flags the topic for a per-process subscription; the
+    # default keeps the shared work-queue subscription.
+    b = PubSubEventBus(
+        project_id="proj", subscription_prefix="core-api", dual_subscribe=True
+    )
+
+    async def handler(event: Event) -> None: ...
+
+    b.subscribe(Topics.Org.SETTINGS_CHANGED, handler, broadcast=True)
+    b.subscribe(Topics.Memory.EMBEDDED, handler)
+    assert Topics.Org.SETTINGS_CHANGED in b._broadcast_topics
+    assert Topics.Memory.EMBEDDED not in b._broadcast_topics
+
+
+async def test_ensure_broadcast_subscription_creates_with_expiration(
+    bus: PubSubEventBus,
+) -> None:
+    # Each process creates its OWN subscription (unique name) so every process
+    # receives every event; expiration_policy reaps it if the process dies.
+    fake_sub = MagicMock()
+    fake_sub.subscription_path = (
+        lambda proj, name: f"projects/{proj}/subscriptions/{name}"
+    )
+    bus._subscriber = fake_sub
+    ok = await bus._ensure_broadcast_subscription(
+        Topics.Org.SETTINGS_CHANGED,
+        f"core-api--{Topics.Org.SETTINGS_CHANGED}--abc123",
+    )
+    assert ok is True
+    req = fake_sub.create_subscription.call_args.kwargs["request"]
+    assert req["topic"] == f"projects/proj/topics/{Topics.Org.SETTINGS_CHANGED}"
+    assert req["name"].endswith("--abc123")
+    assert (
+        req["expiration_policy"]["ttl"]["seconds"]
+        == BROADCAST_SUBSCRIPTION_TTL_SECONDS
+    )
+    # Tracked so stop() can delete it.
+    assert bus._broadcast_sub_paths == [req["name"]]
+
+
+async def test_ensure_broadcast_subscription_already_exists_is_ok(
+    bus: PubSubEventBus,
+) -> None:
+    from google.api_core import exceptions as gexc
+
+    fake_sub = MagicMock()
+    fake_sub.subscription_path = (
+        lambda proj, name: f"projects/{proj}/subscriptions/{name}"
+    )
+    fake_sub.create_subscription = MagicMock(side_effect=gexc.AlreadyExists("exists"))
+    bus._subscriber = fake_sub
+    ok = await bus._ensure_broadcast_subscription(Topics.Org.SETTINGS_CHANGED, "sub-x")
+    # Reuse a prior run's subscription (same _instance_id) rather than fail.
+    assert ok is True
+    assert len(bus._broadcast_sub_paths) == 1
+
+
+async def test_ensure_broadcast_subscription_failure_degrades(
+    bus: PubSubEventBus,
+) -> None:
+    # Missing IAM (pubsub.subscriptions.create) must NOT crash startup — the
+    # process degrades to no fan-out (invalidation falls back to the cache TTL).
+    fake_sub = MagicMock()
+    fake_sub.subscription_path = (
+        lambda proj, name: f"projects/{proj}/subscriptions/{name}"
+    )
+    fake_sub.create_subscription = MagicMock(
+        side_effect=RuntimeError("permission denied")
+    )
+    bus._subscriber = fake_sub
+    ok = await bus._ensure_broadcast_subscription(Topics.Org.SETTINGS_CHANGED, "sub-x")
+    assert ok is False
+    assert bus._broadcast_sub_paths == []
+
+
+async def test_stop_deletes_broadcast_subscriptions(bus: PubSubEventBus) -> None:
+    fake_sub = MagicMock()
+    bus._subscriber = fake_sub
+    bus._broadcast_sub_paths = ["projects/proj/subscriptions/core-api--x--abc"]
+    await bus.stop()
+    fake_sub.delete_subscription.assert_called_once()
+    req = fake_sub.delete_subscription.call_args.kwargs["request"]
+    assert req["subscription"] == "projects/proj/subscriptions/core-api--x--abc"
+    assert bus._broadcast_sub_paths == []
+
+
+async def test_release_broadcast_subscriptions_needs_nothing_else_torn_down(
+    bus: PubSubEventBus,
+) -> None:
+    """The release must work on a fully live bus, with no teardown run first.
+
+    This is the property the fix depends on. Cloud Run allows 10s between
+    SIGTERM and SIGKILL; core-api's shutdown awaits three 5s-timeout flushes
+    sequentially before it reaches the bus, so anything that can only run after
+    them does not run at all on a busy shutdown. That is how 6,571 orphaned
+    subscriptions accumulated in staging against a live instance count in the
+    low tens, exhausting a project-wide cap shared with prod.
+
+    So this asserts the release is callable in isolation — no stop(), no
+    cancelled pull tasks, no closed clients — and that it is the delete alone.
+    """
+    fake_sub = MagicMock()
+    bus._subscriber = fake_sub
+    bus._started = True
+    bus._broadcast_sub_paths = [
+        "projects/proj/subscriptions/core-api--a--1",
+        "projects/proj/subscriptions/core-api--b--2",
+    ]
+
+    await bus.release_broadcast_subscriptions()
+
+    assert fake_sub.delete_subscription.call_count == 2
+    assert bus._broadcast_sub_paths == []
+    # It must not have torn the bus down as a side effect: stop() still has
+    # work to do afterwards, and a release that closed the subscriber would
+    # break the very ordering it exists to enable.
+    fake_sub.close.assert_not_called()
+    assert bus._started is True
+    assert bus._stopped is False
+
+
+async def test_released_subscription_exits_pull_loop_quietly(
+    bus: PubSubEventBus,
+) -> None:
+    """A pull loop that outlives the release must not report a fault.
+
+    The release runs ahead of the rest of teardown so it fits inside the 10s
+    SIGTERM budget, which means a pull loop can still be mid-cycle when its
+    subscription disappears. Without this the loop takes the permanent-error
+    branch — ERROR log, ``_failed_subscriptions``, ``is_healthy`` false — on
+    EVERY graceful shutdown, which is how a real alert gets tuned out.
+    """
+    from google.api_core import exceptions as gexc
+
+    fake_sub = MagicMock()
+    bus._subscriber = fake_sub
+    bus._broadcast_sub_paths = ["projects/proj/subscriptions/core-api--x--abc"]
+    await bus.release_broadcast_subscriptions()
+
+    fake_sub.pull = MagicMock(side_effect=gexc.NotFound("gone"))
+    bus._pull_executor = ThreadPoolExecutor(max_workers=1)
+    await bus._pull_loop("core-api--x--abc", [])
+
+    assert bus._failed_subscriptions == set()
+    assert bus.is_healthy is True
+
+
+async def test_unprovisioned_subscription_still_reports_loudly(
+    bus: PubSubEventBus,
+) -> None:
+    """The suppression must be scoped to what we deleted, and nothing else.
+
+    A NotFound on a subscription this process never released is a real
+    configuration fault — never provisioned, or deleted by someone else — and
+    must keep the loud halting path. A blanket suppression would trade one
+    silent failure for another.
+    """
+    from google.api_core import exceptions as gexc
+
+    fake_sub = MagicMock()
+    bus._subscriber = fake_sub
+    fake_sub.pull = MagicMock(side_effect=gexc.NotFound("never existed"))
+    bus._pull_executor = ThreadPoolExecutor(max_workers=1)
+
+    await bus._pull_loop("core-api--never-provisioned", [])
+
+    assert "core-api--never-provisioned" in bus._failed_subscriptions
+    assert bus.is_healthy is False
+
+
+async def test_release_bounds_the_delete_rpc(bus: PubSubEventBus) -> None:
+    """The delete must carry an explicit short timeout, not the SDK default.
+
+    This method exists to finish inside Cloud Run's 10s SIGTERM budget. The
+    SDK's generated default is 60s per call with a 60s retry deadline — six
+    times the whole budget for one call — so inheriting it defeats the reason
+    the method was split out: one slow Pub/Sub call and the process is killed
+    mid-release, leaking exactly what this reclaims.
+
+    A timed-out delete costs nothing that matters; ``expiration_policy`` still
+    reaps the subscription. Bounding only trades a slow failure for a fast one.
+    """
+    from common.events.pubsub import BROADCAST_RELEASE_TIMEOUT_SECONDS
+
+    fake_sub = MagicMock()
+    bus._subscriber = fake_sub
+    bus._broadcast_sub_paths = [
+        "projects/proj/subscriptions/a--x--abc",
+        "projects/proj/subscriptions/b--x--abc",
+    ]
+
+    await bus.release_broadcast_subscriptions()
+
+    assert fake_sub.delete_subscription.call_count == 2
+    for call in fake_sub.delete_subscription.call_args_list:
+        assert call.kwargs["timeout"] == BROADCAST_RELEASE_TIMEOUT_SECONDS
+    # Small enough that even a sequential worst case fits the budget.
+    assert BROADCAST_RELEASE_TIMEOUT_SECONDS <= 5.0
+
+
+async def test_release_survives_one_failing_delete(bus: PubSubEventBus) -> None:
+    """One subscription failing must not strand the others.
+
+    The deletes are fanned out concurrently; a single raise must neither abort
+    its siblings nor escape into the shutdown path that called this.
+    """
+    fake_sub = MagicMock()
+    bus._subscriber = fake_sub
+    fake_sub.delete_subscription = MagicMock(
+        side_effect=[RuntimeError("pubsub blip"), None]
+    )
+    bus._broadcast_sub_paths = [
+        "projects/proj/subscriptions/a--x--abc",
+        "projects/proj/subscriptions/b--x--abc",
+    ]
+
+    await bus.release_broadcast_subscriptions()
+
+    assert fake_sub.delete_subscription.call_count == 2
+    # Both are recorded as released regardless: the pull loops must exit
+    # quietly either way, and the TTL reaps whatever the delete missed.
+    assert bus._released_subscriptions == {"a--x--abc", "b--x--abc"}
+    assert bus._broadcast_sub_paths == []
+
+
+@pytest.mark.parametrize("exc_name", ["PermissionDenied", "InvalidArgument"])
+async def test_released_subscription_still_reports_non_notfound_loudly(
+    bus: PubSubEventBus,
+    exc_name: str,
+) -> None:
+    """Releasing a name excuses a later NotFound on it, and nothing else.
+
+    "We deleted this one ourselves" explains a subsequent NotFound. It does not
+    explain a PermissionDenied — an IAM grant changed — or an InvalidArgument —
+    we built a malformed request. Neither becomes benign because this process
+    happened to release that name, and both are precisely what the halting path
+    exists to surface.
+
+    The original suppression sat inside the shared handler for all three, so a
+    real IAM regression against a released name would exit the loop silently with
+    ``is_healthy`` still true. ``test_unprovisioned_subscription_still_reports_loudly``
+    does NOT cover this: it varies the *name* (never released) while holding the
+    exception at NotFound, so it constrains only one of the two axes.
+    """
+    from google.api_core import exceptions as gexc
+
+    fake_sub = MagicMock()
+    bus._subscriber = fake_sub
+    bus._broadcast_sub_paths = ["projects/proj/subscriptions/core-api--x--abc"]
+    await bus.release_broadcast_subscriptions()
+    assert "core-api--x--abc" in bus._released_subscriptions
+
+    fake_sub.pull = MagicMock(side_effect=getattr(gexc, exc_name)("still a fault"))
+    bus._pull_executor = ThreadPoolExecutor(max_workers=1)
+    await bus._pull_loop("core-api--x--abc", [])
+
+    assert "core-api--x--abc" in bus._failed_subscriptions
+    assert bus.is_healthy is False
+
+
+async def test_restart_clears_the_released_record(bus: PubSubEventBus) -> None:
+    """Subscription names are deterministic per bus object, so a second start()
+    recreates the same names. A leftover entry would silence a genuine NotFound
+    on the next run — the suppression becoming the blind spot it exists to
+    avoid."""
+    fake_sub = MagicMock()
+    bus._subscriber = fake_sub
+    bus._broadcast_sub_paths = ["projects/proj/subscriptions/core-api--x--abc"]
+    await bus.release_broadcast_subscriptions()
+    assert "core-api--x--abc" in bus._released_subscriptions
+
+    bus._started = False
+    with contextlib.suppress(Exception):
+        await bus.start()
+
+    assert "core-api--x--abc" not in bus._released_subscriptions
+
+
+async def test_release_broadcast_subscriptions_is_idempotent(
+    bus: PubSubEventBus,
+) -> None:
+    """stop() still calls it, so it runs twice on every clean shutdown.
+
+    A second delete of an already-deleted subscription would log a NotFound
+    warning per topic on every graceful exit — noise that would train readers
+    to ignore the one warning that matters.
+    """
+    fake_sub = MagicMock()
+    bus._subscriber = fake_sub
+    bus._broadcast_sub_paths = ["projects/proj/subscriptions/core-api--x--abc"]
+
+    await bus.release_broadcast_subscriptions()
+    await bus.release_broadcast_subscriptions()
+    await bus.stop()
+
+    fake_sub.delete_subscription.assert_called_once()
+
+
+# ── broadcast slot identity ──────────────────────────────────────────
+#
+# The subscription name has to satisfy three properties AT ONCE. Each test
+# below pins exactly one, because the properties trade against each other and a
+# scheme that buys one by giving up another is the failure mode to guard:
+# trading away "distinct between concurrent workers" turns a broadcast into a
+# load-balanced queue, silently.
+#
+# These use real spawned processes, matching uvicorn's own supervisor
+# (``multiprocessing.get_context("spawn")``). They have to: the property under
+# test is that the KERNEL releases a claim when a process is SIGKILLed, and a
+# mock cannot exhibit that.
+
+
+def _slot_child(slot_dir: Path, queue: Any) -> None:
+    """Claim a slot, report it, then block until killed — like a live worker."""
+    queue.put(_claim_broadcast_slot(slot_dir, BROADCAST_MAX_SLOTS))
+    time.sleep(300)
+
+
+@pytest.fixture
+def spawn_worker(tmp_path: Path) -> Any:
+    """Spawn ``_slot_child`` processes into ``tmp_path`` and reap them all."""
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    started: list[Any] = []
+
+    def _spawn() -> tuple[Any, str | None]:
+        proc = ctx.Process(target=_slot_child, args=(tmp_path, queue))
+        proc.start()
+        started.append(proc)
+        # Watch the child alongside the queue rather than just blocking on the
+        # queue. A child that dies before reporting — an import failure under
+        # spawn, an unwritable slot dir — would otherwise burn the entire
+        # timeout per spawn before surfacing as an unhelpful Empty, turning an
+        # already-failing run into a multi-minute one. A live child reports in
+        # ~100ms; the generous ceiling is only there for a cold CI box.
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            try:
+                return proc, queue.get(timeout=0.1)
+            except Empty:
+                if proc.exitcode is not None:
+                    # It may have reported and exited before we looked.
+                    with contextlib.suppress(Empty):
+                        return proc, queue.get(timeout=1)
+                    raise AssertionError(
+                        f"slot child exited {proc.exitcode} without reporting"
+                    ) from None
+        raise AssertionError("slot child never reported")
+
+    yield _spawn
+    for proc in started:
+        if proc.is_alive():
+            proc.kill()
+        proc.join(timeout=10)
+
+
+def test_broadcast_slot_is_stable_across_a_sigkilled_respawn(
+    spawn_worker: Any,
+) -> None:
+    # PROPERTY 1 — stability. uvicorn SIGKILLs a worker that misses its 5s
+    # healthcheck ping and spawns a replacement (``Multiprocess.
+    # keep_subprocess_alive``). The replacement must re-derive its
+    # predecessor's identity so ``_ensure_broadcast_subscription`` takes the
+    # AlreadyExists path instead of minting a fresh subscription that orphans
+    # the old one for a day. This is the property a random id fails, and it is
+    # the entire leak.
+    victim, first = spawn_worker()
+    assert first is not None
+
+    # Exactly what uvicorn does: SIGKILL, reap, spawn a brand-new process.
+    # No shutdown hook runs — that is the point.
+    victim.kill()
+    victim.join(timeout=10)
+    _replacement, second = spawn_worker()
+
+    assert second == first, (
+        f"respawned worker took identity {second!r}, predecessor held {first!r}; "
+        "a changed identity orphans the predecessor's subscription for "
+        f"{BROADCAST_SUBSCRIPTION_TTL_SECONDS}s"
+    )
+
+
+def test_broadcast_slot_is_distinct_between_concurrently_live_workers(
+    tmp_path: Path, spawn_worker: Any
+) -> None:
+    # PROPERTY 2 — THE TRAP. Two live workers sharing one subscription does not
+    # fail loudly: Pub/Sub load-balances between them and each sees roughly half
+    # the events. For org.settings-changed that is a process serving stale
+    # settings with nothing red anywhere. Worse than the leak, so stability must
+    # never be bought at this property's expense.
+    _first, ident_a = spawn_worker()
+    _second, ident_b = spawn_worker()
+    assert ident_a is not None and ident_b is not None
+    assert ident_a != ident_b, (
+        f"two concurrently-live workers both claimed {ident_a!r}; they would "
+        "share one subscription and each receive only part of the broadcast"
+    )
+
+    # And the stronger form: a THIRD claimant, arriving while both incumbents
+    # are still alive, must not be handed either of their identities. This is
+    # the uvicorn ``restart_all`` (SIGHUP) shape, where the replacement is
+    # started and waited on BEFORE the worker it replaces is terminated, so the
+    # configured worker count is transiently exceeded.
+    third = _claim_broadcast_slot(tmp_path, BROADCAST_MAX_SLOTS)
+    assert third not in {ident_a, ident_b}, (
+        f"overlap claimant got {third!r}, already held by a live worker"
+    )
+
+
+def test_broadcast_slot_is_distinct_across_instances(tmp_path: Path) -> None:
+    # PROPERTY 3 — cross-instance distinctness. Every instance's slot 0 is a
+    # different consumer. A bare slot index, or a bare Cloud Run instance id,
+    # each satisfies two of the three properties and fails this one or
+    # property 2; only the token+slot pair satisfies all three.
+    # Two never-used directories stand in for two instances' filesystems, so
+    # each of these is by construction the FIRST claim on its own instance —
+    # the same slot on different instances, which is exactly the colliding
+    # case. Asserted on the whole identity rather than on its parts: pinning
+    # the slot component's shape here would couple this test to the id format
+    # and make it fire for mutations that leave cross-instance distinctness
+    # perfectly intact.
+    ident_a = _claim_broadcast_slot(tmp_path / "instance-a", BROADCAST_MAX_SLOTS)
+    ident_b = _claim_broadcast_slot(tmp_path / "instance-b", BROADCAST_MAX_SLOTS)
+    assert ident_a is not None and ident_b is not None
+    assert ident_a != ident_b, (
+        f"the first slot on two separate instances both resolved to "
+        f"{ident_a!r}; those two workers would share one subscription"
+    )
+
+
+def test_broadcast_slot_falls_back_rather_than_sharing_when_exhausted(
+    tmp_path: Path,
+) -> None:
+    # The fallback DIRECTION, which must never be inverted. When no slot can be
+    # proven free, the claim fails and the caller takes a random id — accepting
+    # a bounded, quota-visible, day-lived leak. It must never wrap around and
+    # reuse a held slot, which would be the silent collision.
+    held = [_claim_broadcast_slot(tmp_path, 2) for _ in range(2)]
+    assert None not in held and len(set(held)) == 2
+    assert _claim_broadcast_slot(tmp_path, 2) is None
+
+
+def test_identity_falls_back_to_a_random_id_when_no_slot_can_be_claimed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An unclaimable slot must degrade to the pre-existing random-id behaviour,
+    # not crash a service at boot. Delivery is unaffected; only the leak returns.
+    monkeypatch.setattr("common.events.pubsub._slot_id", None)
+    monkeypatch.setattr(
+        "common.events.pubsub._claim_broadcast_slot", lambda *_a, **_k: None
+    )
+    assert len(_process_broadcast_slot_id()) == 12
+
+
+def test_identity_is_stable_per_process_even_on_the_fallback_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fallback must be memoised, not re-rolled per caller. An unmemoised
+    # failure gives each bus in a process its OWN random id, which is exactly
+    # the per-process property the memo exists to provide — two buses would
+    # then create two subscriptions where one is wanted, and start()'s claim
+    # that a start/stop/start cycle recreates the same names would be false.
+    monkeypatch.setattr("common.events.pubsub._slot_id", None)
+    monkeypatch.setattr(
+        "common.events.pubsub._claim_broadcast_slot", lambda *_a, **_k: None
+    )
+    assert _process_broadcast_slot_id() == _process_broadcast_slot_id()
+
+
+def test_claim_returns_none_rather_than_raising_on_an_unreadable_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Pins the WIDENING specifically, at the layer where it happens. Reading
+    # the token file is the one filesystem call in this module that did not
+    # degrade to None: every other one catches OSError, while this caught only
+    # FileNotFoundError, so a PermissionError escaped the whole call chain.
+    #
+    # Deliberately asserted here rather than only through start(): the guard in
+    # _process_broadcast_slot_id also catches this, so an end-to-end test stays
+    # green with the narrow except restored and proves nothing about it. Two
+    # isolation layers, so each needs its own test or neither is really pinned.
+    real_read_text = Path.read_text
+
+    def _unreadable(self: Path, *a: Any, **k: Any) -> str:
+        if self.name == "instance":
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", _unreadable)
+    assert _claim_broadcast_slot(tmp_path, BROADCAST_MAX_SLOTS) is None
+
+
+async def test_start_survives_an_unreadable_instance_token(
+    bus: PubSubEventBus, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The module's stated contract is that ANY environment where the slot
+    # cannot be claimed degrades to a random id. An unreadable token file is
+    # such an environment, and it is reachable: the slot directory lives in a
+    # shared tmpdir, so a file owned by another uid, or a directory where a
+    # regular file is expected, both surface as OSError rather than as the
+    # FileNotFoundError that the ordinary "first worker" case raises.
+    #
+    # This runs on the startup path, so the failure mode being pinned is a
+    # service that will not boot — the exact opposite of the degradation the
+    # docstring promises.
+    #
+    # A characterization test for the end-to-end contract, stated as such: two
+    # layers now prevent this (the widened except in _read, and the guard in
+    # _process_broadcast_slot_id), so it stays green if either one alone is
+    # removed. The layer-specific tests above and below are what actually pin
+    # them. Dressing this up as a regression guard for either is how the gap in
+    # #991 got through.
+    import types
+    from unittest.mock import patch
+
+    monkeypatch.setattr("common.events.pubsub._slot_id", None)
+    monkeypatch.setattr("common.events.pubsub.BROADCAST_SLOT_DIR", tmp_path)
+
+    real_read_text = Path.read_text
+
+    def _unreadable(self: Path, *a: Any, **k: Any) -> str:
+        if self.name == "instance":
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", _unreadable)
+
+    class FakeSubscriberClient:
+        def subscription_path(self, proj: str, name: str) -> str:
+            return f"projects/{proj}/subscriptions/{name}"
+
+        def create_subscription(self, request: dict[str, Any]) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    async def _h(_e: Event) -> None:
+        return None
+
+    bus.subscribe(Topics.Org.SETTINGS_CHANGED, _h, broadcast=True)
+    with patch.object(
+        PubSubEventBus,
+        "_ensure_pubsub_sdk",
+        return_value=types.SimpleNamespace(SubscriberClient=FakeSubscriberClient),
+    ):
+        await bus.start()
+
+    # Booted, and with a usable identity rather than none at all.
+    assert bus._started is True
+    assert bus._broadcast_slot_id is not None
+    assert len(bus._broadcast_slot_id) == 12  # the random fallback, not a slot
+    bus._stopping = True  # keep teardown of the fake client quiet
+
+    # ``start()`` above launched the pull loop, and this test used to end
+    # without stopping it: the task then ran for the remaining 652 tests in
+    # the session, on the shared session-scoped loop. Every other test here
+    # that starts the bus already calls ``stop()``; this one was the outlier.
+    # The assertion is what keeps it that way — dropping the ``stop()`` leaves
+    # ``_pull_tasks`` populated.
+    await bus.stop()
+    assert bus._pull_tasks == []
+
+
+def test_identity_survives_an_unexpected_error_in_the_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The totality guard lives in _process_broadcast_slot_id, not at the
+    # start() call site, so it holds for every caller rather than for the one
+    # that remembered to wrap it. Pinned with an exception the callees do not
+    # anticipate at all, since the point is the unforeseen case.
+    monkeypatch.setattr("common.events.pubsub._slot_id", None)
+
+    def _boom(*_a: Any, **_k: Any) -> str:
+        raise RuntimeError("something no callee anticipated")
+
+    monkeypatch.setattr("common.events.pubsub._claim_broadcast_slot", _boom)
+    assert len(_process_broadcast_slot_id()) == 12
+
+
+# ── ack-deadline extension while a batch drains ────────────────────
+
+
+def _lease_harness(bus: PubSubEventBus, message_count: int) -> tuple[Any, list[Any]]:
+    """A subscriber whose pull yields one batch, then stops the loop.
+
+    Returns the fake subscriber and a call log recording ``modify`` and ``ack``
+    in the order they happen, which is what pins the cancel-before-ack rule.
+    """
+    calls: list[Any] = []
+    fake = MagicMock()
+    fake.subscription_path = lambda proj, sub: f"projects/{proj}/subscriptions/{sub}"
+
+    messages = []
+    for i in range(message_count):
+        msg = MagicMock()
+        msg.message.data = EMBEDDED_EVENT_BYTES
+        msg.message.attributes = {}
+        msg.ack_id = f"ack-{i}"
+        messages.append(msg)
+
+    def _pull_once(*_a: Any, **_kw: Any) -> Any:
+        # One batch only: the ``while not self._stopping`` check at the top of
+        # the loop lets this iteration finish and then exits.
+        bus._stopping = True
+        return MagicMock(received_messages=messages)
+
+    fake.pull = MagicMock(side_effect=_pull_once)
+    fake.acknowledge = MagicMock(
+        side_effect=lambda request: calls.append(("ack", request))
+    )
+    fake.modify_ack_deadline = MagicMock(
+        side_effect=lambda request: calls.append(("modify", request))
+    )
+
+    bus._subscriber = fake
+    bus._pull_executor = MagicMock()
+    return fake, calls
+
+
+async def test_a_draining_batch_has_its_ack_deadline_extended(
+    bus: PubSubEventBus,
+) -> None:
+    """A batch slower than the ack deadline must not redeliver its own work.
+
+    The loop dispatches up to ``max_messages`` sequentially and acks only at
+    the end, so the message handled FIRST sits unacked for the whole drain.
+    Nothing refreshed the 30s deadline, so a batch that took longer than that
+    had completed work redelivered — and the redelivered copy takes just as
+    long, so a subscription that falls behind this way stays behind.
+
+    Deterministic rather than timed: the first dispatch blocks until an
+    extension has actually been observed, so without the keeper this fails by
+    timeout rather than by a race that passes on a fast machine.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    import common.events.pubsub as pubsub_module
+
+    _fake, calls = _lease_harness(bus, message_count=3)
+    extended = asyncio.Event()
+
+    def _note_extension(request: dict[str, Any]) -> None:
+        calls.append(("modify", request))
+        if request.get("ack_deadline_seconds") == pubsub_module.LEASE_EXTENSION_SECONDS:
+            extended.set()
+
+    bus._subscriber.modify_ack_deadline = MagicMock(side_effect=_note_extension)
+
+    async def _blocks_until_extended(_handlers: Any, _event: Any) -> bool:
+        await asyncio.wait_for(extended.wait(), timeout=5)
+        return True
+
+    loop = asyncio.get_running_loop()
+
+    async def _direct_run(_executor: Any, fn: Any, *args: Any) -> Any:
+        return fn(*args)
+
+    with (
+        patch.object(pubsub_module, "LEASE_FIRST_REFRESH_SECONDS", 0.01),
+        patch.object(pubsub_module, "LEASE_REFRESH_INTERVAL_SECONDS", 0.01),
+        patch.object(bus, "_dispatch_all", new=_blocks_until_extended),
+        patch.object(loop, "run_in_executor", new=AsyncMock(side_effect=_direct_run)),
+    ):
+        await bus._pull_loop("test-sub", [lambda _e: None])
+
+    extensions = [
+        req
+        for kind, req in calls
+        if kind == "modify"
+        and req.get("ack_deadline_seconds") == pubsub_module.LEASE_EXTENSION_SECONDS
+    ]
+    assert extensions, (
+        "no ack-deadline extension was issued while the batch drained; every "
+        "message in a batch slower than the deadline redelivers"
+    )
+    assert extensions[0]["ack_ids"] == ["ack-0", "ack-1", "ack-2"], (
+        "the extension must cover the WHOLE batch, including messages already "
+        "dispatched — those are the ones sitting unacked the longest"
+    )
+
+
+async def test_extension_stops_before_the_batch_is_acked(bus: PubSubEventBus) -> None:
+    """The keeper must be cancelled before ``acknowledge``, not after.
+
+    An extension racing an ack names ids the ack is retiring in the same
+    instant. Handlers are idempotent so this is not corruption, but it is a
+    self-inflicted error on every single batch, which is how a real one stops
+    being noticed.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    import common.events.pubsub as pubsub_module
+
+    _fake, calls = _lease_harness(bus, message_count=2)
+    extended = asyncio.Event()
+
+    def _note_extension(request: dict[str, Any]) -> None:
+        calls.append(("modify", request))
+        extended.set()
+
+    bus._subscriber.modify_ack_deadline = MagicMock(side_effect=_note_extension)
+
+    async def _blocks_until_extended(_handlers: Any, _event: Any) -> bool:
+        await asyncio.wait_for(extended.wait(), timeout=5)
+        return True
+
+    loop = asyncio.get_running_loop()
+
+    async def _direct_run(_executor: Any, fn: Any, *args: Any) -> Any:
+        return fn(*args)
+
+    with (
+        patch.object(pubsub_module, "LEASE_FIRST_REFRESH_SECONDS", 0.01),
+        patch.object(pubsub_module, "LEASE_REFRESH_INTERVAL_SECONDS", 0.01),
+        patch.object(bus, "_dispatch_all", new=_blocks_until_extended),
+        patch.object(loop, "run_in_executor", new=AsyncMock(side_effect=_direct_run)),
+    ):
+        await bus._pull_loop("test-sub", [lambda _e: None])
+
+    kinds = [kind for kind, _ in calls]
+    assert "ack" in kinds, "the batch should have been acked"
+    assert "modify" in kinds, "the batch should have been extended"
+    assert kinds.index("ack") == len(kinds) - 1, (
+        f"an extension was issued at or after the ack: {kinds}"
+    )
+
+
+async def test_a_failing_extension_does_not_stop_consumption(
+    bus: PubSubEventBus,
+) -> None:
+    """Losing the lease is worse than a warning, but halting is worse still.
+
+    A raise inside the keeper must not reach the pull loop: the consequence of
+    a failed extension is redelivery, which is the behaviour this whole change
+    guards against and which handlers already tolerate. Halting consumption
+    instead would trade a duplicate for a stoppage.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    import common.events.pubsub as pubsub_module
+
+    _fake, calls = _lease_harness(bus, message_count=2)
+    attempted = asyncio.Event()
+
+    def _explode(request: dict[str, Any]) -> None:
+        if request.get("ack_deadline_seconds") == pubsub_module.LEASE_EXTENSION_SECONDS:
+            attempted.set()
+            raise RuntimeError("modify_ack_deadline is down")
+        calls.append(("modify", request))
+
+    bus._subscriber.modify_ack_deadline = MagicMock(side_effect=_explode)
+
+    async def _blocks_until_attempted(_handlers: Any, _event: Any) -> bool:
+        await asyncio.wait_for(attempted.wait(), timeout=5)
+        return True
+
+    loop = asyncio.get_running_loop()
+
+    async def _direct_run(_executor: Any, fn: Any, *args: Any) -> Any:
+        return fn(*args)
+
+    with (
+        patch.object(pubsub_module, "LEASE_FIRST_REFRESH_SECONDS", 0.01),
+        patch.object(pubsub_module, "LEASE_REFRESH_INTERVAL_SECONDS", 0.01),
+        patch.object(bus, "_dispatch_all", new=_blocks_until_attempted),
+        patch.object(loop, "run_in_executor", new=AsyncMock(side_effect=_direct_run)),
+    ):
+        await bus._pull_loop("test-sub", [lambda _e: None])
+
+    assert bus.is_healthy, "a failed extension must not mark the subscription failed"
+    assert [kind for kind, _ in calls] == ["ack"], (
+        "the batch must still be acked after an extension failure"
+    )
+
+
+async def test_an_empty_pull_starts_no_keeper(bus: PubSubEventBus) -> None:
+    """No batch, no keeper — otherwise every idle pull spawns a task that
+    extends nothing, on a loop that spends most of its life idle."""
+    from unittest.mock import AsyncMock, patch
+
+    fake = MagicMock()
+    fake.subscription_path = lambda proj, sub: f"projects/{proj}/subscriptions/{sub}"
+
+    def _pull_empty(*_a: Any, **_kw: Any) -> Any:
+        bus._stopping = True
+        return MagicMock(received_messages=[])
+
+    fake.pull = MagicMock(side_effect=_pull_empty)
+    bus._subscriber = fake
+    bus._pull_executor = MagicMock()
+
+    loop = asyncio.get_running_loop()
+
+    async def _direct_run(_executor: Any, fn: Any, *args: Any) -> Any:
+        return fn(*args)
+
+    with patch.object(loop, "run_in_executor", new=AsyncMock(side_effect=_direct_run)):
+        await bus._pull_loop("test-sub", [lambda _e: None])
+
+    assert not bus._background_tasks, (
+        f"an empty pull spawned {len(bus._background_tasks)} background task(s)"
+    )
+
+
+async def test_a_refresh_that_loses_the_race_to_the_ack_is_not_warned_about(
+    bus: PubSubEventBus, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The one race the cancel cannot close must not read as a lapsing lease.
+
+    ``cancel()`` only interrupts the keeper while it is waiting: a refresh
+    already inside ``run_in_executor`` runs to completion on its thread
+    regardless, so it can land beside the ``acknowledge`` and name ids that ack
+    is retiring. That is expected and harmless — but logged at WARNING with
+    "messages may redeliver" it would fire on ordinary batches and teach
+    on-call to ignore the level, which is how a real lapse gets missed.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    import common.events.pubsub as pubsub_module
+
+    stop = asyncio.Event()
+
+    def _lose_the_race(request: dict[str, Any]) -> None:
+        # Exactly the race: the pull loop finished and acked while this
+        # refresh was already in flight on the executor thread.
+        stop.set()
+        raise RuntimeError("ack id is no longer valid")
+
+    fake = MagicMock()
+    fake.modify_ack_deadline = MagicMock(side_effect=_lose_the_race)
+
+    loop = asyncio.get_running_loop()
+
+    async def _direct_run(_executor: Any, fn: Any, *args: Any) -> Any:
+        return fn(*args)
+
+    with (
+        patch.object(pubsub_module, "LEASE_FIRST_REFRESH_SECONDS", 0.01),
+        patch.object(pubsub_module, "LEASE_REFRESH_INTERVAL_SECONDS", 0.01),
+        patch.object(loop, "run_in_executor", new=AsyncMock(side_effect=_direct_run)),
+        caplog.at_level("DEBUG", logger="common.events.pubsub"),
+    ):
+        await bus._hold_leases(
+            fake, MagicMock(), "projects/p/subscriptions/s", ["ack-0"], "test-sub", stop
+        )
+
+    warnings_logged = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert not warnings_logged, (
+        "a refresh that merely lost the race to the ack was reported as a "
+        f"failing lease: {[r.getMessage() for r in warnings_logged]}"
+    )
+    assert any(r.levelname == "DEBUG" for r in caplog.records), (
+        "the race should still leave a trace, just not an actionable one"
+    )
+
+
+async def test_a_genuine_extension_failure_is_still_warned_about(
+    bus: PubSubEventBus, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The other side of the same branch: with no stop pending, a failed
+    refresh means the lease really is lapsing and the batch really will
+    redeliver. Downgrading that too would have silenced the signal."""
+    from unittest.mock import AsyncMock, patch
+
+    import common.events.pubsub as pubsub_module
+
+    stop = asyncio.Event()
+    attempts = 0
+
+    def _fails(request: dict[str, Any]) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts >= 2:
+            # Let the keeper exit once the point is made.
+            stop.set()
+        raise RuntimeError("modify_ack_deadline is down")
+
+    fake = MagicMock()
+    fake.modify_ack_deadline = MagicMock(side_effect=_fails)
+
+    loop = asyncio.get_running_loop()
+
+    async def _direct_run(_executor: Any, fn: Any, *args: Any) -> Any:
+        return fn(*args)
+
+    with (
+        patch.object(pubsub_module, "LEASE_FIRST_REFRESH_SECONDS", 0.01),
+        patch.object(pubsub_module, "LEASE_REFRESH_INTERVAL_SECONDS", 0.01),
+        patch.object(loop, "run_in_executor", new=AsyncMock(side_effect=_direct_run)),
+        caplog.at_level("DEBUG", logger="common.events.pubsub"),
+    ):
+        await bus._hold_leases(
+            fake, MagicMock(), "projects/p/subscriptions/s", ["ack-0"], "test-sub", stop
+        )
+
+    assert any(r.levelname == "WARNING" for r in caplog.records), (
+        "a real extension failure must stay at WARNING — it means this batch "
+        "redelivers"
+    )
+
+
+async def test_the_first_refresh_does_not_wait_the_steady_interval(
+    bus: PubSubEventBus,
+) -> None:
+    """A durable subscription's initial deadline can be as low as 10s.
+
+    Only the ephemeral subscriptions this module creates are guaranteed 30s.
+    Waiting the STEADY interval before the first refresh means that on a 10s
+    subscription the lease has already lapsed by the time the keeper first
+    acts, and it stays a step behind for the rest of the batch — the keeper
+    runs, issues its RPCs, and fixes nothing.
+
+    The steady interval is patched out of reach here, so an extension observed
+    at all can only have come from the shorter first-refresh delay.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    import common.events.pubsub as pubsub_module
+
+    _fake, calls = _lease_harness(bus, message_count=1)
+    extended = asyncio.Event()
+
+    def _note(request: dict[str, Any]) -> None:
+        calls.append(("modify", request))
+        if request.get("ack_deadline_seconds") == pubsub_module.LEASE_EXTENSION_SECONDS:
+            extended.set()
+
+    bus._subscriber.modify_ack_deadline = MagicMock(side_effect=_note)
+
+    async def _blocks_until_extended(_handlers: Any, _event: Any) -> bool:
+        await asyncio.wait_for(extended.wait(), timeout=5)
+        return True
+
+    loop = asyncio.get_running_loop()
+
+    async def _direct_run(_executor: Any, fn: Any, *args: Any) -> Any:
+        return fn(*args)
+
+    with (
+        patch.object(pubsub_module, "LEASE_FIRST_REFRESH_SECONDS", 0.01),
+        patch.object(pubsub_module, "LEASE_REFRESH_INTERVAL_SECONDS", 3600.0),
+        patch.object(bus, "_dispatch_all", new=_blocks_until_extended),
+        patch.object(loop, "run_in_executor", new=AsyncMock(side_effect=_direct_run)),
+    ):
+        await bus._pull_loop("test-sub", [lambda _e: None])
+
+    assert any(
+        req.get("ack_deadline_seconds") == pubsub_module.LEASE_EXTENSION_SECONDS
+        for kind, req in calls
+        if kind == "modify"
+    ), (
+        "no extension was issued before the steady interval elapsed; on a "
+        "subscription whose ack deadline is below it, the lease lapses first"
+    )
+
+
+async def test_no_lease_extension_lands_after_the_batch_is_nacked(
+    bus: PubSubEventBus,
+) -> None:
+    """A nack must be the LAST word on a failed message's deadline.
+
+    A nack is ``modify_ack_deadline`` of a short backoff delay. A lease
+    extension still in flight when the batch ends carries
+    ``LEASE_EXTENSION_SECONDS`` for the WHOLE leased batch, ``nack_ids``
+    included, so landing behind the nack it overwrites the delay the nack
+    asked for and inverts the nack silently.
+
+    Real threads, deliberately, rather than the inline ``run_in_executor``
+    stand-in the other lease tests use: the entire defect is that cancelling
+    the keeper does not stop work already running on a pool thread, which an
+    inline stand-in cannot express — under one it would pass either way.
+    """
+    import threading
+    from unittest.mock import patch
+
+    import common.events.pubsub as pubsub_module
+
+    calls: list[str] = []
+    extension_started = threading.Event()
+    release_extension = threading.Event()
+
+    fake = MagicMock()
+    fake.subscription_path = lambda proj, sub: f"projects/{proj}/subscriptions/{sub}"
+
+    msg = MagicMock()
+    msg.message.data = EMBEDDED_EVENT_BYTES
+    msg.message.attributes = {}
+    msg.ack_id = "ack-0"
+
+    def _pull_once(*_a: Any, **_kw: Any) -> Any:
+        bus._stopping = True
+        return MagicMock(received_messages=[msg])
+
+    fake.pull = MagicMock(side_effect=_pull_once)
+    fake.acknowledge = MagicMock(side_effect=lambda request: calls.append("ack"))
+
+    def _modify(request: dict[str, Any]) -> None:
+        if request.get("ack_deadline_seconds") == pubsub_module.LEASE_EXTENSION_SECONDS:
+            extension_started.set()
+            # Hold the RPC in flight on this thread, exactly as a real one
+            # would be. Bounded, so a regression fails the assertion below
+            # rather than hanging the suite.
+            release_extension.wait(timeout=5)
+            calls.append("extend")
+        else:
+            calls.append("nack")
+
+    fake.modify_ack_deadline = MagicMock(side_effect=_modify)
+
+    executor = ThreadPoolExecutor(max_workers=4)
+    bus._subscriber = fake
+    bus._pull_executor = executor
+
+    async def _dispatch_fails(_handlers: Any, _event: Any) -> bool:
+        # Do not let the batch finish before an extension is in flight —
+        # otherwise there is no race to observe and the test proves nothing.
+        # ``to_thread`` rather than polling: this is a ``threading`` event, set
+        # from the pool thread running the RPC, so the loop cannot await it
+        # directly. Bounded, so a regression fails the assertion below instead
+        # of hanging the suite.
+        await asyncio.to_thread(extension_started.wait, 5)
+        return False  # nack
+
+    async def _release_once_in_flight() -> None:
+        if await asyncio.to_thread(extension_started.wait, 5):
+            await asyncio.sleep(0.05)  # keep it in flight a beat longer
+        release_extension.set()
+
+    releaser = asyncio.create_task(_release_once_in_flight())
+    try:
+        with (
+            patch.object(pubsub_module, "LEASE_FIRST_REFRESH_SECONDS", 0.01),
+            patch.object(bus, "_dispatch_all", new=_dispatch_fails),
+        ):
+            await bus._pull_loop("test-sub", [lambda _e: None])
+    finally:
+        # Cancel, never plain-await: the releaser waits on ``extension_started``,
+        # so if no extension ever fired it would hang the suite here instead of
+        # letting the assertions report what actually happened.
+        release_extension.set()
+        releaser.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await releaser
+        executor.shutdown(wait=True)
+
+    assert "extend" in calls, "no extension was issued; this test proves nothing"
+    assert "nack" in calls, "the failed message was never nacked"
+    assert calls.index("extend") < calls.index("nack"), (
+        "a lease extension landed AFTER the nack, returning the failed message "
+        f"to {pubsub_module.LEASE_EXTENSION_SECONDS}s of invisibility instead "
+        f"of the backoff the nack asked for: {calls}"
+    )
+
+
+async def test_a_keeper_that_raises_unexpectedly_is_logged_not_swallowed(
+    bus: PubSubEventBus, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Draining the keeper must not become a place bugs go to die.
+
+    ``_hold_leases`` catches and logs its own RPC failures, so anything that
+    escapes it is a bug in the keeper rather than a flaky dependency — the one
+    failure here actually worth waking someone for. Awaiting the task is what
+    makes this necessary: while it was only cancelled, an exception it had
+    already raised stayed unretrieved and asyncio reported it at GC. Retrieving
+    it here ends that, so this has to do the reporting instead.
+
+    The ack is asserted too. Logging the escape is only half the requirement —
+    a keeper bug must not cost the batch its acknowledgement and send finished
+    work round again.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    import common.events.pubsub as pubsub_module
+
+    _fake, calls = _lease_harness(bus, message_count=1)
+
+    async def _raises(*_a: Any, **_kw: Any) -> None:
+        raise RuntimeError("keeper bug")
+
+    async def _dispatch_ok(_handlers: Any, _event: Any) -> bool:
+        # Patched like every other lease test, and here it is load-bearing:
+        # ``_lease_harness`` sets ``_stopping`` during the pull, and the
+        # loop's own ``except Exception`` RETURNS silently while stopping.
+        # A dispatch that raised would therefore look exactly like a keeper
+        # escape that went unlogged -- the very thing under test.
+        return True
+
+    loop = asyncio.get_running_loop()
+
+    async def _direct_run(_executor: Any, fn: Any, *args: Any) -> Any:
+        return fn(*args)
+
+    with (
+        patch.object(pubsub_module, "LEASE_FIRST_REFRESH_SECONDS", 0.01),
+        patch.object(bus, "_hold_leases", new=_raises),
+        patch.object(bus, "_dispatch_all", new=_dispatch_ok),
+        patch.object(loop, "run_in_executor", new=AsyncMock(side_effect=_direct_run)),
+        caplog.at_level("ERROR", logger="common.events.pubsub"),
+    ):
+        await bus._pull_loop("test-sub", [lambda _e: None])
+
+    assert any("keeper bug" in r.getMessage() or r.exc_info for r in caplog.records), (
+        "a keeper that raised out of its own handler left no trace at all"
+    )
+    assert any("lease keeper raised unexpectedly" in r.getMessage() for r in caplog.records), (
+        f"the escape was not reported: {[r.getMessage() for r in caplog.records]}"
+    )
+    assert [kind for kind, _ in calls] == ["ack"], (
+        f"a keeper bug must not cost the batch its ack: {calls}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# stop() drains in-flight handlers before cancelling
+# ---------------------------------------------------------------------------
+
+
+def _running_pull_loop(
+    bus: PubSubEventBus, received: list[Any], handler
+) -> dict[str, Any]:
+    """Wire ``bus`` so a pull loop can run under ``stop()``: the first pull
+    yields ``received``; any later pull blocks until the subscriber is closed,
+    as the real SDK call does."""
+    acked: list[str] = []
+    nacked: list[tuple[str, int]] = []
+    closed = asyncio.Event()
+
+    fake_subscriber = MagicMock()
+    fake_subscriber.subscription_path = lambda proj, sub: (
+        f"projects/{proj}/subscriptions/{sub}"
+    )
+    calls = {"n": 0}
+
+    def fake_pull(request: Any = None, timeout: Any = None) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return MagicMock(received_messages=received)
+        raise RuntimeError("channel closed")
+
+    fake_subscriber.pull = MagicMock(side_effect=fake_pull)
+    fake_subscriber.acknowledge = MagicMock(
+        side_effect=lambda request: acked.extend(request["ack_ids"])
+    )
+    fake_subscriber.modify_ack_deadline = MagicMock(
+        side_effect=lambda request: nacked.extend(
+            (i, request["ack_deadline_seconds"]) for i in request["ack_ids"]
+        )
+    )
+    fake_subscriber.close = MagicMock(side_effect=lambda: closed.set())
+    bus._subscriber = fake_subscriber
+    bus._pull_executor = MagicMock()
+    bus._started = True
+    return {"acked": acked, "nacked": nacked}
+
+
+async def _direct_run(_executor: Any, fn: Any, *args: Any) -> Any:
+    return fn(*args)
+
+
+async def test_stop_lets_an_in_flight_handler_finish_and_ack() -> None:
+    """``stop()`` used to cancel every pull task at once, raising
+    ``CancelledError`` inside a running handler: the message was neither acked
+    nor nacked, and a lifecycle run left its audit row claimed for the lease."""
+    from unittest.mock import AsyncMock, patch
+
+    bus = PubSubEventBus(
+        project_id="proj", subscription_prefix="test", dual_subscribe=True
+    )
+    started = asyncio.Event()
+    finished: list[bool] = []
+
+    async def handler(_event: Event) -> None:
+        started.set()
+        await asyncio.sleep(0.2)
+        finished.append(True)
+
+    received = [
+        _make_received(EMBEDDED_EVENT_BYTES, "ack-1", {}),
+        _make_received(EMBEDDED_EVENT_BYTES, "ack-2", {}),
+    ]
+    out = _running_pull_loop(bus, received, handler)
+    loop = asyncio.get_running_loop()
+    with patch.object(loop, "run_in_executor", new=AsyncMock(side_effect=_direct_run)):
+        task = asyncio.create_task(bus._pull_loop("sub", [handler]))
+        bus._pull_tasks.append(task)
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        await asyncio.wait_for(bus.stop(), timeout=5.0)
+
+    assert finished == [True], "the running handler was cancelled instead of drained"
+    assert out["acked"] == ["ack-1"]
+    # The message not yet dispatched when stop began goes straight back.
+    assert out["nacked"] == [("ack-2", 0)]
+
+
+async def test_stop_grace_is_bounded() -> None:
+    from unittest.mock import AsyncMock, patch
+
+    bus = PubSubEventBus(
+        project_id="proj",
+        subscription_prefix="test",
+        dual_subscribe=True,
+        stop_grace_seconds=0.1,
+    )
+    started = asyncio.Event()
+
+    async def handler(_event: Event) -> None:
+        started.set()
+        await asyncio.sleep(60)
+
+    out = _running_pull_loop(
+        bus, [_make_received(EMBEDDED_EVENT_BYTES, "ack-1", {})], handler
+    )
+    loop = asyncio.get_running_loop()
+    with patch.object(loop, "run_in_executor", new=AsyncMock(side_effect=_direct_run)):
+        task = asyncio.create_task(bus._pull_loop("sub", [handler]))
+        bus._pull_tasks.append(task)
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        await asyncio.wait_for(bus.stop(), timeout=3.0)
+
+    assert task.done()
+    assert out["acked"] == []
+
+
+# ---------------------------------------------------------------------------
+# stop_consuming(): the consuming half of stop(), for a shutdown to run first
+# ---------------------------------------------------------------------------
+
+
+async def test_stop_consuming_ends_the_pull_loop_and_leaves_publishing_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M-09: core-api reached ``stop()`` only after its flushes, and until then
+    its pull loops kept taking lifecycle runs a SIGKILL would strand.
+    ``stop_consuming()`` ends them at the top of shutdown: the running handler
+    finishes and is acked, the rest of its batch goes back, no new pull is made,
+    and publishing stays up for the work that drains after it."""
+    bus = PubSubEventBus(
+        project_id="proj", subscription_prefix="test", dual_subscribe=True
+    )
+    started = asyncio.Event()
+    finished: list[bool] = []
+
+    async def handler(_event: Event) -> None:
+        started.set()
+        await asyncio.sleep(0.2)
+        finished.append(True)
+
+    received = [
+        _make_received(EMBEDDED_EVENT_BYTES, "ack-1", {}),
+        _make_received(EMBEDDED_EVENT_BYTES, "ack-2", {}),
+    ]
+    out = _running_pull_loop(bus, received, handler)
+    monkeypatch.setattr(asyncio.get_running_loop(), "run_in_executor", _direct_run)
+    task = asyncio.create_task(bus._pull_loop("sub", [handler]))
+    bus._pull_tasks.append(task)
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    await asyncio.wait_for(bus.stop_consuming(), timeout=5.0)
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert finished == [True], "the running handler was cancelled instead of drained"
+    assert out["acked"] == ["ack-1"]
+    assert out["nacked"] == [("ack-2", 0)]
+    assert bus._subscriber.pull.call_count == 1, "a new delivery was pulled"
+    assert bus._get_publish_executor() is not None
+    assert not bus.is_healthy, "a bus that no longer consumes reported healthy"
+    await bus.stop()
+
+
+async def test_stop_consuming_cancels_a_handler_that_outlasts_the_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past the grace the handler is cancelled and awaited, so a lifecycle run
+    releases its claim inside the SIGTERM budget. That cancellation is the
+    shutdown's, not a halted subscription."""
+    bus = PubSubEventBus(
+        project_id="proj",
+        subscription_prefix="test",
+        dual_subscribe=True,
+        stop_grace_seconds=0.1,
+    )
+    started = asyncio.Event()
+    cancelled: list[bool] = []
+
+    async def handler(_event: Event) -> None:
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    out = _running_pull_loop(
+        bus, [_make_received(EMBEDDED_EVENT_BYTES, "ack-1", {})], handler
+    )
+    monkeypatch.setattr(asyncio.get_running_loop(), "run_in_executor", _direct_run)
+    task = asyncio.create_task(bus._pull_loop("sub", [handler]))
+    bus._pull_tasks.append(task)
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    await asyncio.wait_for(bus.stop_consuming(), timeout=3.0)
+
+    assert task.done()
+    assert cancelled == [True]
+    assert out["acked"] == []
+    assert bus._failed_subscriptions == set()
+    await bus.stop()

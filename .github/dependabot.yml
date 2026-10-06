@@ -1,0 +1,222 @@
+# Dependabot config — weekly security and version update PRs.
+# Docs: https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Labels follow .github/labels.yml taxonomy: every PR is `kind/chore` +
+# `dependencies` + the relevant `area/*` so it routes through triage
+# and gets surfaced in release-please's Dependencies section.
+#
+# Each ecosystem opens at most TWO PRs per run: one `*-minor-patch` group and one
+# `*-majors` group. Majors stay OUT of the minor/patch group so a breaking bump is never
+# smuggled in with routine ones, but they are batched together rather than one-PR-each —
+# a fleet of individual major PRs was the main source of backlog (15 open bot PRs, 2026-07).
+# The uv services share ONE multi-directory entry for the same reason: four separate
+# entries emitted four near-identical group PRs every week.
+# Mirrors the caura-enterprise grouping strategy.
+#
+# No auto-merge workflow here. The minor/patch carve-out was revoked 2026-08-09, and the
+# `*-minor-patch` group names below no longer feed one — every Dependabot PR merges by hand
+# under the normal review gate. The sibling repos' `dependabot-automerge.yml` now only FLAGS
+# a PR as CI-verified; do not port it back here without a new explicit decision.
+#
+# NO entry here sets `versioning-strategy`, and that applies to all of them:
+#   * `increase-if-necessary` is IGNORED for `uv` — verified against a live run on
+#     2026-08-10 (#740, reverted), which still raised floors for releases the ranges
+#     already allowed. GitHub documents `uv` as supporting it, so this is a
+#     dependabot-core gap; re-verify before believing it is fixed.
+#   * On an entry with NO committed lock — the `pip` entry below — it is worse than
+#     inert: dependabot-core skips the manifest edit when the new version already
+#     satisfies the range and no lockfile exists, leaving nothing to change, so those
+#     updates stop being reported at all.
+#   * `lockfile-only` IS honoured, but it drops any update needing a manifest change.
+#     Most specs in the uv services are capped, so a real major outside a cap would
+#     vanish silently. This repo is public and those `>=` floors are part of the
+#     contract with OSS consumers, so a raised floor is not purely churn here.
+# Net effect: constraint-widening PRs are a known, accepted cost in this repo.
+
+version: 2
+
+updates:
+  # --- Python: root requirements.txt ---
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "kind/chore"
+      - "area/infra"
+    commit-message:
+      prefix: "deps"
+    groups:
+      pip-minor-patch:
+        update-types: ["minor", "patch"]
+      # Majors batched into one reviewable PR instead of one PR per dependency.
+      pip-majors:
+        update-types: ["major"]
+
+  # --- Python (uv): the four core services, ONE entry across all their directories ---
+  # uv (not pip): these services install FROZEN from their committed uv.lock, so only the
+  # uv ecosystem bumps the lock and pyproject together (pip would leave the lock stale).
+  # ONE entry with `directories` (not four separate entries): four entries emitted four
+  # near-identical `uv-minor-patch` group PRs every week — the single biggest contributor
+  # to the backlog. One entry means one grouped PR spanning whichever services changed.
+  - package-ecosystem: "uv"
+    directories:
+      - "/core-api"
+      - "/core-storage-api"
+      - "/core-worker"
+      - "/core-operations"
+    # Deliberately no `versioning-strategy` — see the header before adding one.
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "kind/chore"
+      - "area/core-api"
+      - "area/core-storage-api"
+      - "area/core-worker"
+      - "area/core-operations"
+    commit-message:
+      prefix: "deps"
+    groups:
+      uv-minor-patch:
+        update-types: ["minor", "patch"]
+      # Majors batched into one reviewable PR instead of one PR per dependency.
+      uv-majors:
+        update-types: ["major"]
+
+  # --- npm: root (Playwright e2e) ---
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "kind/chore"
+      - "area/infra"
+    commit-message:
+      prefix: "deps"
+    groups:
+      npm-minor-patch:
+        update-types: ["minor", "patch"]
+      npm-majors:
+        update-types: ["major"]
+
+  # --- npm: plugin ---
+  - package-ecosystem: "npm"
+    directory: "/plugin"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "kind/chore"
+      - "area/plugin"
+    commit-message:
+      prefix: "deps(plugin)"
+    groups:
+      npm-minor-patch:
+        update-types: ["minor", "patch"]
+      npm-majors:
+        update-types: ["major"]
+
+  # --- Python: published client packages (PyPI) ---
+  # These ship inside other people's projects, so they need advisory PRs as much as the
+  # services do. One multi-directory entry, as with uv. No lockfiles here — see the header
+  # on why that rules out `versioning-strategy`.
+  - package-ecosystem: "pip"
+    directories:
+      - "/clients/python"
+      - "/clients/caura-meta"
+      - "/clients/caura-sdk-meta"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "kind/chore"
+      - "area/infra"
+    commit-message:
+      prefix: "deps(clients)"
+    groups:
+      clients-pip-minor-patch:
+        update-types: ["minor", "patch"]
+      clients-pip-majors:
+        update-types: ["major"]
+
+  # --- npm: published client packages ---
+  - package-ecosystem: "npm"
+    directories:
+      - "/clients/typescript"
+      - "/clients/npm-caura-client"
+      - "/clients/npm-caura-sdk"
+      - "/clients/npm-sdk"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "kind/chore"
+      - "area/infra"
+    commit-message:
+      prefix: "deps(clients)"
+    groups:
+      clients-npm-minor-patch:
+        update-types: ["minor", "patch"]
+      clients-npm-majors:
+        update-types: ["major"]
+
+  # --- GitHub Actions ---
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "kind/chore"
+      - "area/infra"
+    commit-message:
+      prefix: "deps(actions)"
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      # e.g. actions/setup-python 5->7 and release-please-action 4->5 arrived as two
+      # separate PRs; batched they are one review.
+      actions-majors:
+        patterns: ["*"]
+        update-types: ["major"]
+
+  # --- Docker ---
+  # The docker ecosystem only scans the directory it is pointed at: `/` covers the compose
+  # files, and the four service Dockerfiles (the images publish-docker.yml ships) each need
+  # their own directory. One multi-directory entry, as with uv, so it stays one grouped PR.
+  - package-ecosystem: "docker"
+    directories:
+      - "/"
+      - "/core-api"
+      - "/core-storage-api"
+      - "/core-worker"
+      - "/core-operations"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "kind/chore"
+      - "area/infra"
+      - "area/core-api"
+      - "area/core-storage-api"
+      - "area/core-worker"
+      - "area/core-operations"
+    commit-message:
+      prefix: "deps(docker)"
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
+      docker-majors:
+        update-types: ["major"]

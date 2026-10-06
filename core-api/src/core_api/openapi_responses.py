@@ -1,0 +1,725 @@
+"""Spec-only response models for C33 (OpenAPI completeness).
+
+These models document success-response shapes in the generated OpenAPI spec
+via ``responses={200: {"model": ...}}`` on the route decorators. They are
+deliberately NOT passed as ``response_model=``: attaching them there would
+route every response through Pydantic serialization (coercing values and
+dropping undeclared keys), which is a runtime behavior change this task must
+not make. Spec-only attachment documents the shape and changes nothing on
+the wire.
+
+Consequence: nothing enforces these models at runtime. When a handler's
+return shape changes, the matching model here must change in the same PR —
+``tests/test_c33_openapi_completeness.py`` ratchets the count of
+undocumented success responses so new routes can't ship blank, and the
+wet-test checklist for schema-touching PRs includes diffing a live response
+against its model here.
+
+Conditional keys (present only under a documented condition) are declared
+Optional with a ``description`` saying when they appear; JSON-mapping values
+use ``dict[str, int]``-style types rather than named models.
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+from core_api.schemas import MemoryOut, SearchWarning
+
+# --------------------------------------------------------------------------
+# memories / recall / health / version
+# --------------------------------------------------------------------------
+
+
+class MemoryPendingWork(BaseModel):
+    embedding: int = Field(description="Live rows whose vector has not landed yet (`embedding IS NULL`).")
+    enrichment: int = Field(
+        description="Live rows still marked `enrichment_pending` — the deferred LLM enrichment has not written back."
+    )
+    fanout: int = Field(
+        description="Live rows whose persisted atomic facts have not been fanned out into child memories yet."
+    )
+
+
+class MemoryStatsResponse(BaseModel):
+    total: int = Field(description="Live (non-deleted) memory count in scope.")
+    by_type: dict[str, int]
+    by_agent: dict[str, int]
+    by_status: dict[str, int]
+    by_tenant: dict[str, int] | None = Field(
+        default=None,
+        description="Only for cross-tenant reads spanning more than one tenant.",
+    )
+    deleted: int | None = Field(default=None, description="Only when include_deleted=true.")
+    total_including_deleted: int | None = Field(default=None, description="Only when include_deleted=true.")
+    pending: MemoryPendingWork | None = Field(
+        default=None,
+        description=(
+            "Background work still outstanding in this scope, from durable row markers. A row can count "
+            "on more than one axis. Contradiction marks are applied after embed/enrich events and carry "
+            "no durable marker, so allow a short grace period after `settled` flips."
+        ),
+    )
+    settled: bool | None = Field(
+        default=None,
+        description="True when every `pending` count is zero. Wait for this before measuring a freshly ingested store.",
+    )
+
+
+class MemoryCountResponse(BaseModel):
+    count: int
+
+
+class BulkDeleteResponse(BaseModel):
+    deleted: int = Field(description="Number of memories soft-deleted.")
+
+
+class SupersessionPeer(BaseModel):
+    id: str
+    content_preview: str = Field(description="First 200 characters of content.")
+    status: str
+    created_at: str
+
+
+class ContradictionEntry(BaseModel):
+    memory_id: str
+    status: str
+    reason: str = Field(description="One of rdf_conflict, semantic_conflict, unknown.")
+    content_preview: str
+    direction: str = Field(description="superseded_by or supersedes.")
+    created_at: str
+
+
+class MemoryContradictionsResponse(BaseModel):
+    memory_id: str
+    status: str | None
+    superseded_by: SupersessionPeer | None = Field(
+        description=(
+            "The older memory this one superseded (via supersedes_id); null when there is none or "
+            "it was deleted. The field name is kept for back-compat; newer memories that superseded "
+            "this one are in superseded_memories and in contradictions with direction superseded_by."
+        )
+    )
+    superseded_memories: list[SupersessionPeer] = Field(
+        description="Newer memories that superseded this one, each with supersedes_id pointing here."
+    )
+    detection_status: str = Field(description="completed or pending.")
+    contradictions: list[ContradictionEntry]
+
+
+class MemoryStatusPatchResponse(BaseModel):
+    memory_id: str
+    old_status: str | None
+    new_status: str
+
+
+class RecallDiagnostic(BaseModel):
+    recall_prompt: str | None
+    # WT-1 — ``summary`` carries only the extracted final answer; the raw
+    # completion stays inspectable here.
+    recall_raw: str | None = Field(
+        description="Unfiltered LLM completion (reasoning scaffold + answer marker) that summary "
+        "was extracted from; null when no LLM ran (no matches, or summarization disabled)."
+    )
+    recall_model: str | None
+    recall_provider: str | None
+    all_candidates: list
+    top_k_used: int | None
+    retrieval_strategy: str | None
+    search_params: dict
+    # CAURA-722 — documented on ``SearchDiagnostic``. ``None`` on the count
+    # means entity FTS never ran, which is a different answer from ``0``.
+    entity_matches: int | None = None
+    entity_match_declined: bool = False
+
+
+class RecallResponse(BaseModel):
+    query: str
+    summary: str
+    memory_count: int
+    memories: list[MemoryOut]
+    # ax-0917-h-03 — DEPRECATED, and deliberately still emitted by default here.
+    #
+    # ``POST /recall`` is a SemVer-stable REST surface (docs/public-api-stability.md,
+    # Memory row), so flipping this default is a breaking change owed a major. The
+    # MCP brief carries no such pin — that document fixes tool names and purposes,
+    # not response bodies — so it already defaults to omitting the alias. That
+    # split is a MIGRATION STATE, not a permanent design: marking the field
+    # deprecated here is what gives it an end, so the two surfaces converge at
+    # v4 rather than disagreeing indefinitely.
+    #
+    # Sunset follows the same deprecate-then-remove convention this PR leans on
+    # for h-04 (C25, #967). No first-party consumer reads it: both SDKs read
+    # ``memories`` first and only fall back (clients/python .../models.py,
+    # clients/typescript/src/index.ts), and the plugin's items reader is only
+    # ever fed /search.
+    items: list[MemoryOut] | None = Field(
+        default=None,
+        deprecated=True,
+        description=(
+            "DEPRECATED — scheduled for removal in v4.0.0; read `memories` instead. "
+            "Back-compat alias of memories, for consumers written against "
+            "/search's shape. Present unless the request set items_alias=false; "
+            "duplicating the result set is ~50% of this response. The MCP recall "
+            "brief already omits it by default."
+        ),
+    )
+    recall_ms: int
+    diagnostic: RecallDiagnostic | None = Field(
+        default=None, description="Only when the request sets diagnostic=true."
+    )
+    # ax-0917-h-05 — same shape as ``SearchResponse.warnings`` (A28). Absent
+    # when there is nothing to report, which is the ordinary case.
+    #
+    # CAURA-723 adds a second family to it: coded caveats about the RESULT SET
+    # rather than about the request, e.g. ``filter_agent_unknown`` when the
+    # agent filter names an id this tenant has never seen. Kept in one field —
+    # both are "the call succeeded, but something you would assume happened did
+    # not", which is exactly what ``SearchWarning`` was defined for.
+    warnings: list[SearchWarning] | None = Field(
+        default=None,
+        description=(
+            "Non-fatal notices about this request or its result set — e.g. "
+            "parameters the endpoint does not read and therefore ignored, or "
+            "'filter_agent_unknown' when the agent filter names an id this "
+            "tenant has never seen."
+        ),
+    )
+
+
+class VersionResponse(BaseModel):
+    version: str
+
+
+# --------------------------------------------------------------------------
+# documents / keystones / evolve / entities / graph
+# --------------------------------------------------------------------------
+
+
+class DocumentSearchItem(BaseModel):
+    collection: str
+    doc_id: str
+    data: dict = Field(description="Arbitrary caller-supplied document body.")
+    similarity: float
+
+
+class DocumentSearchResponse(BaseModel):
+    collection: str | None = Field(
+        description="Echo of the requested collection; null for cross-collection search."
+    )
+    count: int
+    results: list[DocumentSearchItem] = Field(description="Deprecated alias of items (wire contract D1).")
+    items: list[DocumentSearchItem]
+    unindexed_count: int | None = Field(
+        default=None,
+        description=(
+            "Present only on a zero-result search that had unsearchable documents in "
+            "scope. Documents are indexed only when their write supplies data.summary "
+            "(or data.description for skills); without one a document is stored and "
+            "readable by id but never returned by search."
+        ),
+    )
+    note: str | None = Field(
+        default=None,
+        description="Human-readable explanation accompanying unindexed_count.",
+    )
+
+
+class DocumentCollectionInfo(BaseModel):
+    name: str
+    count: int = Field(description="Documents in this collection.")
+
+
+class DocumentCollectionsResponse(BaseModel):
+    collections: list[DocumentCollectionInfo]
+    count: int = Field(description="Number of collections, not total documents.")
+
+
+class KeystoneData(BaseModel):
+    title: str
+    content: str
+    weight: int = Field(
+        description="Priority bucket 25, 50, or 100 (request labels low/med/high are converted)."
+    )
+    scope: str = Field(description="tenant, fleet, or agent.")
+    agent_id: str | None = Field(default=None, description="Only when scope=agent.")
+    author_user_id: str | None = Field(default=None, description="Only when supplied at write time.")
+
+
+class KeystoneDoc(BaseModel):
+    id: str
+    tenant_id: str
+    fleet_id: str | None = Field(description="Null for tenant-scope rules.")
+    collection: str = Field(description='Always "_keystones".')
+    doc_id: str
+    data: KeystoneData
+    created_at: str
+    updated_at: str
+
+
+class KeystonesEnvelope(BaseModel):
+    count: int
+    items: list[KeystoneDoc]
+    rule_set_hash: str | None = Field(
+        description=(
+            "The rule-set hash of the rules in items: lowercase hex SHA-256, as "
+            "the broker computes it for the rules it delivers. Null when a rule "
+            "can't be hashed (a missing updated_at, a weight that isn't a number)."
+        )
+    )
+
+
+class KeystoneDeleteResponse(BaseModel):
+    deleted: bool
+    doc_id: str
+
+
+class KeystoneVersionSummary(BaseModel):
+    version: int = Field(description="The tenant's change count: 1, 2, 3, ...")
+    op: Literal["set", "delete", "baseline", "resync"] = Field(
+        description=(
+            "baseline: the set versioning started from. resync: a change that reached "
+            "the set without a version (a fleet purge, say), recorded before the next "
+            "write so that write's version shows its own change alone."
+        )
+    )
+    doc_id: str | None = Field(description="The rule that changed; null for a baseline or a resync.")
+    actor_agent_id: str | None = Field(description="The agent that made the change.")
+    actor_user_id: str | None = Field(description="The person the gateway vouched for, when there was one.")
+    created_at: str
+    rule_set_hash: str | None = Field(
+        description=(
+            "The rule-set hash of the rules this version gives the fleet_id and "
+            "agent_id asked about, as the keystones list would have returned "
+            "them. Null when a rule can't be hashed."
+        )
+    )
+    rule_count: int = Field(description="How many rules that is, after the cap.")
+    truncated: bool = Field(description="Whether the cap dropped rules, as X-Truncated.")
+
+
+class KeystoneVersionsPage(BaseModel):
+    count: int
+    items: list[KeystoneVersionSummary] = Field(description="Newest first.")
+    next_before: int | None = Field(description="Pass back as before for the next page; null on the last.")
+
+
+class KeystoneVersionRule(BaseModel):
+    doc_id: str
+    fleet_id: str | None = Field(description="Null for tenant-scope rules.")
+    data: KeystoneData
+    updated_at: str
+
+
+class KeystoneVersionDetail(KeystoneVersionSummary):
+    items: list[KeystoneVersionRule] = Field(
+        description="The rules this version gives the fleet_id and agent_id asked about."
+    )
+
+
+class WeightAdjustment(BaseModel):
+    memory_id: str
+    old_weight: float
+    new_weight: float
+    delta: float
+
+
+class GeneratedRule(BaseModel):
+    rule_memory_id: str
+    condition: str
+    action: str
+    confidence: float
+
+
+class EvolveReportResponse(BaseModel):
+    outcome_id: str
+    outcome_type: str = Field(description="success, failure, or partial.")
+    scope: str = Field(description="agent, fleet, or all.")
+    weight_adjustments: list[WeightAdjustment]
+    rules_generated: list[GeneratedRule] = Field(
+        description="At most one element; empty unless a rule persisted."
+    )
+    rule_skipped_reason: str | None = Field(
+        description="Slug explaining why no rule was generated; null when one was."
+    )
+    weight_adjustment_skipped_reason: str | None = Field(
+        description="Slug explaining why no weights moved; null when at least one did."
+    )
+    out_of_scope_count: int
+    evolve_ms: int
+
+
+class EntityListItem(BaseModel):
+    id: str
+    tenant_id: str | None
+    fleet_id: str | None
+    entity_type: str | None
+    canonical_name: str | None
+    attributes: dict | None
+    memory_count: int
+
+
+class GraphNode(BaseModel):
+    id: str
+    label: str | None = Field(description="Entity canonical_name.")
+    type: str | None = Field(description="Entity entity_type.")
+    fleet_id: str | None
+    attributes: dict | None
+    memory_count: int
+
+
+class GraphEdge(BaseModel):
+    id: str
+    source: str
+    target: str
+    relation_type: str | None
+    weight: float
+    evidence_memory_id: str | None
+
+
+class GraphResponse(BaseModel):
+    nodes: list[GraphNode]
+    edges: list[GraphEdge]
+
+
+# --------------------------------------------------------------------------
+# settings / tenants / fleets / tool-descriptions
+# --------------------------------------------------------------------------
+
+
+class ProviderModelChoice(BaseModel):
+    provider: str | None
+    model: str | None
+
+
+class ProviderModelToggle(ProviderModelChoice):
+    enabled: bool | None
+
+
+class SearchSettings(BaseModel):
+    recall_boost: bool | None
+    graph_retrieval: bool | None
+    entity_retrieval: bool | None
+    default_profile: dict = Field(
+        description="Open knob map (min_similarity, top_k, freshness_floor, score_formula, ...)."
+    )
+
+
+class WriteSettings(BaseModel):
+    default_write_mode: str | None = Field(description="fast or strong; null means fast.")
+    triple_emission_enabled: bool | None
+    retraction_enabled: bool | None
+    contradiction_detection_enabled: bool | None = Field(
+        description="Tenant switch for contradiction detection; null means on. False skips "
+        "every detection path for the tenant, so no row is marked outdated/conflicted."
+    )
+
+
+class SettingsResponse(BaseModel):
+    """Full effective settings tree: DEFAULT_SETTINGS deep-merged with tenant
+    overrides — every section always present. Deep operational blobs are left
+    as open objects here; their authoritative key sets live in
+    ``services/organization_settings.py::DEFAULT_SETTINGS``."""
+
+    enrichment: ProviderModelToggle
+    recall: ProviderModelToggle
+    embedding: ProviderModelChoice
+    entity_extraction: ProviderModelToggle
+    fallback_llm: ProviderModelChoice
+    agent_digest: dict
+    search: SearchSettings
+    crystallizer: dict
+    dedup: dict
+    lifecycle: dict
+    entity_linking: dict
+    insights: dict
+    observability: dict
+    chunking: dict
+    write: WriteSettings
+    agents: dict
+    memclaw: dict  # legacy-name-ok: documents the existing settings wire key
+    security_audit: dict
+    skills_factory: dict
+    interviewer: dict
+    entity_blocklist: list[str]
+    governance: dict
+    api_keys: dict = Field(description="Per-tenant provider key overrides (open object).")
+
+
+class FleetDistributionItem(BaseModel):
+    fleet_id: str
+    memory_count: int
+    agent_count: int
+
+
+class ToolDescriptionEnriched(BaseModel):
+    description: str
+    stm_only: bool
+
+
+# --------------------------------------------------------------------------
+# fleet / agents
+# --------------------------------------------------------------------------
+
+
+class FleetCreateResponse(BaseModel):
+    ok: bool
+    fleet_id: str
+    tenant_id: str
+
+
+class FleetListItem(BaseModel):
+    fleet_id: str | None
+    node_count: int
+    last_heartbeat: str | None
+    status: str = Field(description="online or offline.")
+
+
+class FleetPurgeResponse(BaseModel):
+    ok: bool
+    tenant_id: str
+    fleet_id: str
+    deleted: dict[str, int] = Field(
+        description="Rows deleted per table (fleet_commands, memories, entities, ...)."
+    )
+
+
+class HeartbeatCommand(BaseModel):
+    id: str
+    command: str | None
+    payload: dict | None
+
+
+class HeartbeatResponse(BaseModel):
+    ok: bool
+    node_id: str
+    commands: list[HeartbeatCommand] = Field(description="Pending commands, acked on delivery.")
+
+
+class CommandCreateResponse(BaseModel):
+    id: str
+    status: str
+
+
+class FleetCommand(BaseModel):
+    id: str
+    node_id: str
+    command: str | None
+    payload: dict | None
+    status: str = Field(description="pending, acked, done, or failed.")
+    result: dict | None
+    created_at: str
+    acked_at: str | None
+    completed_at: str | None
+
+
+class OkResponse(BaseModel):
+    ok: bool
+
+
+class FleetNode(BaseModel):
+    node_id: str
+    node_name: str
+    fleet_id: str | None
+    hostname: str | None
+    ip: str | None
+    openclaw_version: str | None
+    plugin_version: str | None
+    plugin_hash: str | None
+    os_info: str | None
+    status: str = Field(description="online, stale, or offline.")
+    agents: list | None
+    tools: list | None
+    channels: list | None
+    metadata: dict | None = Field(
+        description="Open object; may carry recall_metrics, reconcile, deploy_blocked_until, sentinel markers."
+    )
+    last_heartbeat: str | None
+    created_at: str | None
+
+
+class FleetAgentStats(BaseModel):
+    agent_id: str
+    trust_level: int
+    total_memories: int
+    last_write_at: str | None
+    total_recalls: int
+    last_recall_at: str | None
+    active_24h: bool
+    stale: bool
+
+
+class FleetSummary(BaseModel):
+    total_agents: int
+    active_agents_24h: int
+    memories_24h: int
+    stale_agents: int
+    total_memories: int
+    conflicted_memories: int
+    outdated_memories: int
+    deleted_memories: int
+    recalled_memories_24h: int
+
+
+class FleetStatsResponse(BaseModel):
+    agents: list[FleetAgentStats]
+    fleet_summary: FleetSummary
+
+
+class AgentFleetPatchResponse(BaseModel):
+    agent_id: str
+    old_fleet_id: str | None
+    new_fleet_id: str
+
+
+# --------------------------------------------------------------------------
+# ingest / crystallize / insights
+# --------------------------------------------------------------------------
+
+
+class IngestFact(BaseModel):
+    content: str
+    suggested_type: str
+    source_uri: str | None = None
+    salience: float | None = Field(default=None, description="Only when the extractor emitted one.")
+
+
+class IngestPreviewResponse(BaseModel):
+    """Covers all four branches: cache hit (cached+run_id), too-short
+    (skipped_reason), zero-section, and the normal LLM path."""
+
+    url: str | None
+    content_length: int
+    facts: list[IngestFact]
+    chunk_ms: int
+    doc_hash: str | None = Field(
+        default=None,
+        description=(
+            "Echo to commit to cache this extraction. Null when sections_failed is non-zero, so a "
+            "partial extraction is never cached; absent on the too-short branch."
+        ),
+    )
+    sections: int | None = Field(
+        default=None, description="Absent on the too-short branch; 0 on a cache hit."
+    )
+    sections_failed: int | None = Field(
+        default=None,
+        description=(
+            "Sections whose LLM extraction failed; present on the extraction path. A preview that "
+            "lost every section is a 502 instead."
+        ),
+    )
+    cached: bool | None = Field(default=None, description="Only on a doc-hash cache hit.")
+    run_id: str | None = Field(default=None, description="Only on a cache hit: the prior run's id.")
+    skipped_reason: str | None = Field(default=None, description="Only when skipped (content_too_short).")
+
+
+class IngestCommitResponse(BaseModel):
+    url: str | None
+    facts_extracted: int
+    memories_created: int
+    skipped_duplicates: int
+    errored: int
+    run_id: str
+    ingest_ms: int
+
+
+class IngestUndoResponse(BaseModel):
+    deleted: int
+    run_id: str
+
+
+class CrystallizeReport(BaseModel):
+    """Nested blobs are open objects; authoritative sub-shapes live in
+    ``services/crystallizer_service.py`` (each may be ``{"error": true}``
+    when its check failed)."""
+
+    id: str
+    tenant_id: str | None
+    fleet_id: str | None
+    trigger: str | None
+    status: str | None = Field(description="running, completed, or failed.")
+    started_at: str | None
+    completed_at: str | None
+    duration_ms: int | None
+    summary: dict = Field(description="overall_score / critical / warning / info counts.")
+    hygiene: dict = Field(
+        description="Seven checks (orphaned_entities, near_duplicates, ...), each with count and affected ids."
+    )
+    health: dict
+    usage_data: dict
+    issues: list[dict] = Field(
+        description="Each: severity, category, code, title, description, count, affected_ids."
+    )
+    crystallization: dict
+
+
+class InsightFinding(BaseModel):
+    type: str
+    headline: str
+    what_happened: str
+    why_it_matters: str
+    recommended_action: str
+    confidence: float
+    related_memory_ids: list[str]
+    title: str = Field(description="Legacy mirror of headline.")
+    description: str = Field(description="Legacy mirror of what_happened + why_it_matters.")
+    recommendation: str = Field(description="Legacy mirror of recommended_action.")
+    insight_memory_id: str | None = Field(description="Null when persisting this finding failed.")
+
+
+class InsightsResponse(BaseModel):
+    focus: str
+    scope: str
+    memories_analyzed: int
+    findings: list[InsightFinding]
+    summary: str
+    insight_memory_ids: list[str]
+    gate_rejected: int
+    insights_ms: int
+
+
+class HealthResponse(BaseModel):
+    status: str = Field(description="ok, degraded, or unhealthy (unhealthy is served as 503).")
+    storage: str = Field(description="connected or unreachable.")
+    redis: str = Field(description="connected, unavailable, or not configured.")
+    event_bus: str = Field(description="ok, unhealthy, or error.")
+    platform_init_errors: list[str] | None = Field(
+        default=None,
+        description="Only when platform init recorded errors and all dependencies are up (status=degraded).",
+    )
+    unhealthy_dependencies: list[str] | None = Field(
+        default=None,
+        description="Only on 503: names of failing dependencies.",
+    )
+
+
+class ConflictOut(BaseModel):
+    """D11 — a detected conflict with its human-review state."""
+
+    id: str
+    tenant_id: str
+    new_memory_id: str
+    old_memory_id: str
+    relationship: str
+    diagnosis: str | None = None
+    action: str | None = Field(default=None, description="What the detector proposed.")
+    review_status: str = Field(description="pending | resolved | dismissed")
+    resolution_action: str | None = Field(default=None, description="What the reviewer chose.")
+    resolution_note: str | None = None
+    resolved_by: str | None = None
+    resolved_at: str | None = None
+    # --- fields present on the runtime conflict payload but previously absent here ---
+    fleet_id: str | None = None
+    relationship_confidence: float | None = None
+    diagnosis_confidence: float | None = None
+    evidence_strength: str | None = None
+    audit_reason: str | None = None
+    created_by: str | None = None
+    created_at: str | None = None
+
+
+class ConflictListResponse(BaseModel):
+    items: list[ConflictOut]

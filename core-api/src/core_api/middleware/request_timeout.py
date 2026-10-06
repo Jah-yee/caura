@@ -1,0 +1,168 @@
+"""Request-wide timeout middleware (CAURA-600).
+
+Pure ASGI middleware — matches the ``SecurityHeadersMiddleware`` pattern
+rather than ``@app.middleware('http')`` (which wraps in
+``BaseHTTPMiddleware`` and has known edge cases around cancellation
+through Starlette's anyio task groups).
+
+Caveat: ``asyncio.timeout`` cannot cancel synchronous threads started
+via ``asyncio.to_thread`` (used by the Vertex and Gemini provider
+SDKs). The deadline frees the request slot and returns 504 to the
+caller on time, but the background thread may outlive the budget up
+to the provider's own latency and hold a ThreadPoolExecutor slot.
+Moving those calls off the hot path (CAURA-594 / CAURA-595) is the
+real fix; this middleware is the outer safety net.
+"""
+
+import asyncio
+import json
+import logging
+import time
+from collections.abc import MutableMapping
+from typing import Any
+
+from starlette.types import ASGIApp as ASGIApplication
+from starlette.types import Receive, Scope, Send
+
+from core_api import request_phase
+from core_api.constants import is_mcp_path
+from core_api.errors import REQUEST_BUDGET_EXCEEDED, make_error_payload
+
+logger = logging.getLogger(__name__)
+
+# Routes that opt out of the blanket middleware budget and enforce their
+# own deadline at the route layer. Bulk-write (CAURA-602) needs a longer
+# budget than the single-write hot path, and cancelling it from this
+# middleware *after* storage commits is exactly what produced the
+# silent-create regression in loadtest-1777301515 — the route now wraps
+# its own ``asyncio.wait_for`` and surfaces the 504 with the retry
+# contract intact.
+# ``/admin/org/purge-data`` (CAURA-689) hard-deletes every row of a
+# soft-deleted org across the OSS schema — a terminal admin batch op
+# driven by the daily sweep, not a user request. A large org can take
+# well past the hot-path budget; cancelling it mid-flight is pointless
+# (the purge is one transaction per tenant and idempotent on retry), so
+# it opts out and is bounded by the storage client's own timeout instead.
+# ``/interview/submit`` (Interviewer Phase 1) runs a synchronous
+# map-reduce LLM interview — a realistic window measured ~63s in the
+# real-LLM pilot, well past the blanket budget. Like bulk, the route
+# enforces its own deadline (``interview_request_timeout_seconds``) and
+# its failure mode is retry-safe (watermark advances only post-commit;
+# the plugin never prunes on error; the attempt id dedups).
+_TIMEOUT_OPT_OUT_PATHS: frozenset[str] = frozenset(
+    {
+        "/api/v1/memories/bulk",
+        "/api/v1/admin/org/purge-data",
+        "/api/v1/interview/submit",
+    }
+)
+
+
+def _is_opted_out(path: str) -> bool:
+    # Exact match keeps neighbours like ``/memories/bulk-delete`` on the
+    # default budget. ASGI ``scope["path"]`` excludes the querystring, so
+    # no startswith-with-``?`` fallback is needed.
+    return path in _TIMEOUT_OPT_OUT_PATHS
+
+
+class RequestTimeoutMiddleware:
+    def __init__(self, app: ASGIApplication, timeout_seconds: float) -> None:
+        self.app = app
+        self.timeout_seconds = timeout_seconds
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or is_mcp_path(scope["path"]) or _is_opted_out(scope["path"]):
+            await self.app(scope, receive, send)
+            return
+
+        response_started = False
+
+        async def _send(message: MutableMapping[str, Any]) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        started_at = time.monotonic()
+        # Armed HERE and nowhere deeper: this middleware sits OUTSIDE
+        # SlowAPI's ``BaseHTTPMiddleware``, which runs the rest of the app in
+        # a separate task. A recorder created below that split would be bound
+        # in a context copy this frame never sees. See ``request_phase``.
+        phases, phase_token = request_phase.begin(self.timeout_seconds)
+        try:
+            async with asyncio.timeout(self.timeout_seconds):
+                await self.app(scope, receive, _send)
+        except TimeoutError:
+            elapsed = round(time.monotonic() - started_at, 3)
+            attribution = phases.snapshot()
+            # Structured, not interpolated. The 2026-09-17 incident was
+            # triaged from a log line that carried the path and nothing
+            # else, so "which route, how long, how often" could not be
+            # aggregated without grepping free text.
+            logger.warning(
+                "request exceeded budget",
+                extra={
+                    "budget_seconds": self.timeout_seconds,
+                    "elapsed_seconds": elapsed,
+                    "method": scope.get("method", "?"),
+                    "path": scope["path"],
+                    # The one field that turns this line from "a request on
+                    # /search was slow" into "the embedding hop was slow".
+                    # Flat and top-level so it is groupable in the log
+                    # backend without unpacking a nested object.
+                    "phase": attribution["phase"],
+                    "phases_cancelled": attribution["phases_cancelled"],
+                    "phases_completed": attribution["phases_completed"],
+                },
+            )
+            if response_started:
+                # Headers already sent; synthesizing a 504 here would leave
+                # the response body half-written. Let the ASGI server drop
+                # the connection via normal cancellation propagation.
+                raise
+            payload = make_error_payload(
+                REQUEST_BUDGET_EXCEEDED,
+                (
+                    f"Request exceeded the {self.timeout_seconds}s server budget and was "
+                    f"cancelled"
+                    + (f" while running {attribution['phase']}" if attribution["phase"] else "")
+                    + ". No upstream reported a failure — this deadline is ours. "
+                    "Retry; if it recurs on the same route, the handler is the slow part."
+                ),
+                details={
+                    "budget_seconds": self.timeout_seconds,
+                    "elapsed_seconds": elapsed,
+                    "path": scope["path"],
+                    # Attribution, not decoration: without it a stalled
+                    # embedding provider and a stalled storage read are the
+                    # same 504, and the only lead an operator has is the
+                    # wall-clock number that every one of them shares.
+                    **attribution,
+                },
+            )
+            body = json.dumps(payload).encode()
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 504,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                        # Same contract as the per-tenant 429 (D14): a
+                        # response that says "retry" must say how soon.
+                        # 1s matches that path's granularity; the budget
+                        # itself is in ``details`` for a caller that wants
+                        # to back off against the real number.
+                        (b"retry-after", b"1"),
+                    ],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": body,
+                    "more_body": False,
+                }
+            )
+        finally:
+            request_phase.end(phase_token)

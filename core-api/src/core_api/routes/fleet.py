@@ -1,0 +1,1520 @@
+"""Fleet heartbeat and command channel — replaces WebSocket/SSH gateway model."""
+
+import asyncio
+import json
+import logging
+import re
+import time
+import weakref
+from collections.abc import MutableMapping
+from datetime import UTC, datetime, timedelta
+from uuid import UUID
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field, field_validator
+
+logger = logging.getLogger(__name__)
+
+from common.constants import NODE_PRINCIPAL_TENANT
+from common.env_utils import read_int_env
+from core_api import errors
+from core_api import openapi_responses as _oar
+from core_api.agent_ids import canonical_service_agent_id
+from core_api.auth import AuthContext, get_auth_context
+from core_api.clients.storage_client import get_storage_client
+from core_api.constants import NODE_OFFLINE_SECONDS, NODE_STALE_SECONDS
+from core_api.errors import coded_detail
+from core_api.schemas import STRICT_WRITE_BODY, TenantScopedBody
+from core_api.services.audit_service import log_action
+from core_api.services.organization_settings import get_raw_settings
+from core_api.version_compat import (
+    MIN_AUTO_DEPLOY_PLUGIN_VERSION,
+    MIN_RECOMMENDED_PLUGIN_VERSION,
+    is_plugin_outdated,
+)
+
+# Dedup for the outdated-plugin warning. ``heartbeat`` runs on every plugin
+# tick (~every 20-60s per node), so a node stuck on an old plugin emits this
+# WARNING thousands of times a day (prod 2026-07: 3 internal nodes produced
+# 6.3k lines/day, one node ~every 20s). Log at most once per (node, version)
+# per hour so the fleet-health signal survives without drowning real warnings.
+# Keyed on (node, version) so a version change re-logs promptly. Per-instance
+# (module-level, not shared across Cloud Run instances), so worst case is one
+# line per instance per node per hour — still orders of magnitude below one
+# per tick. Bounded + oldest-evicted so churn in node names can't grow it.
+_OUTDATED_PLUGIN_LOG_TTL = 3600.0
+_OUTDATED_PLUGIN_LOG_MAX = 5000
+_outdated_plugin_logged: dict[tuple[str, str], float] = {}
+
+# Concurrent agent upserts per WORKER PROCESS, shared by every heartbeat that
+# process is serving (OSS 08/14 L-36). Read through ``read_int_env`` for the
+# reason ``lifecycle`` documents at length: ``core_api.app`` imports this
+# module unconditionally, so a mistyped value raising at import time would
+# stop every route serving — and the helper's ``minimum`` floor of 1 keeps a
+# stray ``0`` from becoming ``Semaphore(0)``, which is already locked and
+# would park every heartbeat forever with no error and no timeout.
+#
+# Sized against core-storage-api's pool, not against this endpoint's traffic:
+# ``db_pool_size=5`` + ``db_max_overflow=5`` is TEN connections, and each
+# upsert is a ``GET /agents/{id}`` plus a conditional POST that draw from
+# those same ten — there is no reader/writer split, so a refresh competes
+# with live writes for the same slots.
+#
+# WHAT THIS DOES NOT DO, same caveat ``lifecycle`` spells out: the cap is per
+# worker PROCESS, not deployment-wide. Both services run ``--workers 2`` and
+# core-api scales horizontally, so the real ceiling against storage is
+# ``instances x workers x`` this number. It is strictly better than the
+# per-request budget it replaces, which bounded nothing even within a worker,
+# but the honest headline is "predictable per worker".
+#
+# It is also tenant-BLIND. One tenant reporting many agents can hold every
+# slot and delay another tenant's heartbeat on that worker.
+# ``per_tenant_storage_slot`` is the repo's mechanism for that, and it is not
+# a substitute here: it queues unboundedly per ``(scope, tenant)``, so N
+# tenants give N x cap and the aggregate — the thing this exists to bound —
+# is unbounded again. A per-tenant SHARE of this budget is the real fix and
+# is a follow-up, not a one-line swap.
+_HEARTBEAT_AGENT_CONCURRENCY: int = read_int_env("FLEET_HEARTBEAT_AGENT_CONCURRENCY", 8)
+
+# The per-request ceiling, and it is what makes the budget above safe to
+# share. A shared budget with no bound on the work one caller may enqueue is
+# not a cap — it is a queue, and this endpoint is the highest-frequency call
+# the API takes. ``HeartbeatIn.agents`` is ``list | None``: untyped,
+# caller-supplied and unbounded, with no rate limit and no per-tenant slot on
+# the route. One node reporting 10,000 agents would hold the process's slots
+# for as long as it took to drain them and stall every other node's heartbeat
+# on that worker — turning a fan-out that only ever slowed ITSELF into one
+# that slows its neighbours.
+#
+# Truncating (rather than rejecting) follows the contract this path already
+# states below: the node and command channel is what the heartbeat promises,
+# while the agent-row refresh is best-effort observability. A 422 would fail
+# the part that matters to protect the part that does not. The overflow is
+# logged, so a deployment that genuinely needs more than this raises the knob
+# instead of discovering the gap in the UI.
+_HEARTBEAT_AGENT_MAX: int = read_int_env("FLEET_HEARTBEAT_AGENT_MAX", 200)
+
+# Keyed by running loop rather than a bare module-level ``Semaphore``, for the
+# reason ``lifecycle._FANOUT_SEMAPHORES`` records: a Semaphore binds to the
+# first loop that awaits it, so a plain global raises "bound to a different
+# event loop" in any suite that runs more than one. WeakKeyDictionary so a
+# finished loop's entry is collected with it.
+_HEARTBEAT_AGENT_SEMAPHORES: MutableMapping[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _heartbeat_agent_semaphore() -> asyncio.Semaphore:
+    """Return this process's shared agent-upsert budget for the running loop."""
+    loop = asyncio.get_running_loop()
+    sem = _HEARTBEAT_AGENT_SEMAPHORES.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(_HEARTBEAT_AGENT_CONCURRENCY)
+        _HEARTBEAT_AGENT_SEMAPHORES[loop] = sem
+    return sem
+
+
+def _should_log_outdated_plugin(node: str, version: str) -> bool:
+    """True at most once per (node, version) per ``_OUTDATED_PLUGIN_LOG_TTL``."""
+    now = time.monotonic()
+    key = (node, version)
+    last = _outdated_plugin_logged.get(key)
+    if last is not None and now - last < _OUTDATED_PLUGIN_LOG_TTL:
+        return False
+    if key not in _outdated_plugin_logged and len(_outdated_plugin_logged) >= _OUTDATED_PLUGIN_LOG_MAX:
+        _outdated_plugin_logged.pop(next(iter(_outdated_plugin_logged)))
+    _outdated_plugin_logged[key] = now
+    return True
+
+
+# How long an ``acked`` deploy command counts as "in flight" before the
+# auto-upgrade gate allows queueing another. CAURA-000: customer prod
+# accumulated 1,381 stuck-acked deploys at a 60s/queue cadence because
+# the pending-only gate was blind to in-flight commands. A typical deploy
+# completes in <2 min (build ~30s + restart ~10s + plugin re-init ~5s);
+# 10 min is generous slack that still recovers genuinely-abandoned
+# commands without needing operator intervention.
+DEPLOY_IN_FLIGHT_WINDOW = timedelta(minutes=10)
+
+# CAURA-000: per-(node, target_version) auto-upgrade attempt budget.
+# The in-flight window above only suppresses concurrent storms; it does
+# nothing to stop a node being re-queued every heartbeat (~60s) forever
+# when it never converges to the target. That happens for failure modes
+# the plugin can't self-detect (persistent /plugin-source fetch errors,
+# unsafe-filename manifest aborts) and — most insidiously — when a deploy
+# "succeeds" but the served manifest version sits below MIN_RECOMMENDED,
+# so every attempt reports success, clears the plugin's cooldown, and
+# still never advances the version. After AUTO_UPGRADE_MAX_ATTEMPTS
+# deploys for the same target within AUTO_UPGRADE_ATTEMPT_WINDOW the gate
+# stops queuing and logs a warning for operator follow-up.
+#
+# A healthy upgrade converges in ONE attempt — the next heartbeat reports
+# the new version and the gate exits at the ``_semver_lt`` check before
+# this budget is ever consulted — so the budget is invisible to
+# legitimate upgrades. 5 attempts absorbs transient flakiness (a one-off
+# network blip on /plugin-source, a transient build OOM) while capping a
+# true wedge at 5 deploys/day instead of ~1,440.
+AUTO_UPGRADE_ATTEMPT_WINDOW = timedelta(hours=24)
+AUTO_UPGRADE_MAX_ATTEMPTS = 5
+
+router = APIRouter(tags=["Fleet"])
+
+
+def _agent_principal(agent_id: str) -> str:
+    return f"agent:{canonical_service_agent_id(agent_id)}"
+
+
+def _install_principal(install_uuid: str) -> str:
+    return f"install:{install_uuid}"
+
+
+def _node_principal(auth: AuthContext) -> str | None:
+    """The credential a node this request acts as must be bound to (M-85).
+
+    Narrow only where the gateway established it: an install credential, or an
+    agent key whose identity the gateway injected (``agent_id_verified``). An
+    ``X-Agent-ID`` the caller asserted itself, on the shared-key and standalone
+    paths, binds nothing, because that caller could as easily assert any other.
+    Every such credential is tenant-wide, as is every tenant, user and admin one,
+    and gets None: it acts as any node of its tenant.
+
+    An install credential with no install UUID is refused (403). The gateway
+    sends the UUID with the credential kind, so this is a broken contract rather
+    than a real install, and a shared placeholder such as ``install:unknown``
+    would let every such credential act as each other's nodes.
+    """
+    if auth.is_install_credential:
+        if not auth.install_uuid:
+            raise HTTPException(
+                status_code=403,
+                detail=coded_detail(
+                    errors.AUTH_INSTALL_UUID_MISSING,
+                    "This install credential carries no install UUID, so it cannot act as a fleet node.",
+                ),
+            )
+        return _install_principal(auth.install_uuid)
+    if auth.agent_id and auth.agent_id_verified:
+        return _agent_principal(auth.agent_id)
+    return None
+
+
+# ── Schemas ──
+
+
+class FleetCreateIn(TenantScopedBody):
+    model_config = STRICT_WRITE_BODY
+
+    fleet_id: str  # alphanumeric + hyphens, 3-50 chars
+    display_name: str | None = None
+    description: str | None = None
+
+    # A field validator, so a malformed id is the 422 every malformed body gets.
+    # As a bare classmethod called from the handler, its ValueError reached the
+    # catch-all handler as a 500 (M-31).
+    @field_validator("fleet_id")
+    @classmethod
+    def validate_fleet_id(cls, v: str) -> str:
+        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9\-]{1,48}[a-zA-Z0-9]$", v):
+            raise ValueError(
+                "fleet_id must be 3-50 chars, alphanumeric + hyphens, no leading/trailing hyphens"
+            )
+        return v
+
+
+def _cap_agent_list(v: list | None) -> list | None:
+    """Bound the reported agent list without failing the heartbeat.
+
+    Same posture as ``_cap_or_drop`` below and for the same 2026-06-28 reason
+    — degrade, never 422, because a rejected heartbeat takes the node's
+    registration and command channel with it. Different mechanism, though: a
+    marker dict would erase every agent, so this truncates and keeps the
+    prefix.
+
+    At the MODEL rather than in the handler because ``agents`` is written
+    wholesale to ``nodes.agents_json`` and read back out to the fleet view.
+    Bounding only the work list would leave the row and the API response
+    unbounded — the very growth the sibling caps exist to stop. One bound
+    here covers the storage fan-out, the node row and the response together.
+
+    Not a strict element type: ``HeartbeatIn`` is deliberately permissive
+    (SAFE-01 below) because there is no plugin/backend version handshake. A
+    length bound does not break that; a typed element would.
+    """
+    if v is not None and len(v) > _HEARTBEAT_AGENT_MAX:
+        logger.warning(
+            "fleet.heartbeat: %d agents reported (> %d cap) — refreshing the first "
+            "%d and dropping the rest for this tick",
+            len(v),
+            _HEARTBEAT_AGENT_MAX,
+            _HEARTBEAT_AGENT_MAX,
+        )
+        return v[:_HEARTBEAT_AGENT_MAX]
+    return v
+
+
+def _cap_or_drop(v: dict | None, limit: int, field: str) -> dict | None:
+    """Cap an OPTIONAL observability blob without failing the whole heartbeat.
+
+    ``recall_metrics`` / ``reconcile`` are best-effort observability. A
+    ``field_validator`` that *raises* on an oversized value fails the entire
+    request model → 422 → the node's registration AND command channel are
+    dropped over one bloated optional field (eToro 2026-06-28: a node with a
+    large skill catalog 422'd every heartbeat, going stale + uncommandable).
+    Degrade gracefully instead: replace the oversized blob with a small marker
+    so the load-bearing heartbeat still lands; only the detailed snapshot is
+    lost for that tick. Still bounds ``nodes.metadata`` growth.
+    """
+    if v is not None:
+        size = len(json.dumps(v))
+        if size > limit:
+            logger.warning(
+                "fleet.heartbeat: %s is %d bytes (> %d cap) — dropping field, keeping heartbeat",
+                field,
+                size,
+                limit,
+            )
+            return {"_truncated": True, "_original_bytes": size}
+    return v
+
+
+class HeartbeatIn(TenantScopedBody):
+    # DELIBERATELY PERMISSIVE (SAFE-01), even though this IS a write. Two
+    # reasons, both specific to this endpoint:
+    #
+    # 1. Nothing a caller owns is lost. The body is node telemetry the plugin
+    #    reports about itself. An unknown key here costs an observability field,
+    #    not a memory — the data-loss the SAFE-01 fix exists to stop.
+    # 2. A 422 costs far more than the field would. There is NO version
+    #    handshake between plugin and backend (RELEASING.md § Compatibility):
+    #    installs in the field roll forward on their own cadence, and the
+    #    command channel rides the heartbeat RESPONSE. Rejecting the request
+    #    over an unrecognised key would take the node offline in fleet views
+    #    AND cut its command channel — including the deploy command that would
+    #    have upgraded it. Unrecoverable without a manual touch on every node.
+    #
+    # This model already declares every field the current plugin sends, and it
+    # caps the two free-form blobs by DROPPING them rather than rejecting (see
+    # the validators below) — the same fail-soft posture as this config.
+    node_name: str
+    fleet_id: str | None = None
+    hostname: str | None = None
+    ip: str | None = None
+    openclaw_version: str | None = None
+    plugin_version: str | None = None
+    plugin_hash: str | None = None
+    os_info: str | None = None
+    agents: list | None = None
+    tools: list | None = None
+    channels: list | None = None
+    metadata: dict | None = None
+    # ``install_id`` is the per-OpenClaw-install opaque suffix the plugin
+    # generates once at first heartbeat and persists locally. Used to
+    # disambiguate the default ``"main"`` agent across fleet installs
+    # so memories from different machines stop colliding on a single
+    # ``(tenant_id, agent_id="main")`` row. Optional — older plugin
+    # versions don't send it.
+    #
+    # ``max_length=32`` matches the ``agents.install_id`` column
+    # (``String(32)``); without this Pydantic constraint, an oversized
+    # value silently 422s at the storage layer in a per-agent
+    # exception handler that swallows the failure, leaving the row
+    # without an ``install_id`` and recreating the very collision
+    # this feature exists to fix. Reject at the API boundary instead.
+    install_id: str | None = Field(None, max_length=32)
+    # CAURA-444: rolling counters from the plugin's recall-policy gate
+    # (context-engine.ts:getRecallMetrics). Reset on plugin restart;
+    # latest snapshot is stored on the node row for SQL aggregation.
+    recall_metrics: dict | None = None
+    # CAURA-444: epoch-ms cooldown signal. When set and in the future,
+    # the auto-upgrade trigger SKIPS queueing further deploy commands
+    # for this node — the plugin is signalling it knows it's in a
+    # broken-deploy state and another deploy would just loop.
+    #
+    # ``ge=1`` rejects 0 and negative values at the API boundary. The
+    # auto-upgrade gate already filters them out via the
+    # ``> now_ms`` check, but they'd still land in
+    # ``nodes.metadata.deploy_blocked_until`` and mislead operators
+    # reading the column (e.g. "blocked since 1970?"). Fail-loud here
+    # instead.
+    deploy_blocked_until: int | None = Field(None, ge=1)
+    # Skill-reconcile observability: the plugin's latest
+    # ``reconcileSkills()`` summary — ``installed`` (the active skills
+    # converged onto this node's disk), per-tick ``added``/``removed``
+    # deltas, ``skipped`` (bad-shape catalog rows), ``protected``, and
+    # ``catalogCount``. Stored as the newest snapshot on the node row
+    # (``nodes.metadata.reconcile``) so an operator can confirm an
+    # approved/active skill actually landed on the fleet. Optional —
+    # older plugin versions don't send it.
+    reconcile: dict | None = None
+
+    @field_validator("agents")
+    @classmethod
+    def _cap_agents(cls, v: list | None) -> list | None:
+        # Anti-ballooning cap on the one free-form field that had none. Unlike
+        # its two siblings this truncates rather than dropping, because an
+        # empty marker would lose every agent instead of the overflow.
+        return _cap_agent_list(v)
+
+    @field_validator("recall_metrics")
+    @classmethod
+    def _cap_recall_metrics(cls, v: dict | None) -> dict | None:
+        # Anti-ballooning cap on an OPTIONAL observability blob. Drop (not
+        # reject) when oversized so a bloated counter blob can't 422 the whole
+        # heartbeat. getRecallMetrics() is well under 1 KB normally; 4 KB cap.
+        return _cap_or_drop(v, 4096, "recall_metrics")
+
+    @field_validator("reconcile")
+    @classmethod
+    def _cap_reconcile(cls, v: dict | None) -> dict | None:
+        # Anti-ballooning cap on an OPTIONAL observability blob. Drop (not
+        # reject) when oversized — see _cap_or_drop. A summary is normally a
+        # handful of slug lists; 8 KB cap.
+        return _cap_or_drop(v, 8192, "reconcile")
+
+
+class CommandIn(BaseModel):
+    model_config = STRICT_WRITE_BODY
+
+    tenant_id: str | None = None
+    node_id: UUID
+    command: str
+    payload: dict | None = None
+
+
+class CommandResultIn(BaseModel):
+    # DELIBERATELY PERMISSIVE (SAFE-01) — the command-ack path, same reasoning
+    # as ``HeartbeatIn`` above: plugin-produced, no version handshake, and a 422
+    # would strand the command as permanently un-acked in the backend rather
+    # than surfacing anything a caller could act on.
+    status: str  # done | failed
+    result: dict | None = None
+
+
+# ── Fleet CRUD ──
+
+
+@router.post(
+    "/fleet",
+    status_code=201,
+    responses={201: {"model": _oar.FleetCreateResponse}},
+)
+async def create_fleet(
+    body: FleetCreateIn,
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Explicitly create a fleet (team) within a tenant."""
+    auth.enforce_read_only()
+    auth.enforce_usage_limits()
+    auth.enforce_tenant(body.tenant_id)
+
+    sc = get_storage_client()
+
+    # Check if fleet already exists
+    if await sc.fleet_exists(body.tenant_id, body.fleet_id):
+        raise HTTPException(status_code=409, detail=f"Fleet '{body.fleet_id}' already exists")
+
+    # Create a sentinel node to register the fleet
+    await sc.upsert_node(
+        {
+            "tenant_id": body.tenant_id,
+            "node_name": f"_fleet_{body.fleet_id}",
+            "fleet_id": body.fleet_id,
+            "metadata": {
+                "display_name": body.display_name,
+                "description": body.description,
+                "sentinel": True,
+            },
+            "last_heartbeat": datetime.now(UTC).isoformat(),
+        }
+    )
+    await log_action(
+        tenant_id=body.tenant_id,
+        action="create",
+        resource_type="fleet",
+        detail={"fleet_id": body.fleet_id, "display_name": body.display_name},
+    )
+    return {"ok": True, "fleet_id": body.fleet_id, "tenant_id": body.tenant_id}
+
+
+@router.get("/fleet", responses={200: {"model": list[_oar.FleetListItem]}})
+async def list_fleets(
+    tenant_id: str = Query(...),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """List distinct fleets for a tenant with node counts."""
+    auth.enforce_tenant(tenant_id)
+
+    sc = get_storage_client()
+    rows = await sc.list_fleets(tenant_id)
+    now = datetime.now(UTC)
+    return [
+        {
+            "fleet_id": r.get("fleet_id"),
+            "node_count": int(r.get("node_count", 0)),
+            "last_heartbeat": r.get("last_heartbeat"),
+            "status": "online"
+            if r.get("last_heartbeat") and _age_seconds(r.get("last_heartbeat"), now) < NODE_OFFLINE_SECONDS
+            else "offline",
+        }
+        for r in rows
+    ]
+
+
+@router.delete("/fleet/{fleet_id}", status_code=204)
+async def delete_fleet(
+    fleet_id: str,
+    tenant_id: str = Query(...),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Delete a fleet and all its nodes. Memories are NOT deleted (they retain fleet_id for history).
+
+    Auth: a write-capable tenant-owner key. Agent-scoped credentials are
+    blocked (BFLA) — fleet lifecycle is admin-plane, the same call the sibling
+    ``POST /fleet/{fleet_id}/purge`` makes.
+
+    Why it is needed rather than implied: ``fleet_id`` is not bound to the
+    caller's scope, and ``enforce_tenant`` only compares tenants. So without
+    this an agent-scoped key — scoped to one agent in one fleet, never to the
+    tenant — could delete ANY fleet in its tenant, taking every node row and
+    every command row belonging to those nodes (completed history included,
+    since the delete is not filtered by status).
+    """
+    auth.enforce_read_only()
+    auth.enforce_tenant(tenant_id)
+    auth.enforce_not_agent_credential("delete a fleet")
+
+    sc = get_storage_client()
+
+    # Count nodes to delete
+    node_count = await sc.count_nodes(tenant_id=tenant_id, fleet_id=fleet_id)
+    if node_count == 0:
+        raise HTTPException(status_code=404, detail=f"Fleet '{fleet_id}' not found")
+
+    # Delete all commands for fleet nodes, then delete nodes
+    await sc.delete_fleet(tenant_id=tenant_id, fleet_id=fleet_id)
+    await log_action(
+        tenant_id=tenant_id,
+        action="delete",
+        resource_type="fleet",
+        detail={"fleet_id": fleet_id, "nodes_deleted": node_count},
+    )
+
+
+@router.post("/fleet/{fleet_id}/purge", responses={200: {"model": _oar.FleetPurgeResponse}})
+async def purge_fleet(
+    fleet_id: str,
+    tenant_id: str = Query(...),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Permanently purge a fleet's entire footprint within a tenant.
+
+    Unlike ``DELETE /fleet/{fleet_id}`` (which removes only the fleet's nodes +
+    commands and intentionally keeps memories for history), this HARD-deletes
+    everything scoped to ``(tenant_id, fleet_id)``: memories, entities,
+    relations, agents, documents, analysis/dedup rows, nodes, and commands.
+    Irreversible. Returns the per-table deleted counts.
+
+    Intended for test-tenant hygiene: the OpenClaw fleet-tester purges its
+    run-scoped ``nightly-<run_id>-fleet-NN`` fleets at teardown so the shared
+    dev tenant doesn't accumulate run data that confounds isolation/trust tests.
+
+    Auth: a write-capable tenant-owner key. Agent-scoped credentials are
+    blocked (BFLA) — a hard fleet purge is an admin-plane operation, on par
+    with bulk memory delete and agent deletion. Idempotent.
+    """
+    auth.enforce_read_only()
+    auth.enforce_tenant(tenant_id)
+    auth.enforce_not_agent_credential("purge fleet data")
+
+    sc = get_storage_client()
+    counts = await sc.purge_fleet_data(tenant_id, fleet_id)
+    await log_action(
+        tenant_id=tenant_id,
+        action="purge",
+        resource_type="fleet",
+        detail={"fleet_id": fleet_id, "deleted": counts},
+    )
+    return {"ok": True, "tenant_id": tenant_id, "fleet_id": fleet_id, "deleted": counts}
+
+
+# ── Heartbeat ──
+
+
+# CAURA-444 — plugin auto-upgrade. Versions whose deploy machinery is
+# itself broken; we never queue auto-deploy for these because the plugin
+# would loop or land in a partially-deployed state. Each entry comes off
+# the list once every node in the wild has been manually upgraded past it.
+#
+# 2.3.0: hardcoded srcFiles list drifted from backend (15 vs 22 files);
+#        prebuild references a monorepo path missing on flat installs,
+#        so version.ts is never refreshed and PLUGIN_VERSION reports
+#        stale.
+KNOWN_BROKEN_DEPLOY_VERSIONS: frozenset[str] = frozenset({"2.3.0"})
+
+# Cap how far into the future a node can defer its own auto-upgrade.
+# Pre-cap a misbehaving / malicious plugin could send
+# ``deploy_blocked_until = Number.MAX_SAFE_INTEGER`` and DoS its own
+# upgrade path indefinitely. 7 days is comfortably above the longest
+# ``CAURA_DEPLOY_FAILURE_COOLDOWN_HOURS`` an operator would set.
+MAX_BLOCK_MS: int = 7 * 24 * 3600 * 1000
+
+
+def _semver_lt(a: str | None, b: str | None) -> bool:
+    """``a < b`` for plain dotted-int versions. Returns False if either
+    side is unparseable so we never queue a deploy on a version we
+    don't understand.
+    """
+    if not a or not b:
+        return False
+    try:
+        a_parts = [int(x) for x in a.split(".") if x]
+        b_parts = [int(x) for x in b.split(".") if x]
+        # Pure-separator strings like "..." filter to an empty list. After
+        # zero-padding they would look like [0, 0, 0] and falsely test
+        # "older than" any real version — triggering a spurious auto-upgrade.
+        # Treat any side with no numeric components as "unknown", not "0".
+        if not a_parts or not b_parts:
+            return False
+        # Pad to the same length with zeros so "2.4" < "2.4.1".
+        n = max(len(a_parts), len(b_parts))
+        a_parts += [0] * (n - len(a_parts))
+        b_parts += [0] * (n - len(b_parts))
+        return a_parts < b_parts
+    except ValueError:
+        return False
+
+
+async def _auto_upgrade_enabled_for_tenant(tenant_id: str) -> bool:
+    """Default true; per-tenant flip via
+    the legacy plugin auto-upgrade setting set to ``false``.
+    """
+    try:
+        raw = await get_raw_settings(tenant_id)
+        flag = raw.get("memclaw", {}).get("auto_upgrade_enabled")  # legacy-name-floor: floor
+        # None (no override) → use the global default (true).
+        return flag is not False
+    except Exception:
+        # Fail-open on settings-resolve errors so a misconfigured tenant
+        # doesn't permanently lose auto-upgrade. The cooldown machinery
+        # on the plugin side prevents loops in the worst case.
+        # Log the failure so chronic settings-resolve breakage is
+        # observable rather than silently masked.
+        logger.warning(
+            "fleet.heartbeat: failed to resolve auto_upgrade_enabled for tenant=%s",
+            tenant_id,
+            exc_info=True,
+        )
+        return True
+
+
+def _has_recent_deploy_command_from_list(pending: list) -> bool:
+    """True if the pending-commands list already contains a ``deploy``.
+    Sync helper — operates on an already-fetched list rather than
+    issuing its own storage call. The heartbeat handler fetches
+    ``pending`` exactly once and threads it through to
+    ``_maybe_queue_auto_upgrade``; without this split, the same
+    ``get_pending_commands`` round-trip fired twice per heartbeat
+    (once for the auto-upgrade gate, once for the response payload).
+
+    The list is already node-scoped at the call site (the storage
+    query takes the node name), so we don't re-filter by node here.
+
+    ``isinstance(c, dict)`` (not ``(c or {})``) guards against truthy
+    non-dict list elements — strings, numbers, etc. would have made
+    the pre-fix ``(c or {}).get(...)`` raise ``AttributeError`` because
+    ``c or {}`` returns ``c`` when ``c`` is truthy, and only dicts have
+    ``.get``. A storage backend bug returning unexpected types should
+    fail-closed (skip the gate) rather than crash the heartbeat.
+    """
+    return any(isinstance(c, dict) and c.get("command") == "deploy" for c in pending or [])
+
+
+async def _maybe_queue_auto_upgrade(
+    *,
+    sc,
+    body: "HeartbeatIn",
+    pending_commands: list,
+    node_id: str,
+) -> bool:
+    """If the node is on an older plugin version and the tenant has
+    auto-upgrade enabled, queue a ``deploy`` command. Multiple skip
+    conditions for safety:
+
+    - missing or unparseable plugin_version
+    - plugin_version >= MIN_RECOMMENDED_PLUGIN_VERSION (no upgrade needed)
+    - plugin_version < MIN_AUTO_DEPLOY_PLUGIN_VERSION (pre-manifest-aware;
+      old client can't fetch new files, so auto-deploy would leave it
+      partially upgraded and unable to load)
+    - plugin_version is in KNOWN_BROKEN_DEPLOY_VERSIONS
+    - node has signalled cooldown via ``deploy_blocked_until``
+    - tenant has explicitly disabled auto-upgrade
+    - a deploy command is already pending for this node
+
+    ``pending_commands`` is the heartbeat handler's already-fetched
+    list of unacked commands for this node — passed in so we avoid a
+    redundant ``get_pending_commands`` round-trip.
+
+    Returns True iff a new ``deploy`` command was successfully created
+    (so the caller can re-fetch + return it in the same heartbeat).
+    """
+    # Plugin release cadence is independent of the backend's ``VERSION``
+    # (CAURA-000 / PR #131). Auto-upgrade target is ``MIN_RECOMMENDED_PLUGIN_VERSION``
+    # — the operator-curated floor in ``core_api.version_compat`` which is
+    # bumped on each plugin release. Comparing against backend ``VERSION``
+    # (pre-merge behaviour) would queue spurious deploys whenever the backend
+    # released ahead of the plugin (or block real upgrades when the plugin
+    # released ahead of the backend).
+    target_version = MIN_RECOMMENDED_PLUGIN_VERSION
+    if not body.plugin_version:
+        return False
+    if not _semver_lt(body.plugin_version, target_version):
+        return False
+    # Pre-manifest-aware floor — old clients fetch source from their own
+    # hardcoded list and silently miss files added in later releases,
+    # which leaves dist/ importing modules that aren't on disk. Same
+    # recovery as KNOWN_BROKEN_DEPLOY_VERSIONS: manual re-install via
+    # ``/api/v1/install-plugin``.
+    if _semver_lt(body.plugin_version, MIN_AUTO_DEPLOY_PLUGIN_VERSION):
+        logger.info(
+            "fleet.heartbeat: skipping auto-upgrade for node=%s on "
+            "pre-manifest-aware version %s (manual re-install required; "
+            "floor=%s)",
+            body.node_name,
+            body.plugin_version,
+            MIN_AUTO_DEPLOY_PLUGIN_VERSION,
+        )
+        return False
+    if body.plugin_version in KNOWN_BROKEN_DEPLOY_VERSIONS:
+        logger.info(
+            "fleet.heartbeat: skipping auto-upgrade for node=%s on "
+            "broken-deploy version %s (manual re-install required)",
+            body.node_name,
+            body.plugin_version,
+        )
+        return False
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    if (
+        body.deploy_blocked_until
+        and body.deploy_blocked_until > now_ms
+        and body.deploy_blocked_until < now_ms + MAX_BLOCK_MS
+    ):
+        return False
+    if not await _auto_upgrade_enabled_for_tenant(body.tenant_id):
+        return False
+    if _has_recent_deploy_command_from_list(pending_commands):
+        return False
+    # CAURA-000: defence against ``acked``-then-stuck queue runaway.
+    # The pending-only list above is blind to commands the heartbeat
+    # handler has already shipped to the plugin (status: ``acked``).
+    # If a previous deploy is still in flight — OR was killed mid-
+    # result-POST by its own systemctl restart — queueing another
+    # one creates the 60s SIGTERM cycle observed on customer prod.
+    # The repo lookup is gated behind the cheaper checks above so we
+    # only pay for the DB roundtrip when an auto-upgrade is actually
+    # eligible. Falls back to ALLOW on error so a transient DB hiccup
+    # doesn't break the upgrade path entirely (the pending check above
+    # is already a safety net).
+    try:
+        in_flight = await sc.fleet_in_flight_deploy(
+            node_id=UUID(node_id),
+            tenant_id=body.tenant_id,
+            since=datetime.now(UTC) - DEPLOY_IN_FLIGHT_WINDOW,
+        )
+    except Exception:
+        logger.warning(
+            "fleet.heartbeat: has_recent_in_flight_deploy lookup failed "
+            "node=%s tenant=%s — falling back to allow (pending check "
+            "above still gates)",
+            body.node_name,
+            body.tenant_id,
+            exc_info=True,
+        )
+        in_flight = False
+    if in_flight:
+        logger.info(
+            "fleet.heartbeat: skipping auto-upgrade for node=%s — a "
+            "deploy is already in flight within the last %s",
+            body.node_name,
+            DEPLOY_IN_FLIGHT_WINDOW,
+        )
+        return False
+    # CAURA-000: attempt budget — stop re-queuing against a node that
+    # never converges to the target. See AUTO_UPGRADE_MAX_ATTEMPTS for
+    # the full rationale. Placed after the cheaper in-flight check so
+    # the count query only runs on the rare
+    # outdated-eligible-and-not-in-flight path. Fail-open on DB error,
+    # consistent with the in-flight check above: a transient hiccup must
+    # not permanently wedge a legitimate upgrade.
+    try:
+        recent_attempts = await sc.fleet_deploy_attempt_count(
+            node_id=UUID(node_id),
+            tenant_id=body.tenant_id,
+            target_version=target_version,
+            since=datetime.now(UTC) - AUTO_UPGRADE_ATTEMPT_WINDOW,
+        )
+    except Exception:
+        logger.warning(
+            "fleet.heartbeat: count_recent_deploys_for_target lookup failed "
+            "node=%s tenant=%s — falling back to allow",
+            body.node_name,
+            body.tenant_id,
+            exc_info=True,
+        )
+        recent_attempts = 0
+    if recent_attempts >= AUTO_UPGRADE_MAX_ATTEMPTS:
+        logger.warning(
+            "fleet.heartbeat: auto-upgrade budget exhausted for node=%s "
+            "target=%s (%d attempts in %s) — not re-queuing. Node is not "
+            "converging to the target version; manual intervention likely "
+            "required (check the node's deploy command results and plugin "
+            "logs).",
+            body.node_name,
+            target_version,
+            recent_attempts,
+            AUTO_UPGRADE_ATTEMPT_WINDOW,
+        )
+        return False
+
+    try:
+        await sc.create_command(
+            {
+                "tenant_id": body.tenant_id,
+                # Storage expects ``node_id`` (UUID, FK to fleet_nodes.id),
+                # not ``node_name``. Pre-fix this call passed ``node_name``,
+                # which ``_filter_fields`` silently dropped (not a FleetCommand
+                # column), leaving ``node_id`` NULL and tripping the NOT NULL
+                # constraint at INSERT time — every auto-upgrade attempt 500'd
+                # silently on the storage round-trip.
+                "node_id": node_id,
+                "command": "deploy",
+                # Plugin re-fetches the canonical file list via
+                # /plugin-manifest; payload only carries the target
+                # version for logging / cooldown bookkeeping.
+                "payload": {"target_version": target_version},
+            }
+        )
+        logger.info(
+            "fleet.heartbeat: auto-upgrade queued for node=%s tenant=%s (%s -> %s)",
+            body.node_name,
+            body.tenant_id,
+            body.plugin_version,
+            target_version,
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            "fleet.heartbeat: failed to queue auto-upgrade for node=%s: %s",
+            body.node_name,
+            e,
+        )
+        return False
+
+
+@router.post("/fleet/heartbeat", responses={200: {"model": _oar.HeartbeatResponse}})
+async def heartbeat(
+    body: HeartbeatIn,
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Plugin pushes status; receives pending commands in response."""
+    # The heartbeat is a WRITE, despite reading like telemetry, and it was
+    # the only mutating route in this module without the gate — its five
+    # siblings (create/delete/purge fleet, create_command, command_result)
+    # all have it. What it mutates:
+    #
+    #   - ``upsert_node`` replaces the node row (hostname, versions, the
+    #     whole metadata blob);
+    #   - ``get_or_create_agent`` materialises agent rows per heartbeat;
+    #   - ``_maybe_queue_auto_upgrade`` can queue a deploy command;
+    #   - ``ack_commands`` DRAINS the node's pending queue and returns the
+    #     payloads in the response.
+    #
+    # That last one is why this is not merely an unwanted write. A
+    # read-only or demo credential naming an existing node could claim
+    # that node's queued commands — receiving payloads meant for it, and
+    # leaving nothing for the real node to collect, since acked commands
+    # are not redelivered. One request, unrecoverable: an operator sees a
+    # dispatched command that was acknowledged and never ran.
+    #
+    # Gate order matches the siblings (``create_fleet``,
+    # ``create_command``): the credential's own capability is judged
+    # first, then the target tenant. Nothing here depends on the order —
+    # ``enforce_read_only`` reads only the caller's own credential — so
+    # consistency is the whole argument.
+    #
+    # ``enforce_usage_limits`` is deliberately NOT added, though the
+    # write-shaped siblings carry it. This call recurs every ~60s from
+    # every node and is how a node stays live and commandable; gating it
+    # on plan limits would take a tenant that merely exceeded its quota
+    # and make its entire fleet go stale and uncommandable — including
+    # the commands an operator would use to reduce usage. ``create_command``
+    # sets the same precedent on this path: read-only gate, no usage gate.
+    auth.enforce_read_only()
+    auth.enforce_tenant(body.tenant_id)
+
+    if is_plugin_outdated(body.plugin_version) and _should_log_outdated_plugin(
+        body.node_name or "", body.plugin_version or ""
+    ):
+        logger.warning(
+            "outdated plugin heartbeat",
+            extra={
+                "node": body.node_name,
+                "plugin_version": body.plugin_version,
+                "min_recommended": MIN_RECOMMENDED_PLUGIN_VERSION,
+            },
+        )
+
+    now = datetime.now(UTC)
+    sc = get_storage_client()
+
+    # Merge CAURA-444 metrics (recall counters + cooldown signal) into
+    # the existing metadata JSONB blob rather than introducing new
+    # columns. This keeps the storage schema unchanged while still
+    # exposing the data via the existing /fleet/nodes endpoint and
+    # ad-hoc SQL on `nodes.metadata`.
+    merged_metadata: dict | None = body.metadata
+    if body.recall_metrics is not None or body.deploy_blocked_until is not None or body.reconcile is not None:
+        merged_metadata = dict(merged_metadata or {})
+        if body.recall_metrics is not None:
+            merged_metadata["recall_metrics"] = body.recall_metrics
+        if body.reconcile is not None:
+            # Latest snapshot wins — overwrites the prior tick's summary
+            # so nodes.metadata.reconcile always reflects the current
+            # on-disk skill state, not an accumulation.
+            merged_metadata["reconcile"] = body.reconcile
+        if body.deploy_blocked_until is not None:
+            # Mirror the gate's MAX_BLOCK_MS cap at write time. The gate
+            # already ignores beyond-cap values (treats them as if the
+            # cooldown weren't set), so persisting them would only
+            # mislead operators reading nodes.metadata ("blocked until
+            # year 5138?"). Storing only what the gate honors keeps the
+            # column truthful.
+            _now_ms = int(datetime.now(UTC).timestamp() * 1000)
+            # Also reject already-expired timestamps. The gate above only
+            # honours ``deploy_blocked_until > now_ms``, so persisting a
+            # past value would leak into ``nodes.metadata`` and mislead
+            # operators inspecting the column (the "blocked until last
+            # week?" trap). Symmetric with the gate's lower bound.
+            if _now_ms < body.deploy_blocked_until <= _now_ms + MAX_BLOCK_MS:
+                merged_metadata["deploy_blocked_until"] = body.deploy_blocked_until
+
+    # The node is bound to the credential that heartbeats it (M-85). Keyed on
+    # ``node_name`` alone, this let any write credential in the tenant name
+    # another node and drain its queue, including deploy payloads an agent
+    # credential may not queue itself. Now a narrow credential acts only as a node
+    # bound to it; a tenant-wide one still acts as any node of its tenant, and
+    # takes back a node a narrow credential bound first. Storage decides and
+    # binds in the same statement, so nothing below runs for a refused caller.
+    try:
+        node = await sc.upsert_node(
+            {
+                "tenant_id": body.tenant_id,
+                "node_name": body.node_name,
+                "fleet_id": body.fleet_id,
+                "hostname": body.hostname,
+                "ip": body.ip,
+                "openclaw_version": body.openclaw_version,
+                "plugin_version": body.plugin_version,
+                "plugin_hash": body.plugin_hash,
+                "os_info": body.os_info,
+                "agents_json": body.agents,
+                "tools_json": body.tools,
+                "channels_json": body.channels,
+                "metadata": merged_metadata,
+                "last_heartbeat": now.isoformat(),
+                "owner_principal": _node_principal(auth) or NODE_PRINCIPAL_TENANT,
+            }
+        )
+    except httpx.HTTPStatusError as exc:
+        # Storage refuses with a 409, which ``upstream_http_error_handler``
+        # would surface as a 500, so it is carried across here as
+        # ``create_command`` carries its 404.
+        if exc.response.status_code != 409:
+            raise
+        raise HTTPException(
+            status_code=403,
+            detail=coded_detail(
+                errors.AUTH_FLEET_NODE_BOUND,
+                f"Node '{body.node_name}' is bound to another credential.",
+                remediation=(
+                    "Send this node's heartbeats with the credential it is bound to, or "
+                    "have a tenant credential bind it to this one with "
+                    "POST /api/v1/fleet/nodes/{node_id}/release?bind_agent_id=... "
+                    "(or bind_install_uuid=...)."
+                ),
+                node_name=body.node_name,
+            ),
+        ) from exc
+
+    # Materialise / refresh per-agent rows on every heartbeat so the
+    # admin UI sees agents the moment they appear (not only after their
+    # first write) and ``display_name`` tracks the current hostname when
+    # operators rename their machines. Old plugin versions that don't
+    # send ``display_name`` / ``install_id`` simply pass NULL — the
+    # diff-merge in ``get_or_create_agent`` only overwrites when the
+    # value is not None, so prior data is preserved.
+    #
+    # ``get_or_create_agent`` (rather than a direct
+    # ``sc.create_or_update_agent``) is load-bearing here: it does
+    # ``GET /agents/{id}`` first and only POSTs an update when the diff
+    # is non-empty, so a steady fleet costs one read per agent per tick
+    # instead of a write. It is NOT still needed to dodge a 500 — an
+    # earlier version of this comment said the bare POST hit an
+    # ``IntegrityError`` → ``rollback()`` → re-SELECT path whose
+    # mid-session rollback closed the outer transaction. ``agent_add``
+    # was since rewritten to ``INSERT ... ON CONFLICT DO NOTHING
+    # RETURNING`` with a same-session re-SELECT precisely to remove that
+    # pattern, and its docstring says so. The read-first shape is an
+    # optimisation now, not a workaround.
+    #
+    # It is NOT what makes the concurrent fan-out below safe — read-then-write
+    # is itself racy, and two callers can both miss the GET and both POST.
+    # What makes that safe is the storage side: ``ON CONFLICT DO NOTHING``
+    # plus the ``with_for_update`` re-SELECT. The fan-out is safe despite the
+    # read-first shape, not because of it.
+    if body.agents:
+        from core_api.services.agent_service import get_or_create_agent
+
+        # Parse and de-duplicate BEFORE fanning out. Sequentially, a key
+        # repeated in one payload was harmless — the second pass saw the row
+        # the first had just written. Concurrently it would be two in-flight
+        # upserts of the same row, racing for a slot each and serialising on
+        # the same ``with_for_update`` re-SELECT at the far end.
+        #
+        # A later entry wins, but only when it actually carries a name. Plain
+        # last-wins would silently differ from the loop this replaces:
+        # ``get_or_create_agent`` refreshes ``display_name`` only when the
+        # argument is not None, so for ``[{a, "box"}, {a}]`` the sequential
+        # pass applied "box" and the bare repeat left it alone. Collapsing to
+        # the last value would hand it None and drop the name.
+        wanted: dict[str, str | None] = {}
+        for a in body.agents:
+            if not isinstance(a, dict):
+                continue
+            agent_key = a.get("agentId") or a.get("agent_id")
+            if not agent_key:
+                continue
+            # Bound ``display_name`` at the API boundary. Storage column
+            # is ``Text`` (unlimited) and ``CAURA_DISPLAY_NAME_OVERRIDE``
+            # passes verbatim from the plugin, so a hostile or buggy
+            # client could push an oversized blob into audit logs and UI
+            # rendering. 255 chars is comfortably above any real
+            # hostname-derived label.
+            raw_dn = a.get("display_name") or a.get("displayName")
+            display_name = raw_dn[:255] if isinstance(raw_dn, str) else None
+            key = str(agent_key)
+            wanted[key] = display_name if display_name is not None else wanted.get(key)
+
+        # The upserts are independent storage round-trips that used to be
+        # awaited one at a time, so a node reporting 40 agents paid 40
+        # sequential round-trips on the highest-frequency call the API takes.
+        # ``_heartbeat_agent_semaphore`` is where the budget's scope and
+        # sizing are argued.
+        #
+        # Per-agent isolation is unchanged: each task keeps its own
+        # try/except, so one bad agent still cannot drop the heartbeat or its
+        # neighbours.
+        sem = _heartbeat_agent_semaphore()
+
+        async def _upsert(agent_key: str, display_name: str | None) -> str | None:
+            """Refresh one agent row. Returns its key on failure, else None."""
+            # ``try`` OUTSIDE ``async with`` deliberately: the semaphore is
+            # released by ``__aexit__`` as the exception unwinds, before this
+            # handler runs, so the traceback is formatted off the budget.
+            # ``exc_info=True`` is ~110x the cost of the same call without it
+            # (measured 465us vs 4.2us) and formats synchronously on the event
+            # loop; inside the slot, a storage outage at the cap would hold
+            # budget for ~93ms of pure formatting per heartbeat, on the
+            # highest-frequency endpoint, from every node, every tick.
+            try:
+                async with sem:
+                    await get_or_create_agent(
+                        tenant_id=body.tenant_id,
+                        agent_id=agent_key,
+                        fleet_id=body.fleet_id,
+                        display_name=display_name,
+                        install_id=body.install_id,
+                    )
+            except Exception:
+                # A single agent upsert failure mustn't drop the heartbeat
+                # — the node + commands path is the contract; the row
+                # refresh is best-effort observability.
+                logger.warning(
+                    "fleet.heartbeat: agent upsert failed for agent_id=%s in tenant=%s",
+                    agent_key,
+                    body.tenant_id,
+                    exc_info=True,
+                )
+                return agent_key
+            return None
+
+        results = await asyncio.gather(*(_upsert(key, name) for key, name in wanted.items()))
+        failed_agents: list[str] = [key for key in results if key is not None]
+
+        # Summary log so the committed audit trail is recoverable: the
+        # individual per-agent warnings above are stack-traced but not
+        # easy to correlate; this single line tells the on-call exactly
+        # how many agents in the batch failed and which ones, with the
+        # tenant pivot for dashboard filters.
+        #
+        # Denominator is what was ATTEMPTED, not ``len(body.agents)``: after
+        # de-duplication and the cap those differ, and a ratio against the raw
+        # payload would read as a partial failure on a tick where every upsert
+        # that ran succeeded.
+        if failed_agents:
+            logger.warning(
+                "fleet.heartbeat: agent upsert failed for %d/%d agents in tenant=%s: %s",
+                len(failed_agents),
+                len(wanted),
+                body.tenant_id,
+                failed_agents,
+            )
+
+    node_id = node.get("id", "")
+    node_name = node.get("node_name", body.node_name)
+
+    # Fetch pending commands ONCE. Used twice: (a) by the auto-upgrade
+    # gate to skip queueing if a deploy is already in-flight, and (b)
+    # returned to the caller in the response payload. Pre-refactor
+    # these were two separate ``get_pending_commands`` round-trips per
+    # heartbeat (CAURA-444 review feedback).
+    try:
+        pending = await sc.get_pending_commands(body.tenant_id, node_name)
+    except Exception:
+        # Same fail-loud-but-continue posture as the prior dedicated
+        # helper. Log so a chronic storage outage on this path is
+        # observable; treat as "no pending commands" so the rest of
+        # the heartbeat still completes (and the auto-upgrade gate
+        # below sees no in-flight deploy → may queue one).
+        logger.warning(
+            "fleet.heartbeat: failed to fetch pending commands node=%s tenant=%s",
+            node_name,
+            body.tenant_id,
+            exc_info=True,
+        )
+        pending = []
+
+    # CAURA-444: opportunistic auto-upgrade. Compares incoming
+    # plugin_version to MIN_RECOMMENDED_PLUGIN_VERSION and queues a deploy
+    # command when behind. Reads ``pending`` to check for an
+    # in-flight deploy. Multiple guards inside the helper — see
+    # _maybe_queue_auto_upgrade docstring. Returns True iff it queued
+    # a new command; we re-fetch in that case so the response carries
+    # it back to the plugin this heartbeat (instead of waiting 60 s).
+    # ``node`` came from the earlier ``upsert_node`` call and includes the
+    # storage-issued UUID. ``_maybe_queue_auto_upgrade`` needs it because
+    # ``fleet_commands.node_id`` is NOT NULL (FK to ``fleet_nodes.id``); a
+    # ``node_name``-only insert silently drops to None via ``_filter_fields``
+    # and 500s at the DB layer. Skip the queue (gracefully) if the upsert
+    # somehow didn't return an id — we'd rather miss one auto-upgrade tick
+    # than crash the heartbeat handler.
+    node_id_for_queue = node.get("id") if isinstance(node, dict) else None
+    if node_id_for_queue:
+        queued_new = await _maybe_queue_auto_upgrade(
+            sc=sc, body=body, pending_commands=pending, node_id=str(node_id_for_queue)
+        )
+    else:
+        queued_new = False
+    if queued_new:
+        try:
+            commands = await sc.get_pending_commands(body.tenant_id, node_name)
+        except Exception:
+            logger.warning(
+                "fleet.heartbeat: failed to re-fetch pending commands after "
+                "auto-upgrade queue node=%s tenant=%s",
+                node_name,
+                body.tenant_id,
+                exc_info=True,
+            )
+            commands = pending  # fall back to pre-queue list
+    else:
+        commands = pending
+
+    if commands:
+        await sc.ack_commands([c.get("id") for c in commands], body.tenant_id)
+
+    return {
+        "ok": True,
+        "node_id": str(node_id),
+        "commands": [
+            {
+                "id": str(c.get("id", "")),
+                "command": c.get("command"),
+                "payload": c.get("payload"),
+            }
+            for c in commands
+        ],
+    }
+
+
+# ── Command result ──
+
+
+@router.post(
+    "/fleet/commands/{command_id}/result",
+    responses={200: {"model": _oar.OkResponse}},
+)
+async def command_result(
+    command_id: UUID,
+    body: CommandResultIn,
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Plugin reports command completion."""
+    auth.enforce_read_only()
+    sc = get_storage_client()
+    # Tenant-scope the update: keying on command_id alone would let any
+    # authenticated tenant complete another tenant's command by UUID
+    # (cross-tenant BOLA). ``auth.tenant_id`` is None only for admin
+    # credentials, which legitimately operate unscoped.
+    #
+    # M-85 — and a narrow credential reports only on its own node's commands,
+    # the node-side half of the binding the heartbeat applies. Another node's
+    # command is the same 404 as one that does not exist.
+    updated = await sc.update_command_status(
+        str(command_id),
+        {
+            "tenant_id": auth.tenant_id,
+            "owner_principal": _node_principal(auth),
+            "status": body.status,
+            "result": body.result,
+            "completed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    if not updated or not updated.get("ok", False):
+        raise HTTPException(status_code=404, detail="Command not found")
+    return {"ok": True}
+
+
+# ── Fleet nodes (frontend reads) ──
+
+
+@router.get("/fleet/nodes", responses={200: {"model": list[_oar.FleetNode]}})
+async def list_nodes(
+    tenant_id: str = Query(...),
+    fleet_id: str | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """List fleet nodes for a tenant with computed status."""
+    auth.enforce_tenant(tenant_id)
+
+    sc = get_storage_client()
+    nodes = await sc.list_nodes(tenant_id, fleet_id=fleet_id)
+    now = datetime.now(UTC)
+
+    out = []
+    for n in nodes:
+        hb = n.get("last_heartbeat")
+        age = _age_seconds(hb, now) if hb else 999999
+        if age > NODE_OFFLINE_SECONDS:
+            status = "offline"
+        elif age > NODE_STALE_SECONDS:
+            status = "stale"
+        else:
+            status = "online"
+
+        out.append(
+            {
+                "node_id": str(n.get("id", "")),
+                "node_name": n.get("node_name"),
+                "fleet_id": n.get("fleet_id"),
+                "hostname": n.get("hostname"),
+                "ip": n.get("ip"),
+                "openclaw_version": n.get("openclaw_version"),
+                "plugin_version": n.get("plugin_version"),
+                "plugin_hash": n.get("plugin_hash"),
+                "os_info": n.get("os_info"),
+                "status": status,
+                "agents": n.get("agents_json"),
+                "tools": n.get("tools_json"),
+                "channels": n.get("channels_json"),
+                # Storage serialises the JSONB column under its ORM
+                # attribute name ``extra`` (the column is ``metadata`` but
+                # the model maps it to ``extra`` to avoid shadowing
+                # SQLAlchemy's ``MetaData``). The storage field list emits
+                # ``extra``, so reading ``"metadata"`` here always yielded
+                # ``None`` — node metadata (recall_metrics,
+                # deploy_blocked_until, and the reconcile summary) never
+                # surfaced through this endpoint. Read ``extra`` (with a
+                # ``metadata`` fallback in case a future serializer renames
+                # it back).
+                "metadata": n.get("extra", n.get("metadata")),
+                "last_heartbeat": n.get("last_heartbeat"),
+                "created_at": n.get("created_at"),
+            }
+        )
+
+    return out
+
+
+@router.post("/fleet/nodes/{node_id}/release", responses={200: {"model": _oar.OkResponse}})
+async def release_node(
+    node_id: UUID,
+    tenant_id: str = Query(...),
+    bind_agent_id: str | None = Query(default=None),
+    bind_install_uuid: str | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Release a node from the credential it is bound to (M-85).
+
+    This is how a node moves to a new narrow credential: bound to one, it
+    refuses every other, including the one an operator just rotated it to. Name
+    the new credential with ``bind_agent_id`` or ``bind_install_uuid`` and the
+    node is bound to it at once, so no other credential can claim it in
+    between. Bare, the node is left unbound and its next heartbeat binds it to
+    whichever credential sends it first.
+
+    Auth: a write-capable tenant credential. Agent and install credentials are
+    refused, since releasing a node is how one would take it from its owner.
+    """
+    auth.enforce_read_only()
+    auth.enforce_tenant(tenant_id)
+    auth.enforce_not_agent_credential("release a fleet node")
+    if auth.is_install_credential:
+        raise HTTPException(
+            status_code=403,
+            detail=coded_detail(
+                errors.AUTH_AGENT_CREDENTIAL_FORBIDDEN,
+                "Install credentials cannot release a fleet node; use a tenant credential.",
+                action="release a fleet node",
+            ),
+        )
+
+    if bind_agent_id and bind_install_uuid:
+        raise HTTPException(
+            status_code=422, detail="Name at most one of bind_agent_id and bind_install_uuid."
+        )
+    owner_principal: str | None = None
+    if bind_agent_id:
+        owner_principal = _agent_principal(bind_agent_id)
+    elif bind_install_uuid:
+        owner_principal = _install_principal(bind_install_uuid)
+
+    if not await get_storage_client().release_node(tenant_id, str(node_id), owner_principal):
+        raise HTTPException(status_code=404, detail="Node not found")
+    await log_action(
+        tenant_id=tenant_id,
+        action="release",
+        resource_type="fleet_node",
+        resource_id=str(node_id),
+        detail={"bound_to": owner_principal},
+    )
+    return {"ok": True}
+
+
+# ── Fleet & agent stats ──
+
+
+@router.get("/fleet/stats", responses={200: {"model": _oar.FleetStatsResponse}})
+async def fleet_stats(
+    tenant_id: str = Query(...),
+    fleet_id: str | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Per-agent and fleet-level memory stats for the Fleet UI."""
+    auth.enforce_tenant(tenant_id)
+    sc = get_storage_client()
+    return await sc.fleet_stats(tenant_id, fleet_id)
+
+
+# ── Queue command (frontend posts) ──
+
+
+# ── Code-delivery guard ──
+#
+# ``deploy`` / ``update_plugin`` with a ``source`` payload is remote code
+# execution on the node by design: the plugin writes the source over its own
+# tree, builds it and restarts (``plugin/src/deploy.ts``). Commands are not yet
+# signed (see ``create_command``), so until they are, the route is the only
+# gate. Two rules close the widest part of it:
+#
+# * Custom ``source`` comes only from an org admin (dashboard admin session,
+#   operator admin key, or a standalone install, whose caller is the admin).
+#   A tenant API key handed to software can still queue a source-less deploy,
+#   which makes the node fetch the canonical source from this server.
+# * ``env_vars`` may not rewrite where the node sends its key, the key itself,
+#   or the switches that keep it safe (TLS, signed commands). The plugin
+#   refuses the same keys (``REMOTE_ENV_DENYLIST`` in ``plugin/src/deploy.ts``).
+_CODE_DELIVERY_COMMANDS = frozenset({"deploy", "update_plugin"})
+_REMOTE_ENV_DENYLIST_SUFFIXES = (
+    "_API_URL",
+    "_API_KEY",
+    "_API_PREFIX",
+    "_KEY_TRANSPORT",
+    "_TENANT_ID",
+    "_ALLOW_INSECURE_HTTP",
+    "_REQUIRE_SIGNED_COMMANDS",
+    "_TASK_DB_PATH",
+)
+
+
+def _denied_env_keys(env_vars: object) -> list[str]:
+    if not isinstance(env_vars, dict):
+        return []
+    return sorted(
+        k
+        for k in env_vars
+        if isinstance(k, str)
+        and k.upper().startswith(("CAURA_", "MEMCLAW_"))  # legacy-name-ok: rule 3 dual-read alias
+        and k.upper().endswith(_REMOTE_ENV_DENYLIST_SUFFIXES)
+    )
+
+
+def _enforce_code_delivery_policy(body: "CommandIn", auth: AuthContext) -> None:
+    if body.command not in _CODE_DELIVERY_COMMANDS:
+        return
+    payload = body.payload or {}
+    if payload.get("source") is not None and not auth.is_org_admin:
+        raise HTTPException(
+            status_code=403,
+            detail=coded_detail(
+                errors.AUTH_ORG_ADMIN_REQUIRED,
+                "Deploying custom plugin source requires an org admin.",
+                remediation=(
+                    "Queue the deploy without 'source' to roll out this server's "
+                    "plugin, or send it from an org-admin session."
+                ),
+            ),
+        )
+    denied = _denied_env_keys(payload.get("env_vars"))
+    if denied:
+        raise HTTPException(
+            status_code=422,
+            detail=f"env_vars may not set: {', '.join(denied)}",
+        )
+
+
+@router.post(
+    "/fleet/commands",
+    status_code=201,
+    responses={201: {"model": _oar.CommandCreateResponse}},
+)
+async def create_command(
+    body: CommandIn,
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Queue a command for a fleet node.
+
+    Auth: a write-capable tenant-owner key. Agent-scoped credentials are
+    blocked (BFLA) — dispatching to a node is admin-plane, the same call
+    ``DELETE /fleet/{fleet_id}`` and ``POST /fleet/{fleet_id}/purge`` make.
+    """
+    # Queueing a command is a write, and the tenant it lands in comes from the
+    # REQUEST BODY. All three gates are required, and the order matters: resolve
+    # the target tenant first, then enforce against the resolved value.
+    #
+    # Without ``enforce_tenant`` any authenticated caller could set
+    # ``body.tenant_id`` to a victim tenant and queue commands into their fleet
+    # — the GET sibling immediately below has always enforced this, so the write
+    # was the weaker of the pair. Without ``enforce_read_only`` a
+    # capabilities={'read'} credential could do the same.
+    #
+    # Neither of those constrains an agent-scoped credential naming its OWN
+    # tenant, and ``body.node_id`` is not bound to the caller's scope —
+    # ``GET /fleet/nodes`` hands out every node id in the tenant behind
+    # ``enforce_tenant`` alone. What lands on the node is not abstract: a
+    # ``deploy``/``update_plugin`` payload carrying ``source`` takes the plugin
+    # down ``deployPlugin`` (``plugin/src/deploy.ts``), which writes it over the
+    # plugin's own source tree, merges ``env_vars`` into its ``.env`` for any
+    # key with the plugin env prefix — ``CAURA_API_URL`` and ``CAURA_API_KEY``
+    # included — and builds; the caller's code goes live on the gateway restart
+    # that same branch then asks for (``plugin/src/heartbeat.ts``). So an
+    # agent-scoped key that cannot raise its own trust_level
+    # (``PATCH /agents/{id}/trust`` refuses it) could instead run code on the
+    # host answering for it.
+    #
+    # The plugin's HMAC check is not a second line of defence: nothing in
+    # core-api or core-storage-api ever puts a ``signature`` on a command — the
+    # heartbeat response above emits ``id``/``command``/``payload`` and no more
+    # — so every command arrives unsigned, which the plugin accepts by default.
+    #
+    # No internal producer loses a channel: both bypass this route. The
+    # auto-upgrade calls ``sc.create_command`` from inside the heartbeat
+    # handler, and the interview scheduler does the same behind
+    # ``enforce_admin`` on ``POST /admin/interview/schedule/run``.
+    auth.enforce_read_only()
+    tenant_id = body.tenant_id or auth.tenant_id
+    auth.enforce_tenant(tenant_id)
+    auth.enforce_not_agent_credential("queue fleet commands")
+    _enforce_code_delivery_policy(body, auth)
+
+    sc = get_storage_client()
+    try:
+        cmd = await sc.create_command(
+            {
+                "tenant_id": tenant_id,
+                "node_id": str(body.node_id),
+                "command": body.command,
+                "payload": body.payload,
+            }
+        )
+    except httpx.HTTPStatusError as exc:
+        # Storage refuses a node that isn't this tenant's (and one that doesn't
+        # exist) with a 404. ``upstream_http_error_handler`` deliberately
+        # re-raises upstream 4xx, which would surface that as a 500, so the
+        # status has to be carried across here.
+        if exc.response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Node not found") from exc
+        raise
+    return {"id": str(cmd.get("id", "")), "status": cmd.get("status", "pending")}
+
+
+# ── Command history ──
+
+
+@router.get("/fleet/commands", responses={200: {"model": list[_oar.FleetCommand]}})
+async def list_commands(
+    tenant_id: str = Query(...),
+    node_id: UUID | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """List recent commands for a tenant, optionally filtered by node."""
+    auth.enforce_tenant(tenant_id)
+
+    sc = get_storage_client()
+    # OSS 09/02 M-26 — ``node_id`` is forwarded. Both the parameter and this
+    # function's docstring ("optionally filtered by node") promised a filter
+    # that was never applied: every call returned every command in the tenant,
+    # so a caller polling for one node's work saw the whole fleet's.
+    #
+    # M-85 — a narrow credential lists only its own nodes' commands. Their
+    # payloads and results are another node's deploy material, and their ids
+    # are what a result is reported against.
+    commands = await sc.list_commands(
+        tenant_id=tenant_id,
+        node_id=str(node_id) if node_id else None,
+        owner_principal=_node_principal(auth),
+    )
+
+    return [
+        {
+            "id": str(c.get("id", "")),
+            "node_id": str(c.get("node_id", "")),
+            "command": c.get("command"),
+            "payload": c.get("payload"),
+            "status": c.get("status"),
+            "result": c.get("result"),
+            "created_at": c.get("created_at"),
+            "acked_at": c.get("acked_at"),
+            "completed_at": c.get("completed_at"),
+        }
+        for c in commands
+    ]
+
+
+# ── Helpers ──
+
+
+def _age_seconds(timestamp: str | None, now: datetime) -> float:
+    """Compute age in seconds from an ISO timestamp string."""
+    if not timestamp:
+        return 999999
+    try:
+        if isinstance(timestamp, str):
+            dt = datetime.fromisoformat(timestamp)
+        else:
+            dt = timestamp
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return (now - dt).total_seconds()
+    except (ValueError, TypeError):
+        return 999999

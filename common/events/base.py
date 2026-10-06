@@ -1,0 +1,178 @@
+"""Event-bus primitives: event envelope, handler type, ABC for the bus."""
+
+from __future__ import annotations
+
+import uuid
+from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class Event(BaseModel):
+    """Envelope that every message on the bus carries.
+
+    The `payload` is a dict so callers don't need to register pydantic
+    schemas upfront; per-topic schema enforcement can be added later as
+    separate subclasses if we want stricter typing.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    event_id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    event_type: str
+    # Absolute timestamp in UTC — Pub/Sub gives us its own publish time on
+    # the subscriber side too, but keeping this in the envelope keeps
+    # semantics identical across in-process and Pub/Sub backends.
+    occurred_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
+    tenant_id: str | None = None
+    # Correlation id for tracing a single logical operation across services.
+    correlation_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+# A handler is an async callable receiving the full Event envelope. Return
+# value is ignored. What raising costs depends on the backend, and the two
+# differ in a way worth knowing before relying on either:
+#   * Pub/Sub nacks, so the message is redelivered (at-least-once).
+#   * ``InProcessEventBus`` logs and drops it. There is no redelivery and no
+#     dead-letter — the event is gone. This line used to say in-process buses
+#     "re-raise in tests"; no such mechanism has ever existed.
+EventHandler = Callable[[Event], Awaitable[None]]
+
+
+class CircularPublishChainError(RuntimeError):
+    """Raised by `InProcessEventBus.drain()` when `max_rounds` is hit.
+
+    A dedicated subclass (rather than a string-matched generic
+    `RuntimeError`) lets `stop()` distinguish the expected cycle
+    scenario from any other programming error without relying on the
+    message text staying stable.
+    """
+
+
+class PermanentOpError(RuntimeError):
+    """A lifecycle op failed in a way redelivering it cannot fix.
+
+    Raise this instead of a generic exception when the op can tell the fault is
+    not worth retrying — a wiring or shape bug rather than a flaky dependency.
+    The lifecycle runner records the ``failure`` row exactly as it would for any
+    other exception, marks it ``stats={"terminal": True}``, and then ACKS.
+
+    Named to match :class:`common.ranking.errors.PermanentRankError`, which is the
+    same idea one layer over; keeping one word for one concept means a grep for
+    either finds both.
+
+    SCOPE: only ``lifecycle_handlers``' shared runner honours this. Handlers
+    registered directly on the bus (see ``core_worker.consumer``) get no special
+    treatment — neither bus inspects the exception type, so raising it there nacks
+    like anything else. Such a handler owns its own audit row and should write the
+    failure row and return, rather than raise.
+
+    Prefer a plain raise when the op is cheap and idempotent. Suppressing a retry
+    is only worth it where redelivery costs something real; for archive/purge a
+    nack is nearly free, so the extra retry is better than the extra machinery.
+    """
+
+
+class EventBus(ABC):
+    """Abstract event bus. Concrete implementations: `InProcessEventBus`,
+    `PubSubEventBus`.
+
+    Subscribers are registered at *startup*, not per-call — there's no
+    `unsubscribe`. A subscriber registered to a topic gets every event
+    published to it until the process exits.
+    """
+
+    @abstractmethod
+    async def publish(self, topic: str, event: Event) -> None:
+        """Publish *event* to *topic*. Fire-and-forget semantics: returns
+        once the event has been accepted by the transport, not once it
+        has been delivered to every subscriber.
+        """
+
+    @abstractmethod
+    def subscribe(
+        self, topic: str, handler: EventHandler, *, broadcast: bool = False
+    ) -> None:
+        """Register *handler* as a subscriber to *topic*. May be called
+        at startup only — not thread-safe during `publish`.
+
+        **Delivery guarantee**: handlers must be idempotent. The Pub/Sub
+        backend is at-least-once — a message whose ack fails, or whose
+        handler raises, gets redelivered. Use `event.event_id` as a
+        natural dedup key when the operation isn't inherently
+        idempotent.
+
+        ``InProcessEventBus`` is at-MOST-once and cannot be otherwise: it
+        holds events in memory, so a handler that raises, or a process that
+        exits, loses them with nothing to redeliver from. That is the
+        standalone and OSS default. A handler whose work must survive its own
+        failure needs a durable record of its own — the bus will not provide
+        one, whatever it is asked.
+
+        ``broadcast``: when True, *every* subscribing process must receive
+        each event (fan-out), not just one. The default (False) is the
+        work-queue semantics every existing consumer relies on — a shared
+        per-service subscription delivers each message to a single
+        process. Broadcast is for cross-process cache invalidation, where
+        one worker handling the event would leave the others stale. The
+        in-process bus dispatches to all local handlers regardless, so it
+        ignores the flag; the Pub/Sub bus gives broadcast topics a
+        per-process subscription.
+        """
+
+    async def start(self) -> None:
+        """Start any background machinery (subscription listeners, etc.).
+        In-process buses treat this as a no-op. Pub/Sub buses spin up
+        subscriber pull-tasks here so they can receive messages.
+        """
+
+    async def stop(self) -> None:
+        """Drain + shut down. Called on graceful shutdown."""
+
+    async def release_broadcast_subscriptions(self) -> None:
+        """Hand back any per-process broadcast subscriptions. No-op by default.
+
+        Exists on the base class so a shutdown path can call it unconditionally,
+        without knowing which implementation it holds. Only the Pub/Sub bus has
+        anything to release; an in-process bus has no external resource and
+        overriding it would be inventing work.
+
+        Separate from ``stop()`` because it must be runnable FIRST, inside the
+        platform's SIGTERM budget, ahead of teardown that may not finish. See
+        the Pub/Sub implementation for why that ordering is load-bearing.
+        """
+
+    async def stop_consuming(self) -> None:
+        """Take no new deliveries and settle the ones in flight. No-op by default.
+
+        The consuming half of ``stop()``, on the base class for the same reason
+        as ``release_broadcast_subscriptions``: a shutdown path runs it early,
+        so a cancelled handler releases what it holds inside the SIGTERM budget.
+        Publishing keeps working. Only the Pub/Sub bus pulls deliveries; an
+        in-process bus's handlers are tasks its own ``stop()`` drains.
+        """
+
+    @property
+    def is_healthy(self) -> bool:
+        """True when the bus can still deliver events end-to-end.
+
+        Default is True for backends with no external failure modes
+        (``InProcessEventBus`` — handlers run in the same process, so
+        there's no cross-service state to go wrong). The Pub/Sub backend
+        overrides this to flip False when any pull loop has halted on a
+        permanent error (subscription missing, SA permission revoked) —
+        a service's readiness probe should include this check so a
+        misconfigured pod is marked unhealthy instead of silently
+        dropping every inbound event while its HTTP surface stays green.
+
+        NOTE: subclasses with external failure modes MUST override this
+        property. Inheriting the default-True is only correct for bus
+        backends where "delivery" is a synchronous in-process call with
+        no transport between producer and consumer that could fail
+        asymmetrically.
+        """
+        return True

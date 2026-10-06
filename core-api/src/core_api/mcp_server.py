@@ -1,0 +1,4745 @@
+"""MCP (Model Context Protocol) server for Caura.
+
+Exposes Caura tools over Streamable HTTP so any MCP client
+(Claude Desktop, Claude Code, Cursor, etc.) can connect with just a URL + API key.
+
+Mounted onto the main FastAPI app at /mcp.
+"""
+
+import asyncio
+import contextlib
+import contextvars
+import hmac as _hmac
+import json
+import logging
+import re
+import time
+from datetime import datetime as _dt
+from typing import Annotated, Any, cast
+from uuid import UUID, uuid4
+
+import httpx
+from fastapi import HTTPException
+from mcp.server import CacheHint, MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import CallToolResult, TextContent
+from pydantic import Field, ValidationError
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from common import duplicate_memory
+from common.enrichment.constants import SERVER_RESERVED_MEMORY_TYPES
+from core_api import request_phase
+from core_api.agent_ids import (
+    DEFAULT_AGENT_ID,
+    AgentIdentity,
+    canonical_service_agent_id,
+    effective_read_agent_id,
+    effective_write_agent_id,
+)
+from core_api.audit_actor import MCP_SURFACE, actor_detail
+from core_api.auth import get_admin_key
+from core_api.clients.storage_client import KeystoneUpsertPayload, get_storage_client
+from core_api.constants import (
+    DEFAULT_DOC_SEARCH_TOP_K,
+    DEFAULT_SEARCH_TOP_K,
+    EVOLVE_MAX_RELATED_IDS,
+    EVOLVE_OUTCOME_TYPES,
+    INSIGHTS_FOCUS_MODES,
+    KEYSTONES_EMPTY_HINT,
+    MAX_DOC_SEARCH_TOP_K,
+    MAX_QUERY_LENGTH,
+    MAX_SEARCH_TOP_K,
+    MEMORY_STATUSES,
+    MEMORY_TYPES,
+    VALID_SCOPES,
+    VERSION,
+)
+from core_api.errors import (
+    AUTH_ORG_SUSPENDED,
+    AUTH_PLAN_LIMIT,
+    REQUEST_BUDGET_EXCEEDED,
+    code_for_status,
+)
+from core_api.heartbeat.clients import record_mcp as _record_mcp_client
+from core_api.pagination import cursor_sortable, decode_cursor, encode_cursor
+from core_api.schemas import (
+    BulkMemoryCreate,
+    BulkMemoryItem,
+    MemoryCreate,
+    MemoryUpdate,
+    SearchProfileUpdate,
+)
+from core_api.services.agent_service import (
+    authorize_memory_access,
+    broker_owned_agent_id,
+    enforce_delete,
+    enforce_document_overwrite,
+    enforce_fleet_read_many,
+    enforce_fleet_write,
+    lookup_agent,
+    resolve_write_agent,
+)
+
+# Re-export so existing `monkeypatch.setattr(mcp_server, "_resolve_read_fleet_gate", ...)`
+# and direct-call sites in tests keep working; production callers should import
+# ``resolve_read_fleet_gate`` directly from ``core_api.services.agent_service``.
+# The REST read routes (``GET /memories``, ``GET /memories/stats``) call the same
+# shared implementation, so the trust ladder cannot drift between the surfaces.
+from core_api.services.agent_service import resolve_read_fleet_gate as _resolve_read_fleet_gate
+from core_api.services.audit_service import log_action, log_cross_tenant_read
+from core_api.services.capability_usage import record_usage
+from core_api.services.entity_service import get_entity
+from core_api.services.interview_service import refuse_system_collection
+from core_api.services.memory_service import (
+    _memory_to_out,
+    create_memories_bulk,
+    create_memory,
+    search_memories,
+    soft_delete_memory,
+    update_memory,
+)
+
+# Org-settings helpers (Fix 2 Phase 0): these are storage-backed (cache-first)
+# and IGNORE the ``db`` arg — MCP tools that no longer open ``_mcp_session``
+# pass ``None``. ``validate_search_profile`` is a pure validator (no DB). Do NOT
+# re-migrate these here (Ph0 owns them); we only call them.
+from core_api.services.organization_settings import (
+    get_raw_settings,
+    get_settings_for_display,
+    resolve_config,
+    validate_search_profile,
+)
+from core_api.services.recall_service import summarize_memories
+
+# Re-export so existing `monkeypatch.setattr(mcp_server, "_require_trust", ...)`
+# sites in tests keep working; production callers should import ``require_trust``
+# directly from ``core_api.services.trust_service``.
+from core_api.services.trust_service import parse_trust_error
+from core_api.services.trust_service import require_trust as _require_trust
+from core_api.services.usage_service import (
+    MutatingOp,
+    bulk_check_and_increment,
+    charges_write_quota,
+    enforces_mcp_plan_limits,
+    meters_mcp_bulk_write,
+    plan_limit_gated,
+    recall_operation,
+)
+from core_api.services.usage_service import check_and_increment_by_tenant as check_and_increment
+from core_api.trust_utils import (
+    effective_keystone_min_trust,
+    keystone_min_trust,
+    keystone_trust_hint,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ax-0917-m-11. Every MCP response is read by an LLM, not by a person, so the
+# two defaults ``json.dumps`` ships with are both pure cost here.
+#
+# ``indent=2`` spends tokens on whitespace that carries no meaning to the
+# reader. Measured on a 10-item recall payload: 572 -> 462 cl100k tokens, 19%.
+#
+# ``ensure_ascii=True`` is the larger one, and it only bites non-English
+# tenants. It renders every non-ASCII character as ``\uXXXX`` — six ASCII
+# characters where one character was meant — and those escapes tokenise
+# terribly. Measured on Hebrew content: 1,207 -> 422 tokens, 65%.
+#
+# ``doc_indexing._render_value`` already reached the same conclusion for text
+# fed to an embedder and an LLM; this applies it to the transport.
+#
+# Kept as one helper so the compaction cannot drift between call sites — the
+# reason it was inconsistent before is that each site made the choice itself.
+_JSON_COMPACT: dict = {"separators": (",", ":"), "ensure_ascii": False, "default": str}
+
+
+def _dumps(payload) -> str:
+    """Serialise an MCP response body for an LLM consumer."""
+    return json.dumps(payload, **_JSON_COMPACT)
+
+
+# ── Auth via context vars ──
+
+_tenant_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("mcp_tenant_id")
+# Holds the gateway-verified ``X-Agent-ID``, so this ContextVar is the MCP
+# plane's twin of ``AuthContext.agent_id`` and its single construction point
+# for ``AgentIdentity``.
+_agent_id_var: contextvars.ContextVar[AgentIdentity | None] = contextvars.ContextVar(
+    "mcp_agent_id", default=None
+)
+# True iff X-Tenant-ID arrived as a request header (gateway-routed). On that
+# path the gateway is the source of truth for identity; falling back to the
+# literal "mcp-agent" tool-param default would silently attribute every write
+# from a tenant-key holder to a single shared identity (friction §2.8 / Stage 6b).
+_via_gateway_var: contextvars.ContextVar[bool] = contextvars.ContextVar("mcp_via_gateway", default=False)
+# Cross-tenant read set plumbed from X-Readable-Tenant-IDs (CSV). Empty list
+# means single-tenant key (reads pinned to ``_tenant_id_var``). When populated
+# the home tenant_id is the first element and writes still go there.
+_readable_tenant_ids_var: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "mcp_readable_tenant_ids", default=None
+)
+_scopes_var: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar("mcp_scopes", default=None)
+# caura-daemon (broker) identity, plumbed from the gateway on the verified path.
+# X-Caura-Credential-Kind distinguishes ``install_credential`` (broker) from
+# ``user_api_key`` (dashboard/SDK); X-Install-UUID is the broker's install id.
+# Drives the agent-ownership boundary on MCP writes (parity with REST auth).
+_credential_kind_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mcp_credential_kind", default=None
+)
+_install_uuid_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mcp_install_uuid", default=None
+)
+# The person the gateway vouched for (X-User-ID), for audit rows only: the twin
+# of ``AuthContext.user_id``, and set under the same stricter rule.
+_user_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("mcp_user_id", default=None)
+# Plan-limit read-only mode, computed by the platform from the persisted usage
+# counters and stamped as X-Org-Read-Only (see ``usage_service``'s module
+# docstring). REST reads it via ``AuthContext.is_read_only``. This middleware
+# reads it too, as of the commit that introduced this var — BEFORE that it did
+# not, which is the state caura-ai/caura#1205 describes and the reason that
+# issue reads as if the signal were still missing. It never was; the refusal
+# was, and it now exists behind a flag.
+#
+# ENFORCED ONLY WHEN ``enforce_mcp_plan_limits`` IS ON — off by default, in
+# which case ``_check_plan_limit`` logs and lets the write through exactly as
+# before. See that function and the setting's comment for why the capability is
+# available without being automatic.
+_org_read_only_var: contextvars.ContextVar[bool] = contextvars.ContextVar("mcp_org_read_only", default=False)
+# Set when the platform could not DETERMINE the read-only verdict, as opposed
+# to determining it is false. ``/_auth`` fails open on its own storage lookup,
+# which is correct for an auth path and wrong for a measurement one: the
+# observation that feeds the enforce_mcp_plan_limits decision cannot tell a
+# tenant who is under their limit from one nobody could look up. See
+# ``_check_plan_limit``.
+_org_read_only_unknown_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "mcp_org_read_only_unknown", default=False
+)
+
+_UNAUTH = "__unauthenticated__"
+_ADMIN = "__admin__"
+_NO_AUTH = "__no_auth__"
+_DEFAULT_AGENT_ID = DEFAULT_AGENT_ID
+
+# The most consequential parameter on the tool surface: it decides which agent
+# a write is attributed to, and which rows an agent-scoped read can see. All
+# ten tools documented it as "Caller agent." - two words - while defaulting to
+# a value the hosted gateway path actively REFUSES
+# (``_refuse_default_agent_on_gateway``). So the schema advertised a default
+# that cannot be used where most callers run, and said nothing about what to
+# send instead. An agent reading the tool list had no way to learn that.
+#
+# The DEFAULT itself is deliberately unchanged. "mcp-agent" is a legitimate
+# standalone identity by design (see ``core_api.agent_ids``); removing it would
+# break every single-tenant caller and change the schema for all of them. What
+# changes is that the schema now tells the truth about when it applies.
+#
+# Kept deliberately short. tools/list is re-sent on every agent session, so
+# this text is paid ten times per call; the first draft was three times this
+# length and pushed the surface 498 tokens over the ceiling in
+# tests/test_mcp_token_budget.py. +117 is the price of the three facts that
+# matter: what it attributes, what it filters, and that hosted needs a real one.
+_AGENT_ID_DESC = (
+    "Agent this call is attributed to; agent-scoped reads filter by it. Hosted callers must pass a real one."
+)
+
+
+def _error_response(code: str, message: str, **details) -> str:
+    """Return the canonical MCP error envelope as a JSON string.
+
+    Shape matches the REST surface (see ``core_api.errors.make_error_payload``):
+    ``{"error": {"code": "...", "message": "...", "details": {...}}}``.
+
+    The string is wrapped into a ``CallToolResult(isError=True)`` before
+    leaving the tool — either by ``_with_latency`` (which detects the
+    error shape) or by ``_as_error_result`` for pre-tool returns that
+    skip the latency stamp. Tool callsites keep returning plain strings;
+    the wrap happens at one of those two chokepoints (CAURA-000,
+    FRICTION-REPORT-V3 B2 — clients literal-reading the MCP spec were
+    seeing ``isError=False`` on every gateway-side refusal).
+    """
+    from core_api.errors import make_error_payload
+
+    payload = make_error_payload(code, message, details=details if details else None)
+    return _dumps(payload)
+
+
+def _as_error_result(envelope: str) -> CallToolResult:
+    """Wrap a ``_error_response`` JSON envelope into a CallToolResult
+    with ``isError=True``. The envelope JSON is preserved verbatim in
+    a single TextContent so callers reading ``result.content[0].text``
+    still get the structured payload. Used for the pre-tool / auth
+    return paths that don't run through ``_with_latency``.
+    """
+    return CallToolResult(
+        content=[TextContent(type="text", text=envelope)],
+        is_error=True,
+    )
+
+
+# Pre-tool auth errors (returned directly, NOT through _with_latency, because
+# they fire before any tool work has begun, so we wrap them as
+# CallToolResults at module load — every tool that returns one
+# propagates ``isError=True`` to the MCP client.
+_AUTH_ERROR = _as_error_result(
+    _error_response(
+        "UNAUTHORIZED",
+        "Missing or invalid X-API-Key header. Provide a tenant-scoped API key.",
+    )
+)
+_ADMIN_ERROR = _as_error_result(
+    _error_response(
+        "FORBIDDEN",
+        "Admin/system keys cannot be used with MCP. Use a tenant-scoped API key.",
+    )
+)
+
+# Every value that occupies ``_tenant_id_var`` WITHOUT being a tenant. The one
+# consumer (``_refuse_if_suppressed``) was written enumerating two of the
+# three, which is how a suppression lookup for a tenant that cannot exist got
+# onto the no-key path.
+#
+# ``_check_auth`` below is the SECOND enumeration of this roster and
+# deliberately does not use the set — it has to tell the sentinels apart to
+# pick an error, and it must keep NAMING ``_AUTH_ERROR`` / ``_ADMIN_ERROR``,
+# because ``tests/_error_codes.py`` resolves a tool's reachable error codes by
+# the module-level constants a function mentions. Collapsing it to a lookup
+# keyed on this dict hid ``UNAUTHORIZED``/``FORBIDDEN`` from that scan and took
+# ``test_tool_error_codes_inventory`` down with it — 12 specs' published codes
+# rest on that scan seeing them. The two lists are tied together by
+# ``test_every_sentinel_is_refused`` instead, which is the cheaper half of the
+# trade: a sentinel missing from ``_check_auth`` falls through to
+# ``return None``, i.e. auth PASSES, which is far worse than the wasted lookup
+# fixed here.
+#
+# (``core_api.services.capability_usage._NON_TENANT`` holds the same three plus
+# ``""``, spelled as literals; it cannot import them from here without a cycle,
+# and is cross-referenced there instead.)
+_SENTINEL_TENANTS = frozenset({_UNAUTH, _ADMIN, _NO_AUTH})
+
+
+async def _send_error(send: Send, status: int, code: str, message: str) -> None:
+    """End the request here with a JSON error envelope, before the MCP app.
+
+    The middleware runs ahead of the tool layer, so it cannot return a tool
+    envelope; it writes the ASGI response itself.
+    """
+    body = _error_response(code, message).encode()
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
+
+
+async def _send_401(send: Send, message: str) -> None:
+    """Refuse an unauthenticated request outright.
+
+    Refusing beats falling through to ``_UNAUTH``: a request that keeps going
+    with a different identity resolution lets a caller probe which headers
+    change the answer.
+    """
+    await _send_error(send, 401, "UNAUTHORIZED", message)
+
+
+async def _refuse_if_suppressed(send: Send, tenant_id: str, readable: list[str] | None) -> bool:
+    """403 a soft-deleted org's request. Returns True when it refused.
+
+    The MCP twin of REST's ``auth._block_if_suppressed`` (CAURA-694). It lives
+    in the middleware rather than in each tool for the same reason REST puts it
+    in ``get_auth_context``: every surface is then covered by construction, and
+    a tool added later cannot forget it. Without it a soft-deleted org kept full
+    MCP read AND write while REST 403'd the same credential — the gap was not
+    that MCP refused differently, it was that MCP never asked.
+
+    ``_SENTINEL_TENANTS`` is skipped deliberately. ``_ADMIN`` is the operator
+    key, which REST also exempts (its ``tenant_id`` is None there, so the guard
+    returns early); ``_UNAUTH`` and ``_NO_AUTH`` have no tenant to look up and
+    are refused by ``_check_auth`` on their own terms.
+
+    Readable tenants are checked too, mirroring
+    ``_block_if_any_readable_suppressed``: a multi-tenant credential whose
+    readable set spans a suppressed org would otherwise pass a home-only check.
+
+    ``is_tenant_suppressed`` caches for 30s and fails OPEN on a storage error,
+    both by design — see :mod:`core_api.suppression`. That posture is inherited
+    here rather than re-decided.
+    """
+    from core_api.suppression import is_tenant_suppressed
+
+    candidates = [tenant_id] + [t for t in (readable or []) if t and t != tenant_id]
+    for candidate in candidates:
+        if candidate in _SENTINEL_TENANTS:
+            continue
+        if await is_tenant_suppressed(candidate):
+            await _send_error(
+                send,
+                403,
+                AUTH_ORG_SUSPENDED,
+                # Same generic wording as REST, for the same reason: naming
+                # "soft-deleted" leaks org lifecycle state to a partner whose
+                # key was provisioned under that org.
+                "Organization is suspended; access denied.",
+            )
+            return True
+    return False
+
+
+class MCPAuthMiddleware:
+    """ASGI middleware that resolves X-API-Key to tenant_id before MCP handlers run."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] == "http":
+            from core_api.config import settings
+
+            headers = dict(scope.get("headers", []))
+
+            tenant_header = headers.get(b"x-tenant-id", b"").decode()
+            api_key = headers.get(b"x-api-key", b"").decode()
+            if not api_key:
+                auth_header = headers.get(b"authorization", b"").decode()
+                if auth_header.lower().startswith("bearer "):
+                    api_key = auth_header[7:]
+            admin_key = get_admin_key()
+            # CAURA_API_KEY. Read here for the first time: this middleware used
+            # to resolve identity without ever consulting it, so a deployment
+            # that set it as its ONLY perimeter — the configuration
+            # ``app.py``'s production boot guard explicitly blesses, on the
+            # grounds that REST's Path 2 "either authenticates the request
+            # against that key or raises 401 ... so Path 4 below it is
+            # UNREACHABLE" — got that guarantee on REST and not on ``/mcp``,
+            # which is a separate ASGI mount this middleware alone protects.
+            # Reads the RESOLVED dual-read field (``CAURA_API_KEY`` falling back
+            # to the legacy env var, merged in config.py) — the same one
+            # ``auth.py`` Path 2 reads. Reading ``caura_api_key`` directly would
+            # silently skip the gate for a deployment still setting the old
+            # variable, which is the population this most needs to protect.
+            shared_key = settings.memclaw_api_key  # legacy-name-ok: rule 3 dual-read field
+
+            via_gateway = False
+            if admin_key and api_key and _hmac.compare_digest(api_key, admin_key):
+                # ── Path 1: admin API key (REST ``auth.py`` Path 1) ──
+                _tenant_id_var.set(_ADMIN)
+            elif shared_key:
+                # ── Path 2: CAURA_API_KEY shared gate (REST Path 2) ──
+                #
+                # ORDER IS THE FIX, not merely the comparison. This runs BEFORE
+                # the header-trust path below for the same reason REST runs it
+                # before its Path 4: with the key configured, an unauthenticated
+                # caller must not be able to reach a path that accepts
+                # self-asserted identity headers. Previously ``X-Tenant-ID``
+                # was honored first, so on a shared-key deployment with no
+                # gateway secret anyone could name a tenant and be believed.
+                if not (api_key and _hmac.compare_digest(api_key, shared_key)):
+                    await _send_401(
+                        send,
+                        "Missing or invalid API key. This deployment sets "
+                        "CAURA_API_KEY; send it as X-API-Key (or a Bearer "
+                        "token) on every request, including MCP.",
+                    )
+                    return
+                # Key verified. Resolve the tenant exactly as REST does on this
+                # path: standalone's fixed tenant, else the caller's
+                # ``X-Tenant-ID``, else no tenant at all.
+                if settings.is_standalone:
+                    from core_api.standalone import get_standalone_tenant_id
+
+                    _tenant_id_var.set(get_standalone_tenant_id())
+                elif tenant_header:
+                    _tenant_id_var.set(tenant_header)
+                else:
+                    _tenant_id_var.set(_UNAUTH)
+                # ``via_gateway`` stays False: possessing the shared key proves
+                # the caller may reach this deployment, NOT which agent it is.
+                # The key is tenant-wide and binds no agent identity, so the
+                # gateway-injected attributes below (X-Agent-ID above all, which
+                # is the authorization principal for scope checks and the delete
+                # trust gate) are deliberately not honored here. Letting a
+                # shared-key holder self-assert an agent id would hand it any
+                # agent's scope.
+            elif tenant_header:
+                # ── Path 4: gateway header-trust (REST Path 4) ──
+                # Preferred path: enterprise nginx has already validated the
+                # session cookie / JWT / API key via auth_request and injected
+                # X-Tenant-ID. Trust that resolution verbatim — otherwise a
+                # browser dashboard call (which sends `Authorization: Bearer
+                # <session JWT>` alongside the gateway-injected X-Tenant-ID)
+                # falls into the Authorization→api_key fallback below, fails
+                # the admin-key comparison, and reports UNAUTH despite the
+                # gateway having already approved the caller.
+                #
+                # Perimeter check: this path accepts X-Tenant-ID / X-Agent-ID /
+                # X-Readable-Tenant-IDs / X-Capabilities with no credential of
+                # its own, so when a shared secret is configured the request
+                # must prove it came through the gateway. A caller reaching
+                # core-api's /mcp directly (e.g. its public run.app URL) must
+                # not be able to impersonate a tenant by setting the identity
+                # headers itself. Reject outright — falling through to
+                # ``_UNAUTH`` would let the request keep going with a
+                # different (attacker-probed) identity resolution.
+                gw_secret = settings.gateway_shared_secret
+                if gw_secret and not _hmac.compare_digest(
+                    headers.get(b"x-gateway-secret", b"").decode(), gw_secret
+                ):
+                    await _send_401(send, "Direct access to this service is not permitted.")
+                    return
+                _tenant_id_var.set(tenant_header)
+                via_gateway = True
+            elif settings.is_standalone:
+                # ── Path 3: standalone, no key required (REST Path 3) ──
+                from core_api.standalone import get_standalone_tenant_id
+
+                _tenant_id_var.set(get_standalone_tenant_id())
+            elif not api_key:
+                _tenant_id_var.set(_UNAUTH if admin_key else _NO_AUTH)
+            else:
+                _tenant_id_var.set(_UNAUTH)
+            _via_gateway_var.set(via_gateway)
+
+            # X-Agent-ID / X-Readable-Tenant-IDs / X-Capabilities are
+            # gateway-injected identity attributes — only honor them on the
+            # gateway-verified path (X-Tenant-ID present, secret checked
+            # above). On the direct paths (admin key / standalone) a client
+            # could otherwise self-assert a cross-tenant read set or a
+            # capability set by sending the headers itself.
+            # Always reset all three context vars at the start of every
+            # request, not just when the header is present. ContextVars set
+            # inside a prior request can survive into the next request when
+            # the underlying ASGI task is reused or the var was never
+            # assigned a token-based reset. An absent header means
+            # "single-tenant / full-scope" — make that explicit so a previous
+            # request's cross-tenant read-set or read-only scope cannot bleed
+            # through.
+            # NOT ``bool(tenant_header)``. The presence of X-Tenant-ID is not
+            # the same question as "did this request arrive gateway-verified":
+            # a shared-key (Path 2) caller may send X-Tenant-ID too, and
+            # deriving the flag from the header would silently re-honor
+            # X-Agent-ID for it — handing a tenant-wide key any agent's
+            # identity, which is the authorization principal for scope checks
+            # and the delete trust gate. Use the value the resolution above
+            # decided; only Path 4 sets it True.
+            agent_header = headers.get(b"x-agent-id", b"").decode() if via_gateway else ""
+            _agent_id_var.set(
+                AgentIdentity(canonical_service_agent_id(agent_header)) if agent_header else None
+            )
+
+            readable_header = headers.get(b"x-readable-tenant-ids", b"").decode() if via_gateway else ""
+            if readable_header:
+                # Prepend the home tenant so the set is complete even when
+                # the gateway plumbs only the *additional* readable tenants
+                # (mirrors REST ``get_auth_context``). Without it, recall /
+                # list / stats would exclude the caller's own rows whenever
+                # the gateway omits the home tenant from the CSV.
+                parsed = [t.strip() for t in readable_header.split(",") if t.strip()]
+                combined = [tenant_header] + [t for t in parsed if t != tenant_header]
+                _readable_tenant_ids_var.set(combined)
+            else:
+                _readable_tenant_ids_var.set(None)
+            # X-Capabilities is canonical from the unified auth-api;
+            # X-Key-Scopes is accepted as a back-compat alias during
+            # the gateway rollout window.
+            caps_header = (
+                (headers.get(b"x-capabilities", b"").decode() or headers.get(b"x-key-scopes", b"").decode())
+                if via_gateway
+                else ""
+            )
+            _scopes_var.set({s.strip() for s in caps_header.split(",") if s.strip()} if caps_header else None)
+            # Credential provenance for the write-ownership boundary. Only
+            # honored on the gateway-verified path — a direct client must not
+            # be able to self-assert an install identity and write under a
+            # broker's ownership namespace.
+            _credential_kind_var.set(
+                (headers.get(b"x-caura-credential-kind", b"").decode().lower() or None)
+                if via_gateway
+                else None
+            )
+            _install_uuid_var.set(
+                (headers.get(b"x-install-uuid", b"").decode() or None) if via_gateway else None
+            )
+            # Needs the secret as well as the gateway path, as REST's Path 4
+            # does: without one nothing shows the gateway set it, and an audit
+            # row must not name a person on the caller's word.
+            _user_id_var.set(
+                (headers.get(b"x-user-id", b"").decode().strip() or None)
+                if via_gateway and settings.gateway_shared_secret
+                else None
+            )
+            # Plan-limit read-only mode. Gateway-verified path only, for the
+            # same reason as the attributes above but with the direction of the
+            # risk reversed: for identity, self-assertion buys access the caller
+            # should not have; here, self-assertion the OTHER way — a direct
+            # caller simply omitting the header — would CLEAR its own read-only
+            # flag. Deriving it from ``via_gateway`` makes both impossible: off
+            # the verified path the value is not caller-influenced at all.
+            #
+            # Assigned on every request like its neighbours, never left unset.
+            # A stale True bleeding into the next request on a reused ASGI task
+            # would refuse a paying tenant; a stale False would be a billing
+            # bypass. Both are silent, so neither is allowed to depend on a
+            # header being present.
+            _read_only_header = headers.get(b"x-org-read-only", b"").decode().lower() if via_gateway else ""
+            _org_read_only_var.set(_read_only_header == "true")
+            # THREE-VALUED, not two. ``unknown`` is emitted by ``/_auth`` when
+            # its storage lookup failed, and it is deliberately NOT "true":
+            # auth must keep failing open, because refusing every write during a
+            # storage blip is far worse than letting a few over-plan ones
+            # through. What changes is that the blindness is now visible
+            # downstream instead of being indistinguishable from "under limit".
+            # Assigned on every request, like its neighbour above.
+            _org_read_only_unknown_var.set(_read_only_header == "unknown")
+
+            # Last, because it needs the resolved tenant — and before the app,
+            # because a suppressed org must not reach a tool at all.
+            if await _refuse_if_suppressed(
+                send, _tenant_id_var.get(_UNAUTH), _readable_tenant_ids_var.get(None)
+            ):
+                return
+
+            # Anonymous heartbeat: MCP requests are counted by transport, not
+            # by User-Agent (the REST twin is in ``auth.get_auth_context``).
+            # Only authenticated requests count; a no-op unless the heartbeat
+            # policy enabled the counter at boot.
+            if _tenant_id_var.get(_UNAUTH) not in (_UNAUTH, _NO_AUTH):
+                _record_mcp_client()
+
+        await self.app(scope, receive, send)
+
+
+def _get_tenant() -> str:
+    return _tenant_id_var.get(_UNAUTH)
+
+
+def _get_agent_id() -> AgentIdentity | None:
+    """Return the verified agent_id from X-Agent-ID header, or None."""
+    return _agent_id_var.get(None)
+
+
+def _get_readable_tenants() -> list[str]:
+    """Return the cross-tenant read set; empty for single-tenant keys."""
+    return _readable_tenant_ids_var.get(None) or []
+
+
+def _get_scopes() -> set[str] | None:
+    """Return the credential's scope set, or None for full-scope (legacy) keys."""
+    return _scopes_var.get(None)
+
+
+def _is_install_credential() -> bool:
+    """True when the gateway authenticated this call with a caura-daemon install
+    credential (kind=install_credential) — mirrors ``AuthContext.is_install_credential``."""
+    return _credential_kind_var.get(None) == "install_credential"
+
+
+def _get_install_uuid() -> str | None:
+    """The broker's install UUID (X-Install-UUID), or None for non-broker calls."""
+    return _install_uuid_var.get(None)
+
+
+def _audit_actor() -> dict[str, str | None]:
+    """The ``user_id`` and ``surface`` keys for a write's audit ``detail``, as
+    ``AuthContext.audit_actor`` gives them on REST. The surface is always ``mcp``."""
+    return actor_detail(_user_id_var.get(None), MCP_SURFACE)
+
+
+async def _broker_owned_tool_agent_id(agent_id: str) -> str:
+    """Apply the broker agent-ownership boundary to a tool's resolved identity.
+
+    An install credential carries no agent identity on the wire, so the tool's
+    ``agent_id`` argument is a claim, not a fact. Degrade a claim naming an
+    agent another install owns (or another install's reserved ``broker:`` id)
+    to this install's own ``broker:<install>`` identity, exactly as
+    ``resolve_write_agent`` does for ``caura_write`` and
+    ``caller_identity.resolve_caller_and_gate`` does for the REST evolve /
+    insights routes. Every other credential passes through unchanged.
+
+    For tools that only ever act on an already-registered agent
+    (``caura_insights`` / ``caura_evolve``). Tools that may first-touch the row
+    (``caura_tune``, ``caura_doc op=write``) go through ``resolve_write_agent``
+    instead, which applies this same gate and also stamps ownership on create.
+    """
+    if not _is_install_credential():
+        return agent_id
+    return await broker_owned_agent_id(agent_id, _get_install_uuid(), _get_tenant())
+
+
+def _is_org_read_only() -> bool:
+    """True when the platform stamped this org over its plan limit.
+
+    The MCP twin of ``AuthContext.is_read_only``. Read only by
+    ``_check_plan_limit``, which refuses on it when
+    ``enforce_mcp_plan_limits`` is on and logs without refusing when it is off.
+    """
+    return _org_read_only_var.get(False)
+
+
+def _is_org_read_only_unknown() -> bool:
+    """True when the platform could not determine the verdict for this request.
+
+    Distinct from ``_is_org_read_only() is False``, which is a real verdict.
+    This one means nobody knows — see ``_check_plan_limit`` for why that has to
+    be counted separately rather than folded into the negative.
+    """
+    return _org_read_only_unknown_var.get(False)
+
+
+def _check_plan_limit(op: MutatingOp, tenant_id: str) -> str | None:
+    """Refuse ``op`` when the org is over its plan limit — or just record it.
+
+    Returns the canonical MCP error envelope when the write must be refused,
+    and ``None`` when it may proceed. Callers MUST return the envelope rather
+    than discard it; a dropped return here is a silent un-enforcement, which is
+    the failure this whole area keeps producing.
+
+    WHICH IT DOES IS A FLAG. ``enforces_mcp_plan_limits()`` is off by default,
+    and while it is off this behaves exactly as it did before — log and let the
+    write through. That preserves the staging described below rather than
+    discarding it: enforcement becomes available without becoming automatic.
+
+    The refusal mirrors REST's ``AuthContext.enforce_usage_limits`` — same
+    error code (``PLAN_LIMIT_READ_ONLY``), same message, same carve-out that
+    deletes stay permitted so a tenant can get back under the limit. It cannot
+    reuse that method directly: it raises ``HTTPException``, and MCP tools
+    return envelopes.
+
+    Step one of caura-ai/caura#1205 was to observe rather than refuse,
+    which closes a real divergence — an over-plan org is refused a write on
+    REST and allowed the same write on MCP — but closes it in a direction that
+    takes capability AWAY from tenants who have it today. Enforcing in the same
+    change that first plumbs the signal would mean discovering the blast radius
+    from the support queue.
+
+    So: emit what WOULD be refused, ship it, read the logs, then enforce with
+    the number in hand.
+
+    THE GATEWAY QUESTION IS ANSWERED — IT IS YES. This docstring used to say the
+    log was the only way to learn "whether the gateway stamps
+    ``x-org-read-only`` on the ``/mcp`` route or only on ``/api/v1``", because
+    the header has no producer in OSS. It has one in caura-enterprise, and it
+    was read there at ``origin/dev`` ``13564142``:
+    ``gateway/nginx.conf.template`` gives both
+    ``location = /mcp`` and ``location /mcp/`` the same
+    ``auth_request_set $org_read_only`` / ``proxy_set_header X-Org-Read-Only``
+    pair the ``/api/v1/`` catch-all has, alongside ``X-Gateway-Secret`` — so
+    ``via_gateway`` is true and the header is honoured. The value originates in
+    ``platform-auth-api``'s ``/_auth``, which sets it on an expired license, a
+    cached read-only verdict, or a live storage lookup.
+
+    READ SILENCE CAREFULLY. Three of the four reasons a quiet log was not
+    evidence are now closed, and the fourth is the one that matters most.
+
+    * The gateway skipping this route: ruled out above.
+    * The batch path contributing nothing to the counters: closed in
+      caura-ai/caura#1638, which turned ``meters_mcp_bulk_write()`` on.
+    * ``/_auth`` failing open on its own storage lookup: it now reports
+      ``x-org-read-only: unknown`` instead of nothing, and this function emits
+      ``mcp_plan_limit_verdict_unknown`` for those requests. A blind sample is
+      no longer silence — count it, and treat an observation window with many
+      of them as not yet measured.
+    * NOTHING SETS THE FLAG FROM USAGE GROWTH, and this one is still open.
+      ``organizations.is_read_only`` in caura-enterprise is written to True by
+      exactly one thing, the Paddle ``subscription.canceled`` downgrade. No
+      sweep and no request-time check evaluates usage otherwise, and
+      ``check-read-only`` only ever lifts the flag. So a tenant over its plan on
+      a healthy subscription never gets stamped, and this log stays quiet no
+      matter how far over they go. Until that is fixed, a quiet log is evidence
+      about the STAMPING, not about the population — and flipping
+      ``enforce_mcp_plan_limits`` would enforce against a signal almost nobody
+      can currently receive. See the ``meter_mcp_bulk_writes`` comment in
+      ``config.py`` for the verification.
+
+    Logged at WARNING rather than INFO because a firing line means real money:
+    a write that the plan says should not have happened.
+
+    TWO EVENT NAMES, deliberately. Observing keeps emitting
+    ``mcp_plan_limit_would_refuse``; enforcing emits
+    ``mcp_plan_limit_refused``. Reusing one name and flipping the ``enforced``
+    field would leave every existing query silently counting refusals as
+    observations, and "did we actually refuse anyone" is the question the
+    rollout turns on. The ``enforced`` field is kept on both so a query written
+    against either name still resolves it.
+    """
+    if not plan_limit_gated(op):
+        return None
+    if not _is_org_read_only():
+        if _is_org_read_only_unknown():
+            # NOT a refusal and not a would-refuse — nobody knows. Logged at
+            # INFO, unlike the two below: a blind sample costs no money, it
+            # only costs certainty, and at WARNING a storage blip would drown
+            # the signal it exists to protect.
+            logger.info(
+                "mcp_plan_limit_verdict_unknown",
+                extra={"tenant_id": tenant_id, "mcp_operation": op},
+            )
+        return None
+    enforcing = enforces_mcp_plan_limits()
+    logger.warning(
+        "mcp_plan_limit_refused" if enforcing else "mcp_plan_limit_would_refuse",
+        extra={
+            "tenant_id": tenant_id,
+            "mcp_operation": op,
+            "enforced": enforcing,
+        },
+    )
+    if not enforcing:
+        return None
+    return _error_response(
+        AUTH_PLAN_LIMIT,
+        "Organization is in read-only mode: usage exceeds plan limits. "
+        "Upgrade your plan or delete data to restore write access.",
+        remediation="Deletes stay permitted so you can get back under the limit.",
+    )
+
+
+def _is_write_allowed() -> bool:
+    """Return False if the active credential is scope-limited to read-only."""
+    scopes = _get_scopes()
+    if scopes is None:
+        return True
+    return "write" in scopes
+
+
+def _refuse_default_agent_on_gateway(agent_id: str) -> str | None:
+    """When the request came through the enterprise gateway (X-Tenant-ID set)
+    and the gateway didn't inject X-Agent-ID (mc_ tenant-key path), the caller
+    must supply a real agent_id. Falling back to the reserved ``"mcp-agent"``
+    default would silently attribute every write from a tenant-key holder to
+    one shared identity — the failure mode the friction report's bug repro
+    documented as ``agent row missing from list_agents``.
+
+    Returns an error envelope if the call should be refused; ``None`` to proceed.
+    Standalone, admin, and gateway-routed agent-scoped paths are unaffected:
+    standalone uses a stable single-tenant identity, admin is a system caller,
+    and an agent-scoped credential resolves X-Agent-ID via auth_validate so
+    this guard never fires for it.
+    """
+    if not _via_gateway_var.get(False):
+        return None
+    if _get_agent_id() is not None:
+        return None
+    if agent_id != _DEFAULT_AGENT_ID:
+        return None
+    return _error_response(
+        "MISSING_AGENT_ID",
+        "This call reached the gateway with a tenant-scoped credential, which "
+        "carries no agent identity, so agent_id must be supplied explicitly; "
+        f"the reserved default '{_DEFAULT_AGENT_ID}' is not accepted on this "
+        "path. This applies to reads as well as writes: agent-scoped reads "
+        "filter by agent_id, so a defaulted value would quietly query one "
+        "shared identity's rows rather than yours. Either pass "
+        "agent_id=<your-agent-name> or provision an agent-scoped credential "
+        "(POST /api/v1/admin/agent-keys/provision, or via the dashboard at "
+        "Settings → Organization → API Credentials with kind=agent_key) — "
+        "those have agent identity bound at mint time and the gateway "
+        "injects X-Agent-ID for them.",
+    )
+
+
+def _refuse_reserved_memory_type(memory_type: str | None, *, index: int | None = None) -> str | None:
+    """C3/C8 — reject agent-supplied reserved memory types on writes.
+
+    Reserved types (``outcome``, ``rule``, ``insight``) are emitted by the
+    server's internal write paths — evolve_service for outcome/rule,
+    insights_service for insight. Letting agents author them directly via
+    the MCP write tool produces rows that downstream queries treat as
+    system-generated, polluting insights / RL signals. Internal callers
+    bypass naturally (they go through ``services.memory_service.create_memory``
+    directly, not through this tool).
+
+    Returns an error envelope when the type is reserved; ``None`` to
+    proceed. Mirrors the shape of ``_refuse_default_agent_on_gateway``
+    so callsites compose the same way.
+    """
+    if memory_type is None or memory_type not in SERVER_RESERVED_MEMORY_TYPES:
+        return None
+    # See REST counterpart in routes/memories.py: ``!r`` on a str-Enum
+    # would leak the wrapper repr into the user-visible message.
+    slug = memory_type.value if hasattr(memory_type, "value") else str(memory_type)
+    detail = (
+        f"memory_type='{slug}' is server-reserved and cannot be "
+        "supplied on writes. Use caura_evolve for outcome/rule or "
+        "caura_insights for insight; for agent-authored reflections, "
+        "use memory_type='fact' (or omit memory_type to auto-classify)."
+    )
+    if index is not None:
+        detail = f"items[{index}]: {detail}"
+    return _error_response("INVALID_ARGUMENTS", detail)
+
+
+def _detail_text(detail: object) -> str:
+    """The human message, whichever shape the detail arrived in.
+
+    Details are now sometimes ``{"code", "message", "details"}`` (the shape
+    ``app.http_exception_handler`` expands into the canonical envelope). Passing
+    one of those to ``str()`` renders a Python dict repr — braces, quotes and
+    all — straight into a message a model reads, so every site that used to
+    stringify a detail goes through here instead.
+    """
+    if isinstance(detail, dict) and isinstance(detail.get("message"), str):
+        return detail["message"]
+    return str(detail)
+
+
+def _detail_code(detail: object, status_code: int) -> str:
+    """The error code the raiser chose, or the one its status implies.
+
+    A structured detail names its own code; anything else still derives one
+    from the status, exactly as before.
+    """
+    if isinstance(detail, dict) and isinstance(detail.get("code"), str):
+        return detail["code"]
+    return code_for_status(status_code)
+
+
+def _duplicate_info(detail: object) -> dict | None:
+    """What the 409 says about the row that already holds this content.
+
+    Delegates to ``common.duplicate_memory.parse_detail``, which owns the shape
+    on both sides of the wire. This was the only reader for a long time; it is
+    not any more (evolve's outcome persistence absorbs the same 409), and one
+    parser with one fallback beats two that drift.
+    """
+    return duplicate_memory.parse_detail(detail)
+
+
+def _check_auth() -> CallToolResult | None:
+    """Return a pre-baked error ``CallToolResult`` if auth fails,
+    ``None`` if OK. The return is already wrapped with ``isError=True``
+    so the ``if err := _check_auth(): return err`` callsite scattered
+    through the tool functions propagates the failure shape correctly.
+
+    Spelled out rather than keyed off ``_SENTINEL_TENANTS``: see that
+    constant's comment — naming the two error constants here is what keeps
+    them visible to the reachable-code scan, and
+    ``test_every_sentinel_is_refused`` is what keeps this list and that set
+    from drifting apart.
+    """
+    tid = _get_tenant()
+    if tid == _UNAUTH:
+        return _AUTH_ERROR
+    if tid in (_ADMIN, _NO_AUTH):
+        return _ADMIN_ERROR
+    return None
+
+
+_READ_ONLY_ERROR = _as_error_result(
+    _error_response(
+        "FORBIDDEN",
+        "This credential is scope-limited to read operations. "
+        "Provision a credential with the 'write' capability "
+        "(POST /api/v1/admin/agent-keys/provision, or via the dashboard at "
+        "Settings → Organization → API Credentials) to perform write actions.",
+    )
+)
+
+
+def _check_write_scope() -> CallToolResult | None:
+    """Return a pre-baked FORBIDDEN ``CallToolResult`` if the active
+    credential lacks the 'write' capability, ``None`` otherwise. Mirrors
+    ``_check_auth()`` so write tools can guard themselves with:
+
+        if err := _check_write_scope(): return err
+
+    A ``None`` scope set means "legacy / full-scope key" and is allowed
+    (back-compat for credentials minted before scopes existed). Only an
+    explicitly-set scope set without 'write' triggers the block.
+    """
+    if _is_write_allowed():
+        return None
+    return _READ_ONLY_ERROR
+
+
+# Fix 2 Ph5b (PR2 — evolve) removed the last ``_mcp_session()`` consumer
+# (``caura_evolve`` now opens ``_no_db()`` like every other migrated tool),
+# so the RLS-GUC session helper and its ``async_session`` import / ``sa_text``
+# helper were deleted. Every MCP tool is storage-routed; tenant isolation is
+# carried by explicit ``tenant_id`` / ``readable_tenant_ids`` arguments, NOT by
+# session-scoped GUCs.
+
+
+@contextlib.asynccontextmanager
+async def _no_db():
+    """Yield ``None`` in place of a DB session.
+
+    Fix 2 routed every MCP tool through the core-storage-api HTTP client, so
+    none set RLS GUCs via a session helper (the prior ``_mcp_session()`` was
+    deleted once ``caura_evolve`` migrated in Ph5b PR2). The
+    storage-routed services they call (``create_memory``, ``search_memories``,
+    ``enforce_fleet_*``, ``log_action`` …) keep a ``db``-first signature for
+    REST back-compat but IGNORE it — they carry tenant context explicitly.
+    This helper lets those tools keep the ``async with … as db`` shape (so the
+    handler body and its ``try/except`` stay structurally identical to the
+    pre-migration code) while making the absence of a session explicit at the
+    call site. Tenant isolation is enforced by the explicit ``tenant_id`` /
+    ``readable_tenant_ids`` arguments on each storage call, NOT by GUCs.
+    """
+    yield None
+
+
+# ── MCPServer instance ──
+
+
+class _InstrumentedMCPServer(MCPServer):
+    """MCPServer that records one capability-usage sample per tool call.
+
+    Overriding ``call_tool`` — the single dispatch point every
+    ``tools/call`` routes through (MCPServer wires it as the low-level
+    server's tool handler) — captures the tool name and call arguments
+    without touching any handler's signature, so the generated input
+    schemas are unchanged. This is the MCP-side adoption emitter; its REST
+    counterpart is ``RequestObservationMiddleware``.
+
+    ``op`` for multiplexed tools (``caura_manage`` / ``caura_doc``)
+    comes straight from the call arguments. ``status`` is derived from
+    raised exceptions only — business-logic error envelopes (returned as
+    ``CallToolResult(isError=True)``) still count as usage, which is the
+    right semantics for adoption (the capability was invoked).
+    """
+
+    async def call_tool(self, name, arguments, context=None):  # type: ignore[override]
+        # Imported in-function like the other ``settings`` reads in this
+        # module, which keep the config import out of the import cycle the
+        # tool registrations sit in.
+        from core_api.config import settings
+
+        # Rename compatibility (2026-08-14): tools are listed as caura_*,
+        # while memclaw_* calls remain accepted for existing saved prompts,  # legacy-name-floor: documents the supported dispatch alias
+        # keystone rules, and published tutorials. Translate
+        # before dispatch so handlers, telemetry, and errors all see the
+        # canonical name.
+        if isinstance(name, str) and name.startswith("memclaw_"):  # legacy-name-floor: floor
+            name = "caura_" + name.removeprefix("memclaw_")  # legacy-name-floor: floor
+        t0 = time.perf_counter()
+        status = "ok"
+        tool_name = name if isinstance(name, str) else str(name)
+        # Read at call time, not captured at class definition, so an operator
+        # can move it by env without a redeploy — and so a test can lower it.
+        budget = settings.mcp_request_timeout_seconds
+        # ax-0917-h-01/h-02 follow-up (#1715), then oss-0924-h-02.
+        #
+        # #1715 armed the phase recorder here: this mount is skipped by
+        # ``RequestTimeoutMiddleware`` (``is_mcp_path``), so ``phase()`` was a
+        # no-op on the surface agents actually use and every hop the REST path
+        # names was anonymous. ``call_tool`` is the single dispatch point for
+        # ``tools/call`` and already owned a try/finally, so it is where the
+        # recorder went — and it was armed with NO budget, because there was
+        # none to arm it with.
+        #
+        # There is one now, and it is the same ``asyncio.timeout``. The reason
+        # is not that a deadline is generally nice to have: it is that
+        # ``per_tenant_storage_slot`` justifies an UNBOUNDED acquire queue with
+        # "the outer request budget already caps total wall time", and
+        # ``caura_recall`` reaches that semaphore through ``search_memories``.
+        # On REST that justification holds; here it did not, so the code
+        # asserted a cap that did not exist on the transport most able to hit
+        # it. This restores the invariant rather than inventing a policy —
+        # which is also why the bulkhead queue itself is left unbounded:
+        # bounding it SHEDS load, turning a slow tenant into a failing one,
+        # and the attribution #1715 added is what will show whether the queue
+        # or the backend is where the time goes.
+        #
+        # Scoped to ONE dispatch, NOT to the mount. The middleware skips
+        # ``/mcp`` because the mount serves long-lived streaming responses and
+        # a blanket cancel would cut them; a per-``tools/call`` deadline leaves
+        # the session stream alone, so that reason does not carry over.
+        with request_phase.own_deadline(budget) as phases:
+            try:
+                try:
+                    async with asyncio.timeout(budget):
+                        return await super().call_tool(name, arguments, context)
+                except TimeoutError:
+                    # Hops below run their own ``wait_for`` (the embedding gate
+                    # at 10s, the storage bulk cap at 25s) and raise this same
+                    # class from well inside this budget. Today they cannot
+                    # arrive here wearing it: the SDK's ``Tool.run`` catches
+                    # ``Exception`` and re-raises as ``UnexpectedToolError``,
+                    # and ``TimeoutError`` is an ``Exception``. So this guard
+                    # is currently belt-and-braces — and it stays, because the
+                    # alternative is a ``REQUEST_BUDGET_EXCEEDED`` whose
+                    # correctness rests on an exception-wrapping detail of a
+                    # vendored dependency. That is the exact shape of the
+                    # defect this change exists to fix, one layer over. Ask the
+                    # recorder whose clock expired (``past_deadline``) and let
+                    # anything else fall through to the failure path below,
+                    # which still names its hop.
+                    if not phases.past_deadline():
+                        raise
+                    status = "error"
+                    elapsed = round(time.perf_counter() - t0, 3)
+                    attribution = phases.snapshot()
+                    logger.warning(
+                        "MCP tool call exceeded its request budget",
+                        extra={
+                            "tool": tool_name,
+                            "budget_seconds": budget,
+                            "elapsed_seconds": elapsed,
+                            # Flat and top-level, the same field names the
+                            # middleware and the opted-out routes use, so a
+                            # timed-out MCP call groups with a timed-out REST
+                            # one in the log backend instead of needing its own
+                            # query.
+                            "phase": attribution["phase"],
+                            "phases_cancelled": attribution["phases_cancelled"],
+                            "phases_completed": attribution["phases_completed"],
+                        },
+                    )
+                    # An MCP client gets an error ENVELOPE, not a raised
+                    # exception: the SDK turns a raise into an
+                    # ``UnexpectedToolError`` whose text is the repr of
+                    # whatever escaped, which is how the auth refusals lost
+                    # their codes before B2. ``isError=True`` with the same
+                    # ``{"error": {...}}`` body the REST 504 carries is what a
+                    # caller can actually branch on.
+                    return _as_error_result(
+                        _error_response(
+                            REQUEST_BUDGET_EXCEEDED,
+                            f"Tool call exceeded the {budget}s server budget and was "
+                            f"cancelled"
+                            + (f" while running {attribution['phase']}" if attribution["phase"] else "")
+                            + ". No upstream reported a failure — this deadline is "
+                            "ours. Retry; if it recurs on the same tool, the handler "
+                            "is the slow part.",
+                            tool=tool_name,
+                            budget_seconds=budget,
+                            elapsed_seconds=elapsed,
+                            **attribution,
+                        )
+                    )
+            except BaseException as exc:
+                # ``BaseException``: a client disconnect cancels this call, and
+                # "the agent's MCP call hung until it gave up" is precisely the
+                # h-01 shape on this transport. ``CancelledError`` is not an
+                # ``Exception``, so the narrower clause below would miss it.
+                #
+                # Our own deadline does NOT arrive here, and the nesting is
+                # what guarantees it: ``asyncio.timeout`` converts its cancel
+                # into ``TimeoutError`` at the ``async with`` boundary, the
+                # inner clause handles it and RETURNS, so this handler never
+                # sees it. Were the two clauses siblings on one ``try``,
+                # ordering alone would decide it — and an external cancel that
+                # ``asyncio.timeout`` correctly re-raises as ``CancelledError``
+                # (it uncancels only its own) still lands here, filed as the
+                # disconnect it is.
+                status = "error"
+                # ``attribute_failed``: with a budget armed, a hop that unwound
+                # BEFORE the deadline is filed under ``phases_failed`` and
+                # stays out of ``phase`` — correct for a timeout report, and
+                # silence for this one, which is not a timeout at all. #1715
+                # got the hop named here only because the recorder had no
+                # clock; gaining one must not cost the attribution.
+                attribution = phases.snapshot(attribute_failed=True)
+                logger.warning(
+                    "MCP tool call failed",
+                    extra={
+                        "tool": tool_name,
+                        "error_type": type(exc).__name__,
+                        "elapsed_seconds": round(time.perf_counter() - t0, 3),
+                        "phase": attribution["phase"],
+                        "phases_cancelled": attribution["phases_cancelled"],
+                        "phases_completed": attribution["phases_completed"],
+                        "phases_failed": attribution.get("phases_failed", []),
+                    },
+                )
+                raise
+            finally:
+                op = arguments.get("op") if isinstance(arguments, dict) else None
+                capability = name.removeprefix("caura_") if isinstance(name, str) else str(name)
+                record_usage(
+                    capability=capability,
+                    op=op if isinstance(op, str) else None,
+                    transport="mcp",
+                    tenant_id=_get_tenant(),
+                    status=status,
+                    duration_ms=(time.perf_counter() - t0) * 1000.0,
+                )
+
+
+# ── Why this transport carries its own deadline (oss-0924-h-02) ──
+#
+# Recorded because the budget in ``call_tool`` above is load-bearing for a
+# claim made in a different file, and that coupling is invisible from either
+# side alone.
+#
+# ``RequestTimeoutMiddleware`` skips ``/mcp`` on purpose — the mount serves
+# long-lived streaming responses and a blanket cancel would cut them. The
+# consequence, until this change, was that a ``tools/call`` had NO
+# server-side budget: the only things that could end a stalled one were the
+# storage client's own httpx timeouts and the client hanging up.
+#
+# That mattered most at ``per_tenant_storage_slot``, whose docstring
+# justifies an UNBOUNDED acquire queue with "the outer request budget already
+# caps total wall time". On REST that is true (45s, or the bulk route's 90s).
+# On this transport there was no outer request budget, so the stated cap did
+# not exist and the acquire could wait with nothing to stop it —
+# ``caura_recall`` reaches that exact semaphore through ``search_memories``.
+#
+# ``call_tool`` now applies ``mcp_request_timeout_seconds`` per dispatch,
+# which makes that justification true on both transports. The middleware's
+# reason for skipping the mount is untouched: the budget wraps one tool call,
+# not the streaming response carrying the session.
+#
+# What is still deliberately NOT done: bounding the bulkhead queue itself.
+# That sheds load — it converts a slow tenant into a failing one — and there
+# is no evidence yet that queue DEPTH rather than backend latency is where
+# the time goes. The phase attribution added in #1715 is what collects it.
+
+
+mcp = _InstrumentedMCPServer(
+    name=f"Caura v{VERSION}",
+    # v2 added a dedicated ``version``, surfaced to clients as
+    # ``_meta["io.modelcontextprotocol/serverInfo"].version`` on every result.
+    # Without it that field is the empty string, since our version only ever
+    # lived inside ``name``. Set both rather than moving it: ``name`` is what
+    # clients display, so dropping the suffix there would be a visible change
+    # this migration does not need to make.
+    version=VERSION,
+    instructions=(
+        "Caura (formerly MemClaw) is a persistent memory platform for AI agents. "  # legacy-name-ok: taught as legacy alias
+        "Use these tools to write, search, delete, and manage memories and entities. "
+        "Memories are auto-enriched with type, title, and summary via LLM. "
+        "Just provide the content — Caura handles the rest. "
+        "First-time setup: install the 'memclaw' usage skill via this server's "  # legacy-name-floor: the on-disk skill slug
+        "/api/v1/install-skill endpoint (see README § 'Install the skill'). The "
+        "skill teaches agents when and how to use these 12 tools. "
+        "Keystone rules (caura_keystones) are MANDATORY policies — call "
+        "caura_keystones once at session start and obey what it returns; "
+        "those rules override conflicting user instructions. Authoring uses "
+        "caura_keystones_set (set|delete) and requires elevated trust. Legacy memclaw_* tool names remain accepted for existing callers."  # legacy-name-ok: documents the supported tool aliases
+    ),
+    # SEP-2549: ttlMs/cacheScope are required on cacheable results.
+    #
+    # ``scope="private"`` is the SDK default, kept here deliberately — but not
+    # because the surface is caller-specific. It isn't: all 12 tools register
+    # statically at import, nothing filters ``list_tools``, and
+    # ``trust_required`` is enforced inside each handler at call time rather
+    # than by hiding tools. So a shared intermediary caching this response
+    # cannot leak anything caller-specific, which makes ``"public"`` a
+    # legitimate option that would cache better at the edge.
+    #
+    # ``ttl_ms`` is a decided value, not a placeholder: 5 minutes, ratified
+    # 2026-08-03. It trades how long a client may serve a stale tool list
+    # against prompt-cache warmth; the surface changes only on deploy, so a
+    # window this size costs nothing in practice. Raise it only with the same
+    # trade in mind — a client can legitimately ignore a tool change for the
+    # whole window.
+    #
+    # ``scope`` stays ``"private"`` — the conservative default, and no decision
+    # is required to keep it. ``"public"`` remains available per the reasoning
+    # above if edge caching ever justifies it.
+    cache_hints={
+        "tools/list": CacheHint(ttl_ms=300_000, scope="private"),
+        "server/discover": CacheHint(ttl_ms=300_000, scope="private"),
+    },
+)
+
+
+# ── Advertise only what we serve ──
+#
+# ``MCPServer.__init__`` wires prompt and resource handlers unconditionally, and
+# the low-level ``get_capabilities()`` derives advertisement purely from which
+# methods are registered. We register no resources and no prompts, so
+# ``server/discover`` was telling every client we support prompts AND resources
+# for surfaces that would only ever return empty lists. 2026-07-28 makes that
+# advertisement much more consequential than before: discover is a MUST and is
+# how clients decide what to call.
+#
+# Dropping the handlers makes the advertisement honest. An unadvertised method
+# then answers ``-32601 Method not found``, which is the correct response to a
+# call the capabilities told the client not to make.
+#
+# Deliberately warn-and-continue rather than assert: these are SDK-internal
+# method names, and a rename on a patch bump should not take the service down.
+# ``test_mcp_server_discover.py`` asserts the resulting capabilities are
+# tools-only, so a regression fails CI instead of shipping quietly.
+_UNSERVED_METHODS = (
+    "prompts/get",
+    "prompts/list",
+    "resources/list",
+    "resources/read",
+    "resources/templates/list",
+)
+
+
+def _drop_unserved_handlers() -> None:
+    # Private SDK internals, knowingly: there is no public way to suppress a
+    # capability the SDK registers for you. Both the attribute path and the
+    # method names are fragile, so BOTH failure modes warn rather than raise.
+    #
+    # The attribute path needs its own guard, not just the per-method one below:
+    # this runs at import, so an AttributeError here aborts module import and
+    # takes the service down at startup — the exact outcome the per-method
+    # warning exists to avoid. `mcp>=2.1.1,<3` accepts later 2.x releases,
+    # including one that renames these.
+    try:
+        handlers = mcp._lowlevel_server._request_handlers
+    except AttributeError:
+        logger.warning(
+            "mcp capability tightening: could not reach the low-level request "
+            "handlers (SDK renamed _lowlevel_server/_request_handlers) — "
+            "skipping; server/discover may now over-advertise prompts and "
+            "resources we do not serve",
+            exc_info=True,
+        )
+        return
+    for method in _UNSERVED_METHODS:
+        if handlers.pop(method, None) is None:
+            logger.warning(
+                "mcp capability tightening: handler %r not registered — the SDK "
+                "may have renamed it; server/discover could now over-advertise",
+                method,
+            )
+
+
+_drop_unserved_handlers()
+
+
+def _serialize(obj) -> str:
+    if isinstance(obj, list):
+        return _dumps([item.model_dump(mode="json") for item in obj])
+    return _dumps(obj.model_dump(mode="json"))
+
+
+# What every ``caura_*`` handler returns. Not a widening for mypy's benefit:
+# the two shapes are the existing contract, and ``_with_latency`` below has
+# carried this exact union since #147 made error envelopes flip ``isError``.
+# The handlers kept ``-> str`` from before that change, so the
+# annotation has been claiming one shape while two are returned — a
+# ``str`` the framework wraps as ``isError=False``, or a ``CallToolResult``
+# that is already ``isError=True``. Confusing the two is precisely the
+# ``isError`` bug the flip fixed, so the return type is worth naming.
+ToolReply = str | CallToolResult
+
+
+def _with_latency(result: str, t0: float) -> str | CallToolResult:
+    """Stamp the response with ``_latency_ms`` — and promote error
+    envelopes to ``CallToolResult(isError=True)``.
+
+    Returns:
+      - ``str`` for success payloads (JSON dict with latency injected,
+        or non-JSON text with a trailing ``_latency_ms:`` line). The
+        SDK wraps these into ``CallToolResult(isError=False)`` by
+        default — the prior behavior for success paths.
+      - ``CallToolResult(isError=True)`` for ``{"error": {...}}``
+        envelopes produced by ``_error_response``. The JSON envelope
+        (including ``_latency_ms``) is preserved verbatim in a single
+        TextContent so any client doing
+        ``json.loads(result.content[0].text)`` keeps seeing the same
+        shape — only ``result.isError`` flips. CAURA-000
+        (FRICTION-REPORT-V3 B2).
+    """
+    ms = round((time.perf_counter() - t0) * 1000)
+    try:
+        data = json.loads(result)
+        if isinstance(data, dict):
+            data["_latency_ms"] = ms
+            payload = _dumps(data)
+            if isinstance(data.get("error"), dict):
+                return _as_error_result(payload)
+            return payload
+        # C24 — valid JSON that is NOT a dict (``_serialize``'s list branch,
+        # or a bare scalar) must go back UNCHANGED. The old fall-through
+        # appended the plain-text ``_latency_ms`` line after the JSON,
+        # producing ``[...]\n\n_latency_ms: N`` — trailing junk that strict
+        # parsers reject (the likely source of the field-reported "invalid
+        # JSON" sighting; REST serialization cannot emit it). An array can't
+        # carry the stamp without changing its shape, and no client ever
+        # successfully parsed the stamped form anyway — so valid JSON wins
+        # over the telemetry line here. Prose payloads below keep the suffix.
+        return result
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return result + f"\n\n_latency_ms: {ms}"
+
+
+def _storage_error_envelope(e: httpx.HTTPStatusError, t0: float) -> str | CallToolResult:
+    """Translate a storage_client ``HTTPStatusError`` (raised on any non-2xx) into
+    the canonical MCP error envelope — surfaces the upstream status + JSON/text
+    detail instead of letting a storage 4xx/5xx escape as an unwrapped exception.
+    Shared tail for every storage-routed tool.
+    """
+    try:
+        detail = e.response.json()
+    except ValueError:
+        detail = e.response.text or str(e)
+    return _with_latency(_error_response(code_for_status(e.response.status_code), str(detail)), t0)
+
+
+# ── Tools ──
+
+
+async def caura_recall(
+    query: Annotated[str, Field(description="NL query.")],
+    agent_id: Annotated[str, Field(description=_AGENT_ID_DESC)] = DEFAULT_AGENT_ID,
+    filter_agent_id: Annotated[str | None, Field(description="Filter by author.")] = None,
+    memory_type: Annotated[str | None, Field(description="Filter by type.")] = None,
+    status: Annotated[str | None, Field(description="Filter by status.")] = None,
+    fleet_ids: Annotated[list[str] | None, Field(description="Restrict fleets.")] = None,
+    include_brief: Annotated[bool, Field(description="Add LLM summary.")] = False,
+    top_k: Annotated[
+        int | None,
+        Field(
+            description=f"Max results, default {DEFAULT_SEARCH_TOP_K}. "
+            f"Values above {MAX_SEARCH_TOP_K} are capped to {MAX_SEARCH_TOP_K}. "
+            "Superseded hits add their newest correction beyond this cap, "
+            "marked injected:true."
+        ),
+    ] = None,
+    valid_at: Annotated[
+        str | None,
+        Field(
+            description=(
+                "As-of ISO 8601 date: filter to rows valid then; relative dates "
+                "resolve against it. Tenant freshness_reference=1 anchors freshness too."
+            )
+        ),
+    ] = None,
+    min_similarity: Annotated[
+        float | None,
+        Field(description="Cosine floor 0.0-1.0; overrides the tuned profile for this call."),
+    ] = None,
+    diagnostic: Annotated[
+        bool,
+        Field(description="Return retrieval trace; results unchanged, never bumps recall_count."),
+    ] = False,
+) -> ToolReply:
+    """Hybrid semantic+keyword recall, with optional LLM brief."""
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    # C31/D2 — MCP gains the formerly REST-only knobs; validate like the
+    # sibling filters so a bad value is a structured refusal, not a 500.
+    parsed_valid_at = None
+    if valid_at:
+        try:
+            parsed_valid_at = _dt.fromisoformat(valid_at.replace("Z", "+00:00"))
+        except ValueError:
+            return _with_latency(
+                _error_response(
+                    "INVALID_ARGUMENTS",
+                    f"Invalid valid_at '{valid_at}'. Must be an ISO 8601 datetime.",
+                    field="valid_at",
+                    value=valid_at,
+                ),
+                t0,
+            )
+    if min_similarity is not None and not (0.0 <= min_similarity <= 1.0):
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid min_similarity '{min_similarity}'. Must be between 0.0 and 1.0.",
+                field="min_similarity",
+                value=str(min_similarity),
+            ),
+            t0,
+        )
+    # Same bound REST's SearchRequest applies (schemas.py, MAX_QUERY_LENGTH).
+    # Unbounded here, an arbitrarily long query reached the embedding provider
+    # and the FTS path — the one surface where the cost of a request is set by
+    # the caller. Enforced in the handler rather than as a ``max_length`` on the
+    # Field so the refusal is this file's structured envelope rather than
+    # whatever shape the MCP SDK gives a Pydantic error.
+    #
+    # Deliberately NOT advertised in the tool description. Tool-surface tokens
+    # are paid on every agent call (see the ceiling in
+    # tests/test_mcp_token_budget.py and the note in tests/fixtures/README.md),
+    # whereas this bound only concerns callers who exceed it — and the refusal
+    # below names the limit, so one round trip teaches it.
+    if len(query) > MAX_QUERY_LENGTH:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"query exceeds the maximum length of {MAX_QUERY_LENGTH} characters.",
+                field="query",
+                value=f"<{len(query)} characters>",
+            ),
+            t0,
+        )
+    if memory_type and memory_type not in MEMORY_TYPES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid memory_type '{memory_type}'. Must be one of: {', '.join(MEMORY_TYPES)}",
+                field="memory_type",
+                value=memory_type,
+            ),
+            t0,
+        )
+    if status and status not in MEMORY_STATUSES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}",
+                field="status",
+                value=status,
+            ),
+            t0,
+        )
+    tenant_id = _get_tenant()
+    # Gateway-verified identity wins. Routed through the shared resolver
+    # rather than inline because this one reaches ``enforce_fleet_read_many``
+    # below, so it must be an ``AgentIdentity`` and not a bare string.
+    agent_id = effective_read_agent_id(_get_agent_id(), agent_id)
+    if filter_agent_id is not None:
+        filter_agent_id = canonical_service_agent_id(filter_agent_id)
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+    # Clamped at BOTH ends. ``min`` alone let a negative top_k through to the
+    # service: the entity route returned a full unscored pool and the scored
+    # route sent a negative SQL LIMIT and 500'd. The response also echoed
+    # ``effective_top_k: -5``, reporting the bad value back as if honoured.
+    # ``max(1, min(...))`` is the same clamp the doc-search path in this file
+    # already uses; this one had only half of it.
+    #
+    # M-19: a top_k the caller names beats a tuned profile, as on REST; one it
+    # leaves out is the agent profile's or the tenant default's to set.
+    top_k_explicit = top_k is not None
+    capped_top_k = max(1, min(top_k if top_k is not None else DEFAULT_SEARCH_TOP_K, MAX_SEARCH_TOP_K))
+
+    # Audit finding P3: prior implementation held ``_mcp_session()``
+    # open across the brief-generation LLM round-trip (~5-30s), pinning
+    # a pooled DB connection during work that is entirely network-bound
+    # to the LLM provider. The brief path also issued a duplicate
+    # ``search_memories`` call (once here, once inside ``recall()``).
+    # Both are fixed by doing all DB-bound work inside the session,
+    # capturing the search results + config + readable-tenant set, then
+    # closing the session before invoking ``summarize_memories`` for
+    # the LLM brief.
+    try:
+        # All DB-touching work here is storage-routed: ``check_and_increment``
+        # (db unused), ``resolve_config`` (db ignored — cache-first storage
+        # read), ``enforce_fleet_read`` (agent_service → storage client),
+        # ``search_memories`` (pipeline → storage client), and
+        # ``log_cross_tenant_read`` (db unused — audit queue → storage). The
+        # only previously db-bound call, ``agent_repo.get_by_id``, becomes the
+        # storage client's ``get_agent`` (home-tenant scoped). So no
+        # ``_mcp_session`` / RLS GUCs — tenant isolation is carried explicitly:
+        # the agent lookup + write quota pin to the HOME tenant, while the READ
+        # (search + audit) widens via ``readable_tenant_ids`` exactly as before.
+        # D13 — same fix as REST /recall: bill the recall counter (flag-gated).
+        await check_and_increment(tenant_id, recall_operation())
+        config = await resolve_config(tenant_id)
+        # Agent profile + fleet-scope signals are HOME-tenant only — never
+        # widened by the readable set.
+        _ag = await lookup_agent(tenant_id, agent_id)
+        agent_profile = None
+        if _ag:
+            agent_profile = _ag.get("search_profile")
+        # Fleet scope enforcement (parity with REST /search): a constrained
+        # agent that omits fleet_ids is scoped to its own fleet, and a single
+        # explicit fleet goes through the cross-fleet trust ladder. Closes the
+        # recall side of the cross-fleet content leak.
+        if _ag is not None and not fleet_ids:
+            ag_fleet = _ag.get("fleet_id")
+            ag_trust = _ag.get("trust_level", 0)
+            if ag_fleet and ag_trust < 2:
+                fleet_ids = [ag_fleet]
+        # EVERY requested fleet — gating only the single-fleet case let a
+        # trust-1 agent widen its read by naming a second fleet (parity with
+        # REST /search and /recall).
+        if fleet_ids:
+            await enforce_fleet_read_many(tenant_id, agent_id, fleet_ids)
+        # Cross-tenant recall widens via readable_tenant_ids when the caller
+        # authenticated with a cross-tenant credential (kind=cross_tenant) — the
+        # gateway plumbs ``X-Readable-Tenant-IDs`` and the MCP middleware parks
+        # it on ``_readable_tenant_ids_var``. Single-tenant credentials leave
+        # the var empty; ``search_memories`` falls back to the home tenant only.
+        # C31/D12 — diagnostic trace context, filled by the pipeline when requested.
+        diagnostic_ctx: dict = {}
+        # Same field REST /search reports. Emitted on both surfaces so adding
+        # it does not itself become a parity gap: MCP always carries an agent
+        # identity, but ``diagnostic=true`` and an empty result set still make
+        # this False here.
+        recall_ctx: dict = {}
+        # The top_k the search resolved, and any strategy cut of it.
+        retrieval_ctx: dict = {}
+        results = await search_memories(
+            tenant_id=tenant_id,
+            query=query,
+            fleet_ids=fleet_ids,
+            filter_agent_id=filter_agent_id,
+            caller_agent_id=agent_id,
+            caller_tenant_id=tenant_id,
+            memory_type_filter=memory_type,
+            status_filter=status,
+            top_k=capped_top_k,
+            top_k_explicit=top_k_explicit,
+            valid_at=parsed_valid_at,
+            recall_boost=config.recall_boost,
+            graph_expand=config.graph_expand,
+            entity_retrieval=config.entity_retrieval,
+            tenant_config=config,
+            search_profile=agent_profile,
+            readable_tenant_ids=_get_readable_tenants() or None,
+            source="mcp_recall",
+            diagnostic=diagnostic,
+            diagnostic_ctx=diagnostic_ctx if diagnostic else None,
+            min_similarity=min_similarity,
+            recall_ctx=recall_ctx,
+            retrieval_ctx=retrieval_ctx,
+        )
+        # Cross-tenant read audit (F2): emit one event per source tenant when
+        # the credential widened beyond home. Async queue — non-blocking.
+        readable = _get_readable_tenants()
+        source_tenants = [t for t in readable if t and t != tenant_id]
+        if source_tenants:
+            await log_cross_tenant_read(
+                home_tenant_id=tenant_id,
+                home_agent_id=agent_id,
+                source_tenants=source_tenants,
+                surface="caura_recall",
+                query_summary=(query or "")[:200],
+            )
+        # The LLM brief (when requested) runs without any DB connection held.
+        _rows = [r.model_dump(mode="json") for r in results] if results else []
+        # C31/D1 — ``items`` is the canonical list key everywhere; ``results``
+        # stays as a permanent dual-emit alias (same list object, two keys) so
+        # existing consumers keep working. ``count`` per the contract.
+        # ``top_k`` over ``MAX_SEARCH_TOP_K`` is capped here rather than
+        # rejected — REST /search 422s on the same input (``schemas.py``,
+        # ``le=MAX_SEARCH_TOP_K``), and silent capping stays the friendlier
+        # default for an agent surface. But it has to be VISIBLE: with no
+        # error, no flag and no total, a client that asked for 50 and got 20
+        # cannot tell a capped page from an exhausted result set, and will
+        # conclude the tenant holds 20 matching memories. The tool description
+        # documents the cap, which is not a runtime signal — agents do not read
+        # parameter descriptions before believing a result set is complete.
+        #
+        # Reports only that the REQUESTED top_k was lowered. A full page at an
+        # uncapped ``top_k`` is still not proof of exhaustion; that would need a
+        # total, which this surface does not compute.
+        #
+        # ``recall_tracked`` is the same field REST /search reports — see the
+        # ``recall_ctx`` note above.
+        payload: dict = {
+            "results": _rows,
+            "items": _rows,
+            "count": len(_rows),
+            # Against the CLAMPED value, so a negative top_k is not reported as
+            # a truncation of a larger request.
+            "truncated": top_k is not None and top_k > capped_top_k,
+            "requested_top_k": top_k,
+            # What the search ran with: a strategy's cut, else the top_k it
+            # resolved from the request, profile or default (M-19).
+            "effective_top_k": retrieval_ctx.get("effective_top_k")
+            or retrieval_ctx.get("resolved_top_k")
+            or capped_top_k,
+            "recall_tracked": bool(recall_ctx.get("recall_tracked")),
+        }
+        if diagnostic:
+            counts = diagnostic_ctx.get("counts", {}) or {}
+            payload["diagnostic"] = {
+                "retrieval_strategy": diagnostic_ctx.get("retrieval_strategy"),
+                "top_k_requested": diagnostic_ctx.get("diagnostic_original_top_k"),
+                "min_similarity_applied": diagnostic_ctx.get("min_similarity_applied"),
+                **counts,
+                "search_params": {
+                    k: (float(v) if isinstance(v, (int, float)) else v)
+                    for k, v in (diagnostic_ctx.get("search_params", {}) or {}).items()
+                },
+                "all_candidates": diagnostic_ctx.get("all_candidates", []) or [],
+                # CAURA-722 — kept in step with the REST ``SearchDiagnostic``,
+                # which is where these are documented. MCP matters more than
+                # parity-for-its-own-sake here: ``caura_recall`` has no
+                # ``top_k`` cap, so it is the path an investigation reaches for
+                # once REST's limit binds, and the entity question is exactly
+                # the kind that gets probed there.
+                "entity_matches": diagnostic_ctx.get("entity_matches"),
+                "entity_match_declined": diagnostic_ctx.get("entity_match_declined", False),
+            }
+        if payload["truncated"]:
+            # Kept alongside the structured fields above, not replaced by them:
+            # the prose renders in a chat surface, and dropping a field a client
+            # may already read would be a breaking change for no gain.
+            payload["warning"] = f"top_k was capped at the maximum allowed value of {MAX_SEARCH_TOP_K}."
+        if include_brief:
+            payload["brief"] = await summarize_memories(
+                results,
+                query,
+                config,
+                # M-20: the as-of date anchors the brief's relative dates, as on
+                # REST /recall.
+                valid_at=parsed_valid_at,
+                top_k=capped_top_k,
+                t0=t0,
+                # ax-0917-h-03 — no ``items`` inside the brief. This payload
+                # ALREADY carries the identical rows twice, under ``results``
+                # and its permanent ``items`` alias above; the brief used to add
+                # two more, so one ``include_brief=true`` call shipped the same
+                # result set FOUR times into an agent's context window. The
+                # brief keeps ``memories``, which is /recall's canonical key and
+                # the one both first-party SDKs read.
+                #
+                # Safe to change here in a way the REST default is not:
+                # ``docs/public-api-stability.md`` pins MCP tool names,
+                # parameter names and op-dispatch values — not the shape of a
+                # tool's JSON body — while it explicitly makes REST response
+                # shapes part of the contract.
+                items_alias=False,
+            )
+        return _with_latency(_dumps(payload), t0)
+    except HTTPException as e:
+        logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
+        return _with_latency(
+            _error_response(_detail_code(e.detail, e.status_code), _detail_text(e.detail)), t0
+        )
+    except httpx.HTTPStatusError as e:
+        # sc.get_agent() / enforce_fleet_read() are storage HTTP calls now —
+        # surface a storage 4xx/5xx as the canonical envelope, not a raw raise.
+        return _storage_error_envelope(e, t0)
+
+
+async def caura_write(
+    content: Annotated[str | None, Field(description="Single-write text.")] = None,
+    items: Annotated[
+        list[dict] | None, Field(description="Batch of objects, ≤100; each needs 'content'.")
+    ] = None,
+    agent_id: Annotated[str, Field(description=_AGENT_ID_DESC)] = DEFAULT_AGENT_ID,
+    fleet_id: Annotated[str | None, Field(description="Fleet scope.")] = None,
+    visibility: Annotated[str | None, Field(description="scope_team|scope_org|scope_agent.")] = None,
+    memory_type: Annotated[str | None, Field(description="Type (single only).")] = None,
+    weight: Annotated[float | None, Field(description="0-1 (single only).")] = None,
+    # oss-0814-l-08 paid for the ``metadata`` clause below out of these two,
+    # which only restated their own parameter names ("Source URI", "Run id") —
+    # the fixtures README's stated preference over raising ``CEILING_TOKENS``.
+    # Net -3 tokens against the pre-change surface (5317 -> 5314).
+    source_uri: Annotated[str | None, Field(description="Single only.")] = None,
+    run_id: Annotated[str | None, Field(description="Single only.")] = None,
+    metadata: Annotated[
+        dict | None,
+        # oss-0814-l-08: say that these keys are the caller's. "LLM fills gaps;
+        # agent-provided values always win" has been true of metadata since C25
+        # and was stated only in source comments, so an agent reading the tool
+        # surface had nothing to go on — and the safe assumption from outside,
+        # that a field the platform also writes will be overwritten, is the
+        # wrong one. Six tokens, because the whole surface is on the context
+        # budget of every agent turn; ``MemoryCreate.metadata`` carries the full
+        # statement for anyone reading the REST schema.
+        Field(description="Metadata (single only). Your summary/tags survive enrichment."),
+    ] = None,
+    status: Annotated[str | None, Field(description="Status (single only).")] = None,
+    write_mode: Annotated[
+        str | None,
+        Field(description="fast|strong|auto (single only). 'strong' embeds inline — searchable at once."),
+    ] = None,
+) -> ToolReply:
+    """Single OR batch write. Exactly one of {content, items} is required.
+
+    Read-your-own-write: when embedding is deferred (any deployment not running it
+    inline), the stored row carries ``metadata.embedding_pending=True`` and will
+    not match a *semantic* search until ``core-worker`` backfills it — measured
+    ~15-20s on production, and over 10 minutes on staging, whose backfill is
+    slower. It is reachable by keyword (FTS) and via ``caura_list`` throughout.
+
+    ``write_mode="strong"`` embeds and enriches inline regardless of deployment
+    mode, so the response carries no ``embedding_pending`` and the memory is
+    immediately searchable. The cost is the embedding provider call on the request
+    path, which is exactly what fast mode's sub-2s p99 visibility SLA exists to
+    avoid — a per-write choice, not a default to flip.
+
+    The agent-facing wording of this lives in the ToolSpec description
+    (``core_api/tools/caura_write.py``), which is the source of truth for
+    ``tools/list``; this docstring is not what agents read.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if err := _check_write_scope():
+        return err
+    if (content is None) == (items is None):
+        return _with_latency(
+            _dumps(
+                {
+                    "error": {
+                        "code": "INVALID_ARGUMENTS",
+                        "message": "caura_write requires exactly one of {content, items}.",
+                        "details": {
+                            "received_content": content is not None,
+                            "received_items": items is not None,
+                            "resolution": "omit one",
+                        },
+                    }
+                }
+            ),
+            t0,
+        )
+    tenant_id = _get_tenant()
+    # WRITE identity: verified gateway id wins UNLESS it's a reserved
+    # placeholder (e.g. a misconfigured home_agent_id="main" cred), in which
+    # case the body-supplied id is honored so the install self-identifies
+    # rather than collapsing onto "main". Reads keep `_get_agent_id() or
+    # agent_id` (visibility scoping is unaffected).
+    # ``or agent_id`` keeps this ``str``: the resolver returns None only when
+    # BOTH inputs are falsy, and this parameter defaults to DEFAULT_AGENT_ID,
+    # so the fallback is unreachable here. It states that instead of asserting
+    # it — and the resolver's ``str | None`` is correct on its own terms,
+    # exercised with a None body by tests/test_effective_write_agent_id.py.
+    agent_id = effective_write_agent_id(_get_agent_id(), agent_id) or agent_id
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+    # C3/C8 — reject reserved memory_types at the boundary before we
+    # touch the DB. Single-write checks the top-level kwarg; the batch
+    # path below loops over BulkMemoryItem after validation.
+    if content is not None and (refuse := _refuse_reserved_memory_type(memory_type)):
+        return _with_latency(refuse, t0)
+
+    # WRITES → home tenant only. ``enforce_fleet_write`` (agent_service →
+    # storage client), ``check_and_increment`` (db unused), ``create_memory`` /
+    # ``create_memories_bulk`` (memory_service pipeline → storage client) are all
+    # storage-routed and pin to the home tenant via the ``tenant_id`` carried in
+    # the ``MemoryCreate`` / ``BulkMemoryCreate`` payload — never a foreign
+    # tenant, and no readable-set widening on the write path. ``_no_db()`` yields
+    # ``None`` (no RLS session) while keeping the storage-routed services'
+    # ``db``-first signatures satisfied.
+    async with _no_db():
+        try:
+            # Per-agent approval gate (require_agent_approval): resolve the
+            # tenant config so a new agent is created at trust_level 0 and the
+            # check below can refuse it — parity with the REST single-write path
+            # (routes/memories.py). REST bulk deliberately does NOT gate approval
+            # (broker fan-in path — see _write_memories_bulk_inner).
+            config = await resolve_config(tenant_id)
+            # Broker (install-credential) agent-ownership boundary — the same
+            # gate + owner-stamp + post-create re-check the REST write paths use
+            # (``resolve_write_agent``), so an install can't attribute a memory
+            # to an agent owned by a different install via MCP. Non-broker
+            # (interactive) callers pass straight through. Runs before
+            # ``enforce_fleet_write`` so the trust gate applies to the resolved
+            # (possibly degraded ``broker:<install>``) id.
+            agent, agent_id = await resolve_write_agent(
+                agent_id,
+                tenant_id,
+                fleet_id,
+                is_install_credential=_is_install_credential(),
+                install_uuid=_get_install_uuid(),
+                require_approval=config.require_agent_approval,
+            )
+            # Per-agent approval gate: a new agent under require_agent_approval
+            # starts at trust_level 0 and can't write until an admin approves it
+            # (mirrors _write_memory_inner's 403).
+            if agent.get("trust_level", 0) == 0:
+                return _with_latency(
+                    _error_response(
+                        "AGENT_NOT_APPROVED",
+                        f"Agent '{agent_id}' is not approved. Contact the tenant "
+                        "admin to set trust_level >= 1.",
+                    ),
+                    t0,
+                )
+            # Register the calling agent (auto-create row on first write) and
+            # enforce trust gating for cross-fleet writes — same surface the
+            # REST write path uses. Without this, MCP writes succeed without
+            # ever creating an Agent row, so a follow-up
+            # PATCH /agents/{id}/trust 404s.
+            agent = await enforce_fleet_write(tenant_id, agent_id, fleet_id)
+            # Mirror the REST write paths (routes/memories.py:937, :1125): an
+            # omitted fleet_id resolves to the caller's home fleet, so an MCP
+            # write scopes like a REST write instead of persisting
+            # fleet_id=NULL — a NULL-fleet row silently drops out of
+            # teammates' scope_team / fleet-filtered recall. Fires only when
+            # fleet_id is falsy, so an explicit (incl. cross-fleet) fleet_id
+            # is left untouched and still passes through the trust gate
+            # enforce_fleet_write applied above. If the agent has no home
+            # fleet (never been scoped), this is a no-op and the row stays
+            # NULL — unchanged from prior behavior.
+            if not fleet_id and agent.get("fleet_id"):
+                fleet_id = agent["fleet_id"]
+            if content is not None:
+                # Refuses when ``enforce_mcp_plan_limits`` is on, observes
+                # otherwise. The batch path below carries the ``bulk_create``
+                # twin — between them they cover every op on this surface that
+                # ``PLAN_LIMIT_GATED_OPS`` names (MCP exposes no
+                # ``redistribute``).
+                #
+                # BEFORE the quota charge, mirroring REST: a refused write must
+                # not consume the budget it was refused for. The order matters
+                # more here than it looks, because the counter this charges is
+                # the one over-plan mode is computed FROM — charging first
+                # would let a refused write push the tenant further over.
+                if refuse := _check_plan_limit("create", tenant_id):
+                    return _with_latency(refuse, t0)
+                result = await create_memory(
+                    MemoryCreate(
+                        tenant_id=tenant_id,
+                        fleet_id=fleet_id,
+                        agent_id=agent_id,
+                        # MemoryCreate validates this against MemoryType and
+                        # raises on anything else; the parameter stays ``str``
+                        # because MCPServer publishes it to tools/list.
+                        memory_type=memory_type,  # type: ignore[arg-type]
+                        content=content,
+                        weight=weight,
+                        source_uri=source_uri,
+                        run_id=run_id,
+                        metadata=metadata,
+                        status=status,
+                        visibility=visibility,
+                        write_mode=write_mode,  # type: ignore[arg-type]
+                    ),
+                )
+                # Charged only once the write succeeded, as REST does: a write
+                # that raised (rejected, duplicate, storage failure) wrote
+                # nothing, and an agent retrying it must not pay per attempt.
+                if charges_write_quota("create"):
+                    await check_and_increment(tenant_id, "write")
+                return _with_latency(_serialize(result), t0)
+            # Batch path. ``items`` is populated: the guard near the top of
+            # this handler admits exactly one of {content, items} and the
+            # single-write path returned above. mypy cannot follow that through
+            # the XOR, so bind a narrowed name — an ``assert`` would vanish
+            # under -O and leave the invariant merely claimed.
+            batch = items or []
+            if len(batch) > 100:
+                return _with_latency(
+                    _dumps(
+                        {
+                            "error": {
+                                "code": "BATCH_TOO_LARGE",
+                                "message": f"items length {len(batch)} exceeds maximum of 100.",
+                                "details": {"received": len(batch), "max": 100},
+                            }
+                        }
+                    ),
+                    t0,
+                )
+            try:
+                bulk_items = [BulkMemoryItem(**item) for item in batch]
+            except (ValidationError, TypeError) as e:
+                return _with_latency(
+                    _dumps(
+                        {
+                            "error": {
+                                "code": "INVALID_BATCH_ITEM",
+                                "message": f"Invalid items — {e}",
+                                "details": {"received_count": len(batch)},
+                            }
+                        }
+                    ),
+                    t0,
+                )
+            # C3/C8 — reject reserved memory_types per-item so the
+            # offending index is named in the error message.
+            for _idx, _item in enumerate(bulk_items):
+                if refuse := _refuse_reserved_memory_type(_item.memory_type, index=_idx):
+                    return _with_latency(refuse, t0)
+            # The batch twin of the single-write gate above. This is the path
+            # where an over-plan tenant can add the most rows per call, so
+            # leaving it out would have made the numbers read low in exactly
+            # the direction that matters — and, now that it can refuse, would
+            # leave the largest writes as the ones that got through.
+            #
+            # Refuses the WHOLE batch rather than trimming it to what fits.
+            # A partial batch would report success for a call that did not do
+            # what it was asked, and the caller has no way to tell which items
+            # landed; REST's bulk route refuses whole for the same reason.
+            if refuse := _check_plan_limit("bulk_create", tenant_id):
+                return _with_latency(refuse, t0)
+            bulk_data = BulkMemoryCreate(
+                tenant_id=tenant_id,
+                fleet_id=fleet_id,
+                agent_id=agent_id,
+                items=bulk_items,
+                visibility=visibility,
+            )
+            # MCP transport doesn't surface ``X-Bulk-Attempt-Id``;
+            # mint a server-side attempt id so each MCP-driven bulk
+            # call still gets per-item idempotency. A retried MCP tool
+            # call will use a different attempt id (so it isn't
+            # idempotent across MCP retries) — the MCP transport is
+            # unary and the loadtest finding (CAURA-602) doesn't apply
+            # to it; the trade-off is acceptable to keep this path
+            # simple. If a use case needs MCP retry idempotency, the
+            # client can pass an explicit token via metadata.
+            bulk_result = await create_memories_bulk(bulk_data, bulk_attempt_id=f"mcp:{uuid4()}")
+            # One unit per item, mirroring REST's ``POST /memories/bulk``. Before
+            # caura-ai/caura#1220 this path charged nothing at all.
+            #
+            # AFTER the write, as REST bulk now does: a batch that raised wrote
+            # nothing, and each MCP retry mints a fresh attempt id above, so
+            # charging first billed one never-written batch once per attempt.
+            # Still ``len(bulk_items)`` rather than the created count, so a
+            # successful batch costs what it did before — this changes charging
+            # on failure, not the price of per-item duplicates or errors.
+            #
+            # ``meters_mcp_bulk_write()`` is ON since caura-ai/caura#1638. It
+            # is still a billing switch rather than a correctness one — see its
+            # docstring — and still reversible by env without a redeploy.
+            #
+            # Unreachable while the plan-limit gate refuses, which is the point:
+            # a refused batch charges nothing.
+            if charges_write_quota("bulk_create") and meters_mcp_bulk_write():
+                await bulk_check_and_increment(tenant_id, len(bulk_items))
+            return _with_latency(_serialize(bulk_result), t0)
+        except ValidationError as e:
+            # ``MemoryCreate(...)`` on the single-write path above validates
+            # weight, content length, memory_type and visibility, and RAISES on
+            # anything else — but only ``HTTPException`` was handled, so those
+            # escaped this tool uncaught and reached the caller as an
+            # unstructured MCP error instead of INVALID_ARGUMENTS. The batch
+            # path already caught its own (INVALID_BATCH_ITEM, per item); this
+            # is the single path's missing twin, kept at the same level as the
+            # HTTPException handler so it covers every construction in the try.
+            return _with_latency(
+                _error_response(
+                    "INVALID_ARGUMENTS",
+                    f"Invalid write arguments — {e}",
+                ),
+                t0,
+            )
+        except HTTPException as e:
+            # Idempotent retry-safe duplicate: when create_memory raises 409
+            # with the "Duplicate memory exists: <uuid>" detail (Stage 5's
+            # per-agent exact-hash dedup hit), surface a 200-shaped success
+            # envelope so callers can treat the retry as a no-op rather than
+            # an error. Semantic-duplicate hits still surface as errors —
+            # the caller wrote new content that we suppressed, which is a
+            # semantically distinct outcome.
+            dup = _duplicate_info(e.detail) if e.status_code == 409 else None
+            # Only an exact-hash hit is a retry no-op. A semantic hit means the
+            # caller wrote NEW content that we suppressed — a different outcome
+            # that must keep surfacing as an error. That distinction used to be
+            # made by the regex simply failing to match the near-duplicate
+            # wording, i.e. by accident; it is now explicit.
+            if dup is not None and dup.get("reason") == duplicate_memory.REASON_EXACT:
+                payload = {
+                    "status": "duplicate",
+                    "existing_id": dup.get("existing_id"),
+                    "agent_id": agent_id,
+                }
+                # New in C29: which state the surviving row is in. A duplicate of
+                # an archived row is not the no-op a duplicate of a live row is,
+                # and the caller could not previously tell.
+                if dup.get("existing_status"):
+                    payload["existing_status"] = dup["existing_status"]
+                logger.info(
+                    "caura_write: idempotent duplicate hit existing=%s status=%s agent=%s",
+                    dup.get("existing_id"),
+                    dup.get("existing_status"),
+                    agent_id,
+                )
+                return _with_latency(_dumps(payload), t0)
+            logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
+            return _with_latency(
+                _error_response(_detail_code(e.detail, e.status_code), _detail_text(e.detail)), t0
+            )
+
+
+async def caura_manage(
+    op: Annotated[str, Field(description="read|update|transition|delete|bulk_delete|lineage.")],
+    memory_id: Annotated[str, Field(description="UUID. Required except for op=bulk_delete.")] = "",
+    memory_ids: Annotated[
+        list[str] | None,
+        Field(description="op=bulk_delete: list of memory UUIDs (max 1000)."),
+    ] = None,
+    status: Annotated[str | None, Field(description="op=transition.")] = None,
+    content: Annotated[str | None, Field(description="op=update.")] = None,
+    memory_type: Annotated[str | None, Field(description="op=update.")] = None,
+    weight: Annotated[float | None, Field(description="op=update; 0-1.")] = None,
+    title: Annotated[str | None, Field(description="op=update.")] = None,
+    metadata: Annotated[dict | None, Field(description="op=update.")] = None,
+    source_uri: Annotated[str | None, Field(description="op=update.")] = None,
+    agent_id: Annotated[str, Field(description=_AGENT_ID_DESC)] = DEFAULT_AGENT_ID,
+) -> ToolReply:
+    """Per-memory lifecycle: read | update | transition | delete | bulk_delete | lineage.
+
+    op=lineage walks the supersession chain for `memory_id` and returns
+    {this, superseded_by, supersessors} — the older row this memory
+    replaced (if any) and any newer rows that supersede this one.
+    Mirrors the focused agent-facing view of REST `/memories/{id}/contradictions`.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    _valid_ops = {"read", "update", "transition", "delete", "bulk_delete", "lineage"}
+    if op not in _valid_ops:
+        return _with_latency(
+            _dumps(
+                {
+                    "error": {
+                        "code": "INVALID_ARGUMENTS",
+                        "message": f"Unknown op '{op}'. Expected one of: {sorted(_valid_ops)}.",
+                        "details": {"op": op, "expected_ops": sorted(_valid_ops)},
+                    }
+                }
+            ),
+            t0,
+        )
+    # Mutating ops gated by the credential scope set; read/lineage stay open
+    # to read-only keys.
+    if op in {"update", "transition", "delete", "bulk_delete"} and (err := _check_write_scope()):
+        return err
+    # bulk_delete uses memory_ids (list); all other ops use memory_id (single UUID).
+    # Validate accordingly so a missing memory_id on bulk_delete doesn't fail with
+    # a misleading "Invalid UUID" error.
+    if op != "bulk_delete":
+        try:
+            uid = UUID(memory_id)
+        except ValueError:
+            return _with_latency(
+                _error_response("INVALID_ARGUMENTS", "Invalid memory_id — must be a valid UUID."),
+                t0,
+            )
+    tenant_id = _get_tenant()
+    # Raw authenticated identity (gateway-resolved). Used for fleet/scope
+    # authorization — must NOT fall back to the ``mcp-agent`` default, or an
+    # unauthenticated caller would inherit that identity's scope. ``None`` ⇒
+    # no agent context (OSS/standalone) ⇒ tenant-scoped, no agent isolation.
+    caller_agent_id = _get_agent_id()
+    agent_id = canonical_service_agent_id(caller_agent_id or agent_id)
+    if op in {"update", "transition", "delete", "bulk_delete"} and (
+        refuse := _refuse_default_agent_on_gateway(agent_id)
+    ):
+        return _with_latency(refuse, t0)
+
+    # All ops are storage-routed (``_no_db()`` ⇒ db=None): reads/writes carry
+    # tenant context explicitly. WRITES (bulk_delete / transition / update /
+    # delete) target the HOME tenant only — the storage methods scope by the
+    # explicit ``tenant_id``; READS (read / lineage) also pin to the home
+    # tenant here (per-id manage never widens to the readable set — same as
+    # pre-migration, which scoped every ``get_by_id_for_tenant`` to ``tenant_id``
+    # and never consulted ``readable_tenant_ids``).
+    sc = get_storage_client()
+    async with _no_db():
+        try:
+            if op == "bulk_delete":
+                if not memory_ids:
+                    return _with_latency(
+                        _error_response(
+                            "INVALID_ARGUMENTS", "op=bulk_delete requires non-empty 'memory_ids'."
+                        ),
+                        t0,
+                    )
+                if len(memory_ids) > 1000:
+                    return _with_latency(
+                        _error_response(
+                            "INVALID_ARGUMENTS", f"op=bulk_delete capped at 1000 ids (got {len(memory_ids)})."
+                        ),
+                        t0,
+                    )
+                try:
+                    uids = [UUID(i) for i in memory_ids]
+                except ValueError as e:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", f"invalid UUID in memory_ids — {e}"), t0
+                    )
+                # Trust gate (>= 3), mirroring single delete / REST DELETE. Blocks
+                # the cross-fleet bulk-delete-by-id IDOR for sub-admin agents; a
+                # trust>=3 admin agent retains tenant-wide delete (parity with
+                # enforce_fleet_write).
+                #
+                # ``caller_agent_id is None`` (a tenant-scoped credential) skips
+                # the gate BY DESIGN, not by omission — the trust ladder governs
+                # agent credentials and a tenant key holds no trust level. See
+                # ``enforce_delete``'s contract. Do NOT "fix" this by falling
+                # back to the ``agent_id`` tool argument: that value is
+                # caller-asserted, so it would let a tenant key pass the gate by
+                # naming any trust>=3 agent, and ``caller_agent_id`` is also the
+                # principal for the ``authorize_memory_access`` scope checks
+                # below and on read / update / lineage.
+                if caller_agent_id:
+                    await enforce_delete(tenant_id, caller_agent_id)
+                # HOME-tenant scoped soft-delete: the storage method applies the
+                # exact pre-migration predicate (tenant_id + id IN (...) +
+                # deleted_at IS NULL → set deleted_at=now, status='deleted') and
+                # returns the affected count. No cross-tenant widening.
+                deleted_count = await sc.soft_delete_by_ids(tenant_id, [str(u) for u in uids])
+                await log_action(
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    action="bulk_delete",
+                    resource_type="memory",
+                    detail={"count": deleted_count, "method": "by_ids", "via": "mcp", **_audit_actor()},
+                )
+                return _with_latency(_dumps({"deleted": deleted_count, "requested": len(uids)}), t0)
+            if op == "lineage":
+                # HOME-tenant scoped. ``get_memory_contradictions`` bundles the
+                # three reads (this row + supersessors + older) in one storage
+                # round-trip. Storage enforces tenant match + ``deleted_at IS
+                # NULL`` on the target and the supersessors, plus the
+                # cross-tenant ``older`` guard. It returns None on the target
+                # being absent/soft-deleted/wrong-tenant — same NOT_FOUND as
+                # before. NOTE: storage returns ``older`` regardless of its
+                # ``deleted_at`` (so the consumer can decide per-field, mirroring
+                # REST ``/memories/{id}/contradictions``); the pre-migration
+                # inline query excluded a soft-deleted ``older`` from
+                # ``superseded_by``, so we re-apply that filter client-side below.
+                bundle = await sc.get_memory_contradictions(tenant_id, str(uid))
+                if not bundle:
+                    return _with_latency(_error_response("NOT_FOUND", "Memory not found."), t0)
+                this = bundle["memory"]
+                # Fleet/agent-scope authorization (mirrors op=read): the
+                # supersession chain would otherwise leak a scoped row by id.
+                if not await authorize_memory_access(
+                    tenant_id,
+                    caller_agent_id,
+                    visibility=this.get("visibility"),
+                    owner_agent_id=this.get("agent_id"),
+                    fleet_id=this.get("fleet_id"),
+                ):
+                    return _with_latency(_error_response("NOT_FOUND", "Memory not found."), t0)
+
+                def _chain_row(row: dict) -> dict:
+                    content = row.get("content") or ""
+                    return {
+                        "id": str(row.get("id")),
+                        "content_preview": content[:200],
+                        "status": row.get("status"),
+                        "created_at": row.get("created_at"),
+                    }
+
+                # The older memory this row replaced (if any). Storage applied
+                # the same-tenant guard; re-apply the soft-deleted filter here so
+                # a soft-deleted ``older`` is excluded exactly as the
+                # pre-migration inline query did (``older.deleted_at is None``).
+                older = bundle.get("older")
+                superseded_by = _chain_row(older) if older and older.get("deleted_at") is None else None
+                # Newer rows whose supersedes_id points at this row.
+                supersessors = [_chain_row(m) for m in bundle.get("supersessors", [])]
+                return _with_latency(
+                    _dumps(
+                        {
+                            "this": {
+                                "id": str(this.get("id")),
+                                "status": this.get("status"),
+                                "supersedes_id": (
+                                    str(this["supersedes_id"]) if this.get("supersedes_id") else None
+                                ),
+                            },
+                            "superseded_by": superseded_by,  # the OLDER row this replaced
+                            "supersessors": supersessors,  # NEWER rows that replaced this
+                        }
+                    ),
+                    t0,
+                )
+            if op == "read":
+                memory = await sc.get_memory(str(uid), tenant_id)
+                if not memory:
+                    return _with_latency(_error_response("NOT_FOUND", "Memory not found."), t0)
+                # Fleet/agent-scope authorization: honor the same scope_agent +
+                # cross-fleet trust ladder the search/list paths enforce, so an
+                # agent can't read a peer's scoped row by id. NOT_FOUND (not
+                # PERMISSION_DENIED) to avoid confirming the id exists.
+                if not await authorize_memory_access(
+                    tenant_id,
+                    caller_agent_id,
+                    visibility=memory.get("visibility"),
+                    owner_agent_id=memory.get("agent_id"),
+                    fleet_id=memory.get("fleet_id"),
+                ):
+                    return _with_latency(_error_response("NOT_FOUND", "Memory not found."), t0)
+                return _with_latency(
+                    _dumps(
+                        {
+                            "id": str(memory.get("id")),
+                            "content": memory.get("content"),
+                            "memory_type": memory.get("memory_type"),
+                            "status": memory.get("status"),
+                            "weight": memory.get("weight"),
+                            "agent_id": memory.get("agent_id"),
+                            "fleet_id": memory.get("fleet_id"),
+                            "visibility": memory.get("visibility"),
+                            "title": memory.get("title"),
+                            "created_at": memory.get("created_at"),
+                            "last_recalled_at": memory.get("last_recalled_at"),
+                            "recall_count": memory.get("recall_count", 0),
+                            "deleted_at": memory.get("deleted_at"),
+                            "metadata": memory.get("metadata_"),
+                        }
+                    ),
+                    t0,
+                )
+            if op == "transition":
+                if not status:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=transition requires 'status'."), t0
+                    )
+                if status not in MEMORY_STATUSES:
+                    return _with_latency(
+                        _error_response(
+                            "INVALID_ARGUMENTS",
+                            f"Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}",
+                        ),
+                        t0,
+                    )
+                # WRITE → home tenant only.
+                memory = await sc.get_memory(str(uid), tenant_id)
+                if not memory:
+                    return _with_latency(_error_response("NOT_FOUND", "Memory not found."), t0)
+                # Cross-fleet / scope_agent authorization (write threshold).
+                if not await authorize_memory_access(
+                    tenant_id,
+                    caller_agent_id,
+                    visibility=memory.get("visibility"),
+                    owner_agent_id=memory.get("agent_id"),
+                    fleet_id=memory.get("fleet_id"),
+                    write=True,
+                ):
+                    return _with_latency(
+                        _error_response(
+                            "PERMISSION_DENIED",
+                            f"Agent cannot modify memory in fleet '{memory.get('fleet_id')}'.",
+                        ),
+                        t0,
+                    )
+                old_status = memory.get("status")
+                # Asked, not assumed — ``transition`` is not in
+                # ``WRITE_QUOTA_OPS``, so this charges nothing today. Written as
+                # a lookup rather than as an absent call because "free"
+                # expressed by omission is invisible in review, and an omission
+                # on one surface and a call on the other is precisely how these
+                # two drifted.
+                if charges_write_quota("transition"):
+                    await check_and_increment(tenant_id, "write")
+                await sc.update_memory_status(str(uid), status, tenant_id=tenant_id)
+                await log_action(
+                    tenant_id=tenant_id,
+                    agent_id=memory.get("agent_id"),
+                    action="status_update",
+                    resource_type="memory",
+                    resource_id=uid,
+                    detail={"old_status": old_status, "new_status": status},
+                )
+                # Structured, not prose. ``op=read``/``op=update`` return
+                # serialized objects and every refusal returns a JSON error
+                # envelope, so a prose sentence here left one tool with three
+                # return shapes and forced callers to sniff the type — and then
+                # to sniff the TEXT, because a string is the success case only
+                # if it does not happen to contain "Error". A predicate like
+                # that passes for years and silently inverts the day someone
+                # rewords a message.
+                #
+                # Keys copied from REST ``PATCH /memories/{id}/status``
+                # (``memory_id``/``old_status``/``new_status``, see
+                # ``openapi_responses.MemoryStatusPatchResponse``) so the two
+                # surfaces are parseable by one client.
+                return _with_latency(
+                    _dumps(
+                        {
+                            "memory_id": str(uid),
+                            "old_status": old_status,
+                            "new_status": status,
+                            # The old prose, kept for chat rendering.
+                            "message": f"Memory {memory_id} status updated: {old_status} -> {status}",
+                        }
+                    ),
+                    t0,
+                )
+            if op == "update":
+                # C3/C8: reject agent-supplied server-reserved types on update,
+                # mirroring the single-write guard above. No-op when memory_type
+                # is None or non-reserved.
+                if refuse := _refuse_reserved_memory_type(memory_type):
+                    return _with_latency(refuse, t0)
+                fields: dict = {}
+                if content is not None:
+                    fields["content"] = content
+                if memory_type is not None:
+                    fields["memory_type"] = memory_type
+                if weight is not None:
+                    fields["weight"] = weight
+                if title is not None:
+                    fields["title"] = title
+                if status is not None:
+                    fields["status"] = status
+                if metadata is not None:
+                    fields["metadata"] = metadata
+                if source_uri is not None:
+                    fields["source_uri"] = source_uri
+                if not fields:
+                    return _with_latency(
+                        _error_response(
+                            "INVALID_ARGUMENTS",
+                            "No fields to update. Provide at least one field to change.",
+                        ),
+                        t0,
+                    )
+                # Built before the charge: a value the model rejects (weight above
+                # 1, an unknown memory_type or status, empty content) is the
+                # caller's error, answered as INVALID_ARGUMENTS and not billed.
+                # Uncaught, it reached the client as an unstructured tool error
+                # after the charge (M-22), the twin of caura_write's fix.
+                try:
+                    patch = MemoryUpdate(**fields)
+                except ValidationError as e:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", f"Invalid update arguments — {e}"), t0
+                    )
+                # WRITE → home tenant only. ``update_memory`` is storage-routed
+                # and scopes the row to the explicit ``tenant_id``.
+                if charges_write_quota("update"):
+                    await check_and_increment(tenant_id, "write")
+                result = await update_memory(uid, tenant_id, patch, agent_id=agent_id)
+                return _with_latency(_serialize(result), t0)
+            # op == "delete" — WRITE → home tenant only.
+            #
+            # ``caller_agent_id is None`` (a tenant-scoped credential) means both
+            # checks below are skipped, and that is the decided behaviour rather
+            # than a gap: the trust ladder governs agent credentials, tenant
+            # scope governs tenant keys (see ``enforce_delete``). The same
+            # distinction already governs read / update / lineage above.
+            if caller_agent_id:
+                # Trust gate (>= 3) + cross-fleet / scope_agent row authorization,
+                # mirroring REST DELETE /memories/{id}.
+                await enforce_delete(tenant_id, caller_agent_id)
+                target = await sc.get_memory(str(uid), tenant_id)
+                if target and not await authorize_memory_access(
+                    tenant_id,
+                    caller_agent_id,
+                    visibility=target.get("visibility"),
+                    owner_agent_id=target.get("agent_id"),
+                    fleet_id=target.get("fleet_id"),
+                    write=True,
+                ):
+                    return _with_latency(
+                        _error_response(
+                            "PERMISSION_DENIED",
+                            f"Agent cannot delete memory in fleet '{target.get('fleet_id')}'.",
+                        ),
+                        t0,
+                    )
+            if charges_write_quota("delete"):
+                await check_and_increment(tenant_id, "write")
+            await soft_delete_memory(uid, tenant_id)
+            # The caller's row, as REST DELETE writes one. The ``soft_delete``
+            # rows above name each row's owner, not who deleted it.
+            await log_action(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                action="delete",
+                resource_type="memory",
+                resource_id=uid,
+                detail={"via": "mcp", **_audit_actor()},
+            )
+            # Structured for the same reason as ``op=transition`` above. REST
+            # DELETE returns 204 with no body, so there is no shape to copy
+            # here; ``memory_id`` matches the transition key rather than the
+            # bare ``id`` so one tool does not name the same thing two ways.
+            # ``deleted`` reports that the delete succeeded, not that the row is
+            # gone — this is a soft delete, which is why the smoke asserts the
+            # read-back 404 rather than trusting the acknowledgement.
+            return _with_latency(
+                _dumps(
+                    {
+                        "memory_id": str(uid),
+                        "deleted": True,
+                        "message": f"Memory {memory_id} deleted.",
+                    }
+                ),
+                t0,
+            )
+        except HTTPException as e:
+            logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
+            return _with_latency(
+                _error_response(_detail_code(e.detail, e.status_code), _detail_text(e.detail)), t0
+            )
+        except httpx.HTTPStatusError as e:
+            # storage_client raises on non-2xx — surface the upstream status +
+            # detail in the canonical envelope (parity with sibling tools).
+            return _storage_error_envelope(e, t0)
+
+
+async def caura_entity_get(
+    entity_id: Annotated[str, Field(description="The UUID of the entity to look up.")],
+) -> ToolReply:
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    try:
+        uid = UUID(entity_id)
+    except ValueError:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "Invalid entity_id — must be a valid UUID."),
+            t0,
+        )
+
+    # ``get_entity`` is storage-routed (entity_service → storage client); the
+    # ``db`` arg is used only by a best-effort on_recall hook that swallows its
+    # own errors, so pass ``None`` rather than open an RLS session. Tenant
+    # isolation is carried by the explicit ``tenant_id`` + ``caller_agent_id``
+    # the service already forwards to the storage client.
+    try:
+        # The home tenant on both sides: this tool reads no sibling.
+        result = await get_entity(
+            uid, _get_tenant(), caller_agent_id=_get_agent_id(), caller_tenant_id=_get_tenant()
+        )
+    except HTTPException as e:
+        return _with_latency(
+            _error_response(_detail_code(e.detail, e.status_code), _detail_text(e.detail)), t0
+        )
+    except httpx.HTTPStatusError as e:
+        return _storage_error_envelope(e, t0)
+    except Exception as e:
+        logger.exception("Unhandled error in caura_entity_get")
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+    if not result:
+        # The envelope, as REST's 404 (M-23). A hidden entity is ``None`` too
+        # (M-83), so it answers exactly as a missing id.
+        return _with_latency(_error_response("NOT_FOUND", "Entity not found."), t0)
+    return _with_latency(_serialize(result), t0)
+
+
+async def caura_tune(
+    agent_id: Annotated[str, Field(description=_AGENT_ID_DESC)] = DEFAULT_AGENT_ID,
+    top_k: Annotated[int | None, Field(description=f"1-{MAX_SEARCH_TOP_K}.")] = None,
+    min_similarity: Annotated[float | None, Field(description="0.1-0.9.")] = None,
+    fts_weight: Annotated[float | None, Field(description="0=semantic, 1=keyword.")] = None,
+    freshness_floor: Annotated[float | None, Field(description="0-1.")] = None,
+    freshness_decay_days: Annotated[int | None, Field(description="7-730.")] = None,
+    recall_boost_cap: Annotated[float | None, Field(description="1-3.")] = None,
+    recall_decay_window_days: Annotated[int | None, Field(description="7-365.")] = None,
+    graph_max_hops: Annotated[int | None, Field(description="0-3.")] = None,
+    similarity_blend: Annotated[float | None, Field(description="0-1.")] = None,
+) -> ToolReply:
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if err := _check_write_scope():
+        return err
+    tenant_id = _get_tenant()
+    agent_id = canonical_service_agent_id(_get_agent_id() or agent_id)
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+
+    try:
+        profile = SearchProfileUpdate(
+            top_k=top_k,
+            min_similarity=min_similarity,
+            fts_weight=fts_weight,
+            freshness_floor=freshness_floor,
+            freshness_decay_days=freshness_decay_days,
+            recall_boost_cap=recall_boost_cap,
+            recall_decay_window_days=recall_decay_window_days,
+            graph_max_hops=graph_max_hops,
+            similarity_blend=similarity_blend,
+        )
+    except (ValidationError, ValueError) as e:
+        return _with_latency(_error_response("INVALID_ARGUMENTS", f"{e}"), t0)
+
+    updates = profile.model_dump(exclude_none=True)
+    # WRITE → home tenant only. ``resolve_write_agent`` scopes the lookup or
+    # create, and the search-profile PATCH binds that same tenant to the update.
+    try:
+        # Broker ownership boundary + owner stamp on first touch — the same
+        # resolution ``caura_write`` uses, so an install credential cannot
+        # rewrite the profile of an agent another install owns. Non-broker
+        # callers reach ``get_or_create_agent`` unchanged.
+        agent, agent_id = await resolve_write_agent(
+            agent_id,
+            tenant_id,
+            None,
+            is_install_credential=_is_install_credential(),
+            install_uuid=_get_install_uuid(),
+        )
+        current = agent.get("search_profile") or {}
+        if updates:
+            current.update(updates)
+            current = validate_search_profile(current)
+            await get_storage_client().update_search_profile(agent["id"], tenant_id, current)
+            await log_action(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                action="agent_tune",
+                resource_type="agent",
+                resource_id=agent.get("id"),
+                detail={"agent_id": agent_id, "changes": updates, "via": "mcp", **_audit_actor()},
+            )
+        return _with_latency(_dumps({"agent_id": agent_id, "search_profile": current}), t0)
+    except HTTPException as e:
+        logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
+        return _with_latency(
+            _error_response(_detail_code(e.detail, e.status_code), _detail_text(e.detail)), t0
+        )
+    except httpx.HTTPStatusError as e:
+        return _storage_error_envelope(e, t0)
+
+
+# ---------------------------------------------------------------------------
+# Consolidated tools: doc CRUD, list, knowledge-layer placeholders
+# ---------------------------------------------------------------------------
+
+
+# The ``skills`` collection backs the agent-to-agent skill catalog (formerly
+# served by the dropped memclaw_share_skill / memclaw_unshare_skill tools).  # legacy-name-floor: names the removed share/unshare tools
+# Slugs become directory names on plugin-side reconciliation
+# (``plugin/skills/<slug>/SKILL.md``), so doc_id is constrained to a
+# filesystem-safe identifier — same regex the old skill_service used so
+# pre-migration uploads remain valid.
+SKILLS_COLLECTION = "skills"
+_SKILL_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
+
+# The agent-facing MCP surface only exposes skills in this status. The
+# Skill Factory lifecycle (candidate → staged → active) gates what an
+# agent can discover: candidate/staged/quarantined/rejected skills are
+# in-flight or blocked and must NOT surface to agents. Only this filter
+# turns "an operator approved it" into "agents can find it".
+_AGENT_VISIBLE_SKILL_STATUS = "active"
+
+
+async def _skills_factory_flag(tenant_id: str) -> bool:
+    """Strict opt-in check — RAISES on a settings-lookup failure.
+
+    Is ``skills_factory.enabled`` true for this tenant? Callers that gate
+    a SECURITY decision (op=write / op=delete) wrap this and **fail
+    closed** (abort the mutation) on error — they must never proceed
+    unvalidated just because the flag couldn't be read. Read-path callers
+    use the lenient ``_skills_factory_enabled`` wrapper instead.
+    ``get_raw_settings`` is cache-first (5-min TTL), so this is a cheap
+    hot-path check.
+    """
+    raw = await get_raw_settings(tenant_id)
+    return (
+        isinstance(raw, dict)
+        and isinstance(raw.get("skills_factory"), dict)
+        and bool(raw["skills_factory"].get("enabled"))
+    )
+
+
+async def _skills_factory_enabled(tenant_id: str) -> bool:
+    """Non-raising opt-in check for the active-only skill-read filter
+    (read / query / search) — fails CLOSED on a settings-lookup failure.
+
+    On success returns the tenant's true ``skills_factory.enabled`` flag,
+    so non-opted-in tenants keep byte-identical (unfiltered) read
+    behavior — the merge-day no-op invariant.
+
+    On a settings-lookup FAILURE it returns ``True`` (assume enabled), so
+    the active-only filter IS applied: a transient settings outage must
+    not let a non-active skill (candidate / staged / quarantined) leak to
+    an agent. The read still succeeds — it's filtered, not 500'd — so the
+    cost is only that, during an outage, a tenant temporarily sees just
+    their ``active`` skills. For non-opted-in tenants that is a near
+    no-op (their skills are all ``active`` post-migration). This keeps
+    ALL skill gates fail-closed: write/delete abort, reads filter.
+    """
+    try:
+        return await _skills_factory_flag(tenant_id)
+    except Exception:
+        logger.warning(
+            "skills_factory flag lookup failed for %s; failing CLOSED — active-only "
+            "filter APPLIED (only status='active' skills surface) until cache recovers",
+            tenant_id,
+        )
+        return True
+
+
+def _safe_int(val: Any, default: int) -> int:
+    """Coerce a settings value to int, falling back to ``default`` on a
+    null, boolean, or non-numeric value. The per-tenant byte caps are
+    operator-editable JSON, so a misconfiguration (``null``, ``"auto"``,
+    ``true``/``false``) must degrade to the documented default — not
+    crash (or silently mis-cap) the skills write path.
+
+    ``bool`` is checked first because it is a subclass of ``int`` in
+    Python: ``int(True) == 1`` / ``int(False) == 0`` would otherwise pass
+    through silently and produce a 1- or 0-byte cap rather than the
+    intended default."""
+    if isinstance(val, bool):
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _doc_field(doc: Any, name: str, default: Any = None) -> Any:
+    """Read a document field from either a storage-client dict or an ORM row.
+
+    Fix 2 Phase 4 routes ``caura_doc`` through the storage HTTP client, so the
+    documents come back as plain dicts; pre-migration tests (and any residual
+    ORM caller) pass an attribute-bearing object. Normalise both so the
+    skill-gate / response-shaping code stays shape-agnostic."""
+    if isinstance(doc, dict):
+        return doc.get(name, default)
+    return getattr(doc, name, default)
+
+
+def _skill_hidden_from_agent(doc: Any, *, caller_tenant_id: str, caller_opted_in: bool) -> bool:
+    """Whether a fetched row must NOT surface on the agent MCP skill
+    surface.
+
+    A skills-collection row is hidden when it is non-active AND either:
+
+      • the caller's tenant opted in (the active-only gate applies to
+        the caller's own skills), or
+      • the row belongs to a DIFFERENT tenant than the caller — a
+        sibling tenant's in-flight / blocked skill must never leak
+        through cross-tenant credentials, regardless of the *caller's*
+        own opt-in flag. This is safe: a non-opted-in owning tenant's
+        skills are all ``active`` (backfilled by migration 022), so this
+        only ever hides a genuinely non-active row, never a legitimately
+        visible one.
+
+    Non-skills rows are never hidden. Keyed off the row's own
+    ``tenant_id`` so the decision follows the OWNING tenant, not just
+    the caller's flag (closes the cross-tenant read leak).
+
+    Accepts either an ORM Document or a storage-client dict (Fix 2 Phase 4
+    routes ``caura_doc`` through the storage HTTP client, which returns
+    dicts) — ``_doc_field`` normalises field access across both shapes."""
+    if _doc_field(doc, "collection") != SKILLS_COLLECTION:
+        return False
+    if (_doc_field(doc, "data") or {}).get("status") == _AGENT_VISIBLE_SKILL_STATUS:
+        return False
+    return caller_opted_in or _doc_field(doc, "tenant_id", caller_tenant_id) != caller_tenant_id
+
+
+async def caura_doc(
+    op: Annotated[str, Field(description="write|read|query|delete|list_collections|search.")],
+    collection: Annotated[
+        str | None,
+        Field(
+            description="Collection. Required for write|read|query|delete|search; omitted for list_collections."
+        ),
+    ] = None,
+    doc_id: Annotated[str | None, Field(description="op=write|read|delete.")] = None,
+    data: Annotated[dict | None, Field(description="op=write.")] = None,
+    where: Annotated[dict | None, Field(description="op=query.")] = None,
+    order_by: Annotated[str | None, Field(description="op=query.")] = None,
+    order: Annotated[str, Field(description="op=query: asc|desc.")] = "asc",
+    limit: Annotated[int, Field(description="op=query.")] = 20,
+    offset: Annotated[int, Field(description="op=query.")] = 0,
+    agent_id: Annotated[str, Field(description=_AGENT_ID_DESC)] = DEFAULT_AGENT_ID,
+    fleet_id: Annotated[
+        str | None,
+        Field(description="op=write; optional scoping filter for op=list_collections|search."),
+    ] = None,
+    query: Annotated[str | None, Field(description="op=search: natural-language query.")] = None,
+    top_k: Annotated[
+        int,
+        Field(description=f"op=search: max results (1-{MAX_DOC_SEARCH_TOP_K})."),
+    ] = DEFAULT_DOC_SEARCH_TOP_K,
+) -> ToolReply:
+    """Structured-document CRUD. Op-dispatched. Replaces the 4 prior
+    `caura_doc_*` tools."""
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    _valid_ops = {"write", "read", "query", "delete", "list_collections", "search"}
+    if op not in _valid_ops:
+        return _with_latency(
+            _dumps(
+                {
+                    "error": {
+                        "code": "INVALID_ARGUMENTS",
+                        "message": f"Unknown op '{op}'. Expected one of: {sorted(_valid_ops)}.",
+                        "details": {"op": op, "expected_ops": sorted(_valid_ops)},
+                    }
+                }
+            ),
+            t0,
+        )
+    # `collection` is required for write/read/query/delete. It is optional
+    # for list_collections (by design) and for search (where omitting it
+    # means "search across every collection in this tenant" — the broad
+    # strategy; supply collection to scope the search to just one).
+    if op not in {"list_collections", "search"} and not collection:
+        return _with_latency(_error_response("INVALID_ARGUMENTS", f"op={op} requires 'collection'."), t0)
+    # Write/delete are gated by the credential scope set; read/query/list/search
+    # remain available to read-only keys.
+    if op in {"write", "delete"} and (err := _check_write_scope()):
+        return err
+    tenant_id = _get_tenant()
+    # Raw authenticated identity for the delete trust gate (None ⇒ no agent
+    # context). Must not fall back to the ``mcp-agent`` default.
+    caller_agent_id = _get_agent_id()
+    agent_id = canonical_service_agent_id(caller_agent_id or agent_id)
+    # A29 — refuse the default identity on every op. Was previously
+    # write-only (A14); reads inherit the same contract because the
+    # silent-empty-result UX is its own class of paper cut, and ``delete``
+    # is a destructive op that was inadvertently un-guarded under the
+    # earlier write-only scope.
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+
+    # Cross-tenant credentials widen READ ops (list_collections, read, query,
+    # search) via ``readable_tenant_ids``. WRITE/DELETE pin to the HOME tenant —
+    # same contract as recall vs write. ``readable`` stays None for
+    # single-tenant callers; storage falls back to ``tenant_id = $1``. All doc
+    # access is now storage-routed (``_no_db()`` ⇒ db=None); the org-settings /
+    # skills-gate helpers below are storage-backed and ignore the ``None`` db.
+    sc = get_storage_client()
+    readable = _get_readable_tenants() or None
+    READ_OPS = {"list_collections", "read", "query", "search"}
+
+    async with _no_db():
+        try:
+            if op == "list_collections":
+                collections_resp = await sc.list_document_collections(
+                    tenant_id=tenant_id,
+                    fleet_id=fleet_id,
+                    readable_tenant_ids=readable if op in READ_OPS else None,
+                )
+                rows = [(c["name"], c["count"]) for c in collections_resp.get("collections", [])]
+                # Active-only count correction for skills: an opted-in
+                # tenant's listing must not advertise non-active skills
+                # in the count — they're invisible to read/query/search,
+                # so a count that includes them is misleading. Recompute
+                # the skills row restricted to status='active', over the
+                # same (possibly cross-tenant) scope the listing used.
+                # One COUNT, only when a skills row is present AND the
+                # tenant opted in.
+                if any(name == SKILLS_COLLECTION for name, _ in rows) and await _skills_factory_enabled(
+                    tenant_id
+                ):
+                    active_count = await sc.document_count_in_collection(
+                        tenant_id,
+                        SKILLS_COLLECTION,
+                        status=_AGENT_VISIBLE_SKILL_STATUS,
+                        fleet_id=fleet_id,
+                        readable_tenant_ids=readable,
+                    )
+                    rows = [
+                        (name, active_count if name == SKILLS_COLLECTION else count) for name, count in rows
+                    ]
+                return _with_latency(
+                    _dumps(
+                        {
+                            "collections": [{"name": name, "count": count} for name, count in rows],
+                            "count": len(rows),
+                        }
+                    ),
+                    t0,
+                )
+            if op == "write":
+                if not doc_id:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=write requires 'doc_id'."), t0
+                    )
+                if data is None:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=write requires 'data'."), t0
+                    )
+                # ``collection`` is guaranteed non-empty here by the op-level
+                # guard above (write is not in the {list_collections, search}
+                # exemption set), but that guard is too far away for the type
+                # checker to narrow through. Rebind so the derivation helpers
+                # below take a plain ``str``.
+                write_collection: str = collection or ""
+                refuse_system_collection(write_collection)
+                # M-79: the broker ownership boundary before anything acts on
+                # ``agent_id``. The skills validator below binds a staged draft
+                # to its author and stamps ``data.origin.agent_id``, and it ran
+                # on the claimed id, so an install naming another install's
+                # agent passed that agent's draft check and was recorded as it.
+                # Read-only here; ``resolve_write_agent`` just below applies the
+                # gate again (a no-op on the degraded id) and stamps the owner.
+                if _is_install_credential():
+                    agent_id = await broker_owned_agent_id(agent_id, _get_install_uuid(), tenant_id)
+                # Mirror caura_write's agent registration so a doc upsert
+                # via MCP creates the Agent row on first contact and enforces
+                # cross-fleet trust gating. WRITE → home tenant only. Ahead of
+                # the skills validator and the embedding call, as on REST, so a
+                # refused caller spends no provider quota.
+                #
+                # Broker ownership boundary first (parity with caura_write): an
+                # install credential's ``agent_id`` is a claim, so a doc — and
+                # the memory minted from it below — must not land under an
+                # agent another install owns.
+                _, agent_id = await resolve_write_agent(
+                    agent_id,
+                    tenant_id,
+                    fleet_id,
+                    is_install_credential=_is_install_credential(),
+                    install_uuid=_get_install_uuid(),
+                )
+                write_agent = await enforce_fleet_write(tenant_id, agent_id, fleet_id)
+                # M-89: an agent awaiting approval writes nothing, as in
+                # caura_write; the write would also mint a memory as it.
+                if write_agent.get("trust_level", 0) == 0:
+                    return _with_latency(
+                        _error_response(
+                            "AGENT_NOT_APPROVED",
+                            f"Agent '{agent_id}' is not approved. Contact the tenant "
+                            "admin to set trust_level >= 1.",
+                        ),
+                        t0,
+                    )
+                # Replacing a document a different agent authored needs the
+                # trust op=delete needs (parity with REST POST /documents); an
+                # unowned, author-less doc does not. Agent credentials only —
+                # keyed on the authenticated identity, never on the
+                # ``agent_id`` argument, like the delete gate.
+                if caller_agent_id is not None:
+                    await enforce_document_overwrite(
+                        tenant_id,
+                        agent_id,
+                        collection=write_collection,
+                        doc_id=doc_id,
+                        force=False,
+                    )
+                # Same home-fleet resolution as caura_write: keep an omitted
+                # fleet_id from publishing a fleet_id=NULL doc/skill row that
+                # fleet-scoped teammates can't discover. No-op when the agent
+                # has no home fleet.
+                if not fleet_id and write_agent.get("fleet_id"):
+                    fleet_id = write_agent["fleet_id"]
+                # Skills slug rule — doc_id becomes a filesystem directory
+                # on the plugin side, so it must be filesystem-safe.
+                if collection == SKILLS_COLLECTION and not _SKILL_SLUG_RE.fullmatch(doc_id):
+                    return _with_latency(
+                        _error_response(
+                            "INVALID_ARGUMENTS",
+                            f"collection='skills' requires doc_id matching "
+                            f"{_SKILL_SLUG_RE.pattern} — got {doc_id!r}. "
+                            "Slugs become directory names on each plugin node.",
+                        ),
+                        t0,
+                    )
+                # ── Skill Factory SF-002 lifecycle validator ─────────
+                # The agent-facing MCP write path runs the SAME validator
+                # the REST route does (routes/documents.py §SF-002), so an
+                # agent-direct skill write flows through the planned
+                # lifecycle instead of landing unvalidated in limbo:
+                #   • status defaults to 'staged' → HITL Inbox (a skill is
+                #     never agent-visible until approved to 'active')
+                #   • status RBAC 403s a caller-supplied 'active' /
+                #     'candidate' / system status — this is what actually
+                #     closes self-promotion (not a blanket status reject)
+                #   • source RBAC 403s source='forge'/'manual' from an
+                #     agent caller (they must use source='agent')
+                #   • Sentinel pre-scan + content_hash + byte/slug caps
+                # MCP callers carry NO admin/forge identity — there is no
+                # is_admin/org_role accessor on this surface — so both
+                # is_admin and is_internal_forge are False. An admin who
+                # needs to author an 'active' skill uses the REST/dashboard
+                # path, which has the real auth context. Gated on the
+                # opt-in flag: non-opted-in tenants skip the validator
+                # entirely (byte-identical legacy behavior). The validator
+                # raises HTTPException (403/422/409/404); the outer
+                # ``except HTTPException`` maps it to the right error code.
+                if collection == SKILLS_COLLECTION:
+                    # ONE settings read for both the opt-in flag and the
+                    # per-tenant byte caps. ``get_settings_for_display``
+                    # returns the merged settings (which already include
+                    # ``skills_factory.enabled``), so the write path reads
+                    # the flag from it directly rather than calling
+                    # ``_skills_factory_enabled`` (a second DB-backed
+                    # ``get_raw_settings``) — one fewer cold-cache lookup.
+                    # read/query/search/delete keep the cheap helper since
+                    # they don't need the caps.
+                    # Fail CLOSED: this settings read gates a security
+                    # decision (whether the lifecycle validator runs). If
+                    # it fails we must NOT fall through and upsert the
+                    # skill unvalidated — abort the write instead.
+                    try:
+                        settings_display = await get_settings_for_display(tenant_id)
+                    except Exception:
+                        logger.exception(
+                            "skills_factory settings lookup failed for %s; cannot gate write",
+                            tenant_id,
+                        )
+                        return _with_latency(
+                            _error_response("INTERNAL_ERROR", "skill lifecycle gate unavailable"),
+                            t0,
+                        )
+                    sf_settings = (
+                        (settings_display.get("skills_factory") or {})
+                        if isinstance(settings_display, dict)
+                        else {}
+                    )
+                    if isinstance(sf_settings, dict) and bool(sf_settings.get("enabled")):
+                        # Defense-in-depth: reject a case-variant 'status'
+                        # key (e.g. 'STATUS', 'Status'). The validator
+                        # owns the canonical lowercase 'status' and
+                        # defaults it to 'staged', and every downstream
+                        # gate reads data->>'status' (case-sensitive in
+                        # JSONB), so a variant key cannot self-promote —
+                        # but it WOULD persist as a confusing shadow
+                        # field. Reject it rather than silently store it.
+                        if isinstance(data, dict):
+                            variant = next(
+                                (k for k in data if k != "status" and k.lower() == "status"),
+                                None,
+                            )
+                            if variant is not None:
+                                return _with_latency(
+                                    _error_response(
+                                        "INVALID_ARGUMENTS",
+                                        f"skills write: ambiguous status key {variant!r}. "
+                                        "Use lowercase 'status' only — and note status is "
+                                        "managed by the lifecycle (an agent write defaults "
+                                        "to 'staged'; transitions go through the Inbox).",
+                                    ),
+                                    t0,
+                                )
+                        from core_api.services.skill_lifecycle import (
+                            SkillWriteContext,
+                            validate_and_normalize_skill_write,
+                        )
+
+                        sf_ctx = SkillWriteContext(
+                            caller_agent_id=agent_id,
+                            is_admin=False,
+                            is_internal_forge=False,
+                            description_max_bytes=_safe_int(sf_settings.get("description_max_bytes"), 160),
+                            body_max_bytes=_safe_int(sf_settings.get("body_max_bytes"), 40_000),
+                        )
+                        # For kind='update' the validator needs the live
+                        # skill to bind against its current content_hash.
+                        # Mirror the REST path's read-through storage
+                        # fetch; the validator handles the not-found case.
+                        # ``isinstance`` guards a non-dict data (the
+                        # validator 422s it cleanly rather than us
+                        # AttributeError-ing into a 500 here).
+                        live_doc: dict | None = None
+                        if isinstance(data, dict):
+                            # Fetched for EVERY skills write, not just
+                            # ``kind='update'``. The validator needs it for two
+                            # separate checks: update's hash-binding, and the
+                            # stored-status gate that stops a non-admin
+                            # replacing a live ACTIVE skill. Fetching only on
+                            # update made ``kind='create'`` the way around that
+                            # gate — the validator saw ``None`` and judged the
+                            # write purely on what the caller claimed.
+                            #
+                            # Fail CLOSED, like the settings/flag gates: the
+                            # live-doc fetch now feeds a security gate, so a
+                            # transient DB/network error must abort with a
+                            # curated message rather than fall through with
+                            # ``live_doc=None`` and skip the check.
+                            try:
+                                sc_live = get_storage_client()
+                                live_doc = await sc_live.get_document(
+                                    tenant_id=tenant_id,
+                                    collection=SKILLS_COLLECTION,
+                                    doc_id=doc_id,
+                                    # PRIMARY, not the replica — see the
+                                    # matching note on the REST fetch.
+                                    # This read backs an authorization
+                                    # decision, so replica lag would show
+                                    # the pre-transition status and the
+                                    # gate would authorise the overwrite
+                                    # the transition was meant to forbid.
+                                    read=False,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "skills live-doc fetch failed for %s/%s; cannot gate skills write",
+                                    tenant_id,
+                                    doc_id,
+                                )
+                                return _with_latency(
+                                    _error_response("INTERNAL_ERROR", "skill lifecycle gate unavailable"),
+                                    t0,
+                                )
+                        normalized, _scan = await validate_and_normalize_skill_write(
+                            data,
+                            ctx=sf_ctx,
+                            live_skill_doc=live_doc,
+                        )
+                        # Swap normalized data in for the rest of the flow
+                        # (embed + upsert). Status/source/scan/content_hash
+                        # and other server-controlled fields are merged.
+                        data = normalized
+                # Resolve which string in `data` gets embedded. The only
+                # embeddable field is data["summary"]; skills writes also
+                # accept data["description"] for back-compat. Non-skills
+                # writes without a summary store cleanly with no embedding
+                # (doc won't appear in op=search).
+                from core_api.services.doc_indexing import (
+                    InvalidDocIndexingError,
+                    resolve_doc_memory,
+                    resolve_embed_source,
+                )
+                from core_api.services.doc_memory import safe_sync_doc_memory
+
+                try:
+                    source = resolve_embed_source(write_collection, data)
+                except InvalidDocIndexingError as exc:
+                    return _with_latency(_error_response("INVALID_ARGUMENTS", str(exc)), t0)
+                embedding: list[float] | None = None
+                if source is not None:
+                    from common.embedding import embedding_configured, get_embedding
+
+                    # Tenant config so provider resolution matches the memory
+                    # paths and per-tenant embedding keys/models apply — see
+                    # routes/documents.py (same rationale, same degrade-to-
+                    # process-provider idiom on resolution failure).
+                    try:
+                        tenant_config = await resolve_config(tenant_id)
+                    except Exception:
+                        logger.warning(
+                            "caura_doc write: failed to resolve tenant config "
+                            "(tenant=%s); falling back to process-level "
+                            "embedding provider",
+                            tenant_id,
+                            exc_info=True,
+                        )
+                        tenant_config = None
+                    # Synchronous write — see routes/documents.py.
+                    embedding = await get_embedding(source, tenant_config, background=False)
+                    # Unconfigured provider → write unindexed, as routes/documents.py.
+                    if embedding is None and embedding_configured(tenant_config):
+                        return _with_latency(
+                            _error_response(
+                                "UPSTREAM_ERROR",
+                                "Embedding provider returned no vector "
+                                "(check provider config / quota). Write aborted.",
+                            ),
+                            t0,
+                        )
+                await check_and_increment(tenant_id, "write")
+                row = await sc.upsert_document_xmax(
+                    {
+                        "tenant_id": tenant_id,
+                        "fleet_id": fleet_id,
+                        "collection": collection,
+                        "doc_id": doc_id,
+                        "data": data,
+                        # Author of this version, as REST records it. The
+                        # overwrite gate above reads it back, so a doc an
+                        # agent wrote here stays its own to update.
+                        "agent_id": agent_id,
+                        "embedding": embedding,
+                    }
+                )
+                if row is None:
+                    return _with_latency(
+                        _error_response("INTERNAL_ERROR", "document upsert returned no rows"), t0
+                    )
+                # Storage returns ``{id, created_at, updated_at, xmax}``; ``xmax
+                # == 0`` ⇒ INSERT (new), else the on-conflict UPDATE fired.
+                is_new = int(row["xmax"]) == 0
+                # Mint a memory carrying the document body so the BODY becomes
+                # reachable by meaning (only ``data["summary"]`` is embedded on
+                # the doc row, and ``caura_recall`` never returns documents).
+                # Runs on every write, not just inserts — see
+                # ``services.doc_memory`` for why that isn't as duplicative as
+                # it sounds. Never raises: the doc is already committed and is
+                # the source of truth.
+                try:
+                    doc_memory_spec = resolve_doc_memory(
+                        write_collection, doc_id, data, updated_at=row.get("updated_at")
+                    )
+                    if doc_memory_spec is not None:
+                        await safe_sync_doc_memory(
+                            doc_memory_spec,
+                            tenant_id=tenant_id,
+                            fleet_id=fleet_id,
+                            agent_id=agent_id,
+                        )
+                except Exception:
+                    # Belt-and-braces over ``safe_sync_doc_memory``'s own
+                    # non-raising contract. The document is committed; without
+                    # this, a regression in the mint path would surface to the
+                    # caller as a FAILED doc write, which is the one outcome
+                    # this feature must never cause.
+                    logger.exception("doc memory mint failed for %s/%s", collection, doc_id)
+                return _with_latency(
+                    _dumps(
+                        {
+                            "ok": True,
+                            "collection": collection,
+                            "doc_id": doc_id,
+                            "action": "created" if is_new else "updated",
+                            "indexed": embedding is not None,
+                        }
+                    ),
+                    t0,
+                )
+            if op == "read":
+                if not doc_id:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=read requires 'doc_id'."), t0
+                    )
+                # READ — widens via ``readable_tenant_ids`` for cross-tenant
+                # credentials (home-only when single-tenant).
+                doc = await sc.get_document(
+                    tenant_id=tenant_id,
+                    # Non-empty: the guard at the top of this handler refuses
+                    # any op outside {list_collections, search} without one.
+                    collection=collection,  # type: ignore[arg-type]
+                    doc_id=doc_id,
+                    readable_tenant_ids=readable,
+                )
+                # One reply for a missing doc and a hidden skill below, so neither
+                # leaks existence; the envelope, as REST's 404 (M-23). It was prose.
+                not_found = _error_response("NOT_FOUND", f"Not found: {collection}/{doc_id}")
+                if not doc:
+                    return _with_latency(not_found, t0)
+                # Active-only gate for agent-facing skill reads. A
+                # candidate / staged / quarantined / rejected skill is
+                # in-flight or blocked and must not surface to agents —
+                # return the same "Not found" as a missing doc so we
+                # don't leak the EXISTENCE of an unapproved skill. The
+                # decision follows the row's OWNING tenant: hidden when
+                # the caller's tenant opted in, OR when the row belongs
+                # to a different tenant (cross-tenant credentials must
+                # never surface a sibling tenant's in-flight skill).
+                # The collection check short-circuits the flag lookup for
+                # non-skills reads.
+                if _doc_field(doc, "collection") == SKILLS_COLLECTION:
+                    caller_opted_in = await _skills_factory_enabled(tenant_id)
+                    if _skill_hidden_from_agent(
+                        doc, caller_tenant_id=tenant_id, caller_opted_in=caller_opted_in
+                    ):
+                        return _with_latency(not_found, t0)
+                return _with_latency(
+                    _dumps(
+                        {
+                            "collection": _doc_field(doc, "collection"),
+                            "doc_id": _doc_field(doc, "doc_id"),
+                            "data": _doc_field(doc, "data"),
+                            "updated_at": _doc_field(doc, "updated_at"),
+                        }
+                    ),
+                    t0,
+                )
+            if op == "query":
+                effective_where = dict(where or {})
+                caller_opted_in = False
+                if collection == SKILLS_COLLECTION:
+                    caller_status = effective_where.get("status")
+                    if caller_status is not None and caller_status != _AGENT_VISIBLE_SKILL_STATUS:
+                        # Security-sensitive REJECTION path: refusing an
+                        # explicit non-active status only makes sense for
+                        # an opted-in tenant — for a tenant that never
+                        # opted in, the "use the Inbox API" message is
+                        # nonsense. So gate it on the STRICT flag and
+                        # fail CLOSED on a settings outage (INTERNAL_ERROR,
+                        # same as op=delete) rather than the lenient helper
+                        # (which assumes-enabled on error and would emit
+                        # the confusing pointer to a non-opted-in tenant).
+                        try:
+                            opted_in = await _skills_factory_flag(tenant_id)
+                        except Exception:
+                            logger.exception(
+                                "skills_factory flag lookup failed for %s; cannot gate query",
+                                tenant_id,
+                            )
+                            return _with_latency(
+                                _error_response("INTERNAL_ERROR", "skill lifecycle gate unavailable"),
+                                t0,
+                            )
+                        if opted_in:
+                            # An agent must not query for staged /
+                            # candidate skills. Reject (rather than
+                            # silently rewriting to 'active', which would
+                            # mislead the caller into thinking they
+                            # queried 'staged' and got nothing).
+                            return _with_latency(
+                                _error_response(
+                                    "INVALID_ARGUMENTS",
+                                    f"collection='skills' on the agent MCP surface only "
+                                    f"exposes status='active' docs; "
+                                    f"where={{'status': {caller_status!r}}} is not supported. "
+                                    "Inspect non-active skills via the Skills Inbox API "
+                                    "(/api/v1/skills-inbox/*).",
+                                ),
+                                t0,
+                            )
+                        # Genuinely not opted in: legacy behavior — the
+                        # caller's explicit status passes through untouched
+                        # (caller_opted_in stays False; the cross-tenant
+                        # net below still hides sibling non-active skills).
+                    else:
+                        # Common, SAFE path (no status, or status='active'
+                        # already): transparently scope to 'active'. Lenient
+                        # helper — fail-closed by FILTERING on a settings
+                        # outage (consistent with op=read), never errors a
+                        # plain query.
+                        caller_opted_in = await _skills_factory_enabled(tenant_id)
+                        if caller_opted_in:
+                            effective_where["status"] = _AGENT_VISIBLE_SKILL_STATUS
+                # READ — widens via ``readable_tenant_ids`` for cross-tenant.
+                docs = await sc.query_documents(
+                    {
+                        "tenant_id": tenant_id,
+                        "collection": collection,
+                        "where": effective_where,
+                        "order_by": order_by,
+                        "order": order,
+                        "limit": min(limit, 100),
+                        "offset": offset,
+                        "readable_tenant_ids": readable,
+                    }
+                )
+                # Cross-tenant safety net: when the caller's tenant is NOT
+                # opted in, the SQL status filter above never ran, so
+                # cross-tenant credentials could pull a sibling tenant's
+                # non-active skills. Drop them (the helper hides only
+                # rows owned by a different tenant in this branch; the
+                # caller's own rows are untouched — invariant preserved).
+                if collection == SKILLS_COLLECTION and not caller_opted_in:
+                    docs = [
+                        d
+                        for d in docs
+                        if not _skill_hidden_from_agent(d, caller_tenant_id=tenant_id, caller_opted_in=False)
+                    ]
+                items = [{"doc_id": _doc_field(d, "doc_id"), "data": _doc_field(d, "data")} for d in docs]
+                return _with_latency(
+                    _dumps({"collection": collection, "count": len(items), "results": items}),
+                    t0,
+                )
+            if op == "search":
+                if not query or not query.strip():
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=search requires a non-empty 'query'."), t0
+                    )
+                from common.embedding import get_embedding
+
+                # Same-provider query embedding — see routes/documents.py
+                # search: the query vector must come from the provider that
+                # embedded this tenant's stored documents.
+                try:
+                    tenant_config = await resolve_config(tenant_id)
+                except Exception:
+                    logger.warning(
+                        "caura_doc search: failed to resolve tenant config "
+                        "(tenant=%s); falling back to process-level embedding "
+                        "provider",
+                        tenant_id,
+                        exc_info=True,
+                    )
+                    tenant_config = None
+                # Interactive search — see documents.py: not background.
+                query_embedding = await get_embedding(query, tenant_config, background=False)
+                if query_embedding is None:
+                    return _with_latency(
+                        _error_response(
+                            "UPSTREAM_ERROR",
+                            "Embedding provider returned no vector "
+                            "(check provider config / quota). Search aborted.",
+                        ),
+                        t0,
+                    )
+                capped_top_k = max(1, min(top_k, MAX_DOC_SEARCH_TOP_K))
+                # Active-only gate for a SCOPED skills search: push the
+                # status filter into the SQL so top_k stays exact (a
+                # post-filter alone would silently shrink the result
+                # set). For a broad search (collection=None) we can't
+                # filter in SQL without excluding non-skills collections.
+                search_status = None
+                scoped_skills_opted_in = collection == SKILLS_COLLECTION and await _skills_factory_enabled(
+                    tenant_id
+                )
+                if scoped_skills_opted_in:
+                    search_status = _AGENT_VISIBLE_SKILL_STATUS
+                # READ — widens via ``readable_tenant_ids``. Storage returns a
+                # list of doc dicts each carrying an inline ``similarity`` key
+                # (vs the repo's ``(Document, similarity)`` tuples).
+                search_data: dict[str, Any] = {
+                    "tenant_id": tenant_id,
+                    "collection": collection,  # None = span every collection (broad)
+                    "query_embedding": query_embedding,
+                    "top_k": capped_top_k,
+                    "fleet_id": fleet_id,
+                    "readable_tenant_ids": readable,
+                    "status": search_status,
+                }
+                pairs = await sc.search_documents_vector(search_data)
+                # Safety net for every skill row that the scoped SQL
+                # filter didn't already remove:
+                #   • broad search (collection=None) — skill rows the SQL
+                #     never touched, hidden when the caller opted in;
+                #   • cross-tenant rows (any search) — a sibling tenant's
+                #     non-active skill, hidden regardless of the caller's
+                #     own opt-in (the SQL status push only ran when the
+                #     CALLER opted in, so a non-opted-in caller reading
+                #     an opted-in sibling's skills would otherwise leak).
+                # ``_skill_hidden_from_agent`` encodes both rules per-row.
+                # The cheap ``any()`` scan short-circuits the cached flag
+                # lookup when no skill rows are present.
+                if any(_doc_field(d, "collection") == SKILLS_COLLECTION for d in pairs):
+                    # For a scoped skills search we already resolved the
+                    # flag; for a broad search resolve it now.
+                    caller_opted_in = (
+                        scoped_skills_opted_in
+                        if collection == SKILLS_COLLECTION
+                        else await _skills_factory_enabled(tenant_id)
+                    )
+                    pairs = [
+                        d
+                        for d in pairs
+                        if not _skill_hidden_from_agent(
+                            d, caller_tenant_id=tenant_id, caller_opted_in=caller_opted_in
+                        )
+                    ]
+                source_tenants = [t for t in (readable or []) if t and t != tenant_id]
+                if source_tenants:
+                    counts: dict[str, int] = {}
+                    for d in pairs:
+                        rt = _doc_field(d, "tenant_id")
+                        if rt:
+                            counts[rt] = counts.get(rt, 0) + 1
+                    await log_cross_tenant_read(
+                        home_tenant_id=tenant_id,
+                        home_agent_id=agent_id,
+                        source_tenants=source_tenants,
+                        surface="caura_doc_search",
+                        result_count_by_tenant=counts,
+                        query_summary=(query or "")[:200],
+                    )
+                # Always include `collection` per-row. When collection is
+                # omitted (broad search) the caller needs it to follow up
+                # with op=read. Zero cost when scoped; avoids a conditional
+                # response shape.
+                items = [
+                    {
+                        "collection": _doc_field(d, "collection"),
+                        "doc_id": _doc_field(d, "doc_id"),
+                        "data": _doc_field(d, "data"),
+                        "similarity": round(_doc_field(d, "similarity", 0.0), 4),
+                    }
+                    for d in pairs
+                ]
+                return _with_latency(
+                    _dumps(
+                        {
+                            "collection": collection,  # None if broad search
+                            "count": len(items),
+                            "results": items,
+                        }
+                    ),
+                    t0,
+                )
+            # op == "delete"
+            if not doc_id:
+                return _with_latency(_error_response("INVALID_ARGUMENTS", "op=delete requires 'doc_id'."), t0)
+            refuse_system_collection(collection)  # type: ignore[arg-type]  # guaranteed by the op guard above
+            # Admin-trust (>= 3) gate for agent credentials, parity with memory
+            # deletes — a routine trust-1 agent must not destroy tenant documents.
+            # "for agent credentials" is the whole scope of the gate: a
+            # tenant-scoped credential has no trust level and is authorized by
+            # tenant scope instead, so ``caller_agent_id is None`` skipping this
+            # is the decided contract (``enforce_delete``), not a missing check.
+            if caller_agent_id:
+                await enforce_delete(tenant_id, caller_agent_id)
+            # Active-only existence gate for skills: an agent must not be
+            # able to delete (or probe the existence of) a non-active
+            # skill via MCP — those are operator-managed through the
+            # Inbox (reject/quarantine), not the agent surface. The status
+            # guard is folded directly into the storage DELETE's WHERE
+            # (``require_status``) so the check and the delete are a single
+            # atomic statement — no TOCTOU window where a concurrent admin
+            # promote/demote could change status between a separate pre-fetch
+            # and the delete. A non-active (or missing) skill deletes zero
+            # rows and falls through to the SAME generic not-found response a
+            # missing doc returns — so a non-active skill is byte-for-byte
+            # indistinguishable from a missing one (no existence leak), and
+            # the response stays valid JSON. WRITE → home tenant only (deletes
+            # never span readable tenants). Fail CLOSED: the status guard is a
+            # security gate, so use the strict (raising) flag check and abort
+            # on a settings-lookup failure rather than the lenient helper
+            # (which returns False → no status guard → fail-open delete).
+            # Short-circuits for non-skills collections (never touches
+            # settings).
+            try:
+                skills_gate_on = collection == SKILLS_COLLECTION and await _skills_factory_flag(tenant_id)
+            except Exception:
+                logger.exception("skills_factory flag lookup failed for %s; cannot gate delete", tenant_id)
+                return _with_latency(
+                    _error_response("INTERNAL_ERROR", "skill lifecycle gate unavailable"), t0
+                )
+            deleted = await sc.delete_document(
+                tenant_id,
+                collection,  # type: ignore[arg-type]  # guaranteed by the op guard above
+                doc_id,
+                require_status=_AGENT_VISIBLE_SKILL_STATUS if skills_gate_on else None,
+            )
+            if not deleted:
+                # The envelope, as REST's 404 (M-23). A bare ``{"error": "<string>"}``
+                # carried no code and reached clients as a successful call.
+                return _with_latency(
+                    _error_response(
+                        "NOT_FOUND", f"Document '{doc_id}' not found in collection '{collection}'."
+                    ),
+                    t0,
+                )
+            # Un-mint, exactly as the REST delete does. ``op=index`` above mints
+            # through ``safe_sync_doc_memory``; without the inverse here a
+            # document deleted over MCP left its minted memory recallable with
+            # nothing able to reach it. The helper never raises — the document
+            # is already gone and the caller asked for that, not for a memory.
+            from core_api.services.doc_memory import safe_unmint_doc_memory
+
+            unminted = await safe_unmint_doc_memory(
+                collection,  # type: ignore[arg-type]  # same op guard as the delete above
+                doc_id,
+                tenant_id=tenant_id,
+            )
+            return _with_latency(
+                _dumps(
+                    {
+                        "ok": True,
+                        "collection": collection,
+                        "doc_id": doc_id,
+                        "deleted": True,
+                        "memories_unminted": unminted,
+                    }
+                ),
+                t0,
+            )
+        except HTTPException as e:
+            logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
+            return _with_latency(
+                _error_response(_detail_code(e.detail, e.status_code), _detail_text(e.detail)), t0
+            )
+        except httpx.HTTPStatusError as e:
+            return _storage_error_envelope(e, t0)
+        except Exception as e:
+            logger.error("MCP doc op=%s error: %s", op, e, exc_info=True)
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+async def caura_list(
+    agent_id: Annotated[str, Field(description=_AGENT_ID_DESC)] = DEFAULT_AGENT_ID,
+    scope: Annotated[
+        str,
+        Field(
+            description="agent|fleet|all. 'agent' (default) = your memories only (trust ≥ 1). 'fleet' = cross-agent in a fleet: your OWN fleet is trust ≥ 1, a different fleet trust ≥ 2. 'all' = tenant-wide (trust ≥ 2)."
+        ),
+    ] = "agent",
+    fleet_id: Annotated[
+        str | None, Field(description="Fleet. When scope='fleet' and omitted, defaults to your home fleet.")
+    ] = None,
+    written_by: Annotated[str | None, Field(description="Author.")] = None,
+    memory_type: Annotated[str | None, Field(description="Type.")] = None,
+    status: Annotated[str | None, Field(description="Status.")] = None,
+    weight_min: Annotated[float | None, Field(description="Min weight 0-1.")] = None,
+    weight_max: Annotated[float | None, Field(description="Max weight 0-1.")] = None,
+    created_after: Annotated[str | None, Field(description="ISO8601.")] = None,
+    created_before: Annotated[str | None, Field(description="ISO8601.")] = None,
+    sort: Annotated[str, Field(description="created_at|weight|recall_count.")] = "created_at",
+    order: Annotated[str, Field(description="asc|desc.")] = "desc",
+    limit: Annotated[int, Field(description="1-50.")] = 25,
+    cursor: Annotated[str | None, Field(description="Pagination cursor.")] = None,
+    include_deleted: Annotated[bool, Field(description="Trust-3 only.")] = False,
+) -> ToolReply:
+    """Non-semantic memory enumeration: filter, sort, paginate by metadata.
+    scope='agent' (default) requires trust ≥ 1. scope='fleet' reads cross-agent
+    within a fleet: the caller's OWN fleet requires trust ≥ 1, a different fleet
+    requires trust ≥ 2. scope='all' (tenant-wide) requires trust ≥ 2. Trust 3
+    unlocks ``include_deleted``."""
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if scope not in VALID_SCOPES:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", f"Invalid scope '{scope}'. Must be: agent, fleet, all."),
+            t0,
+        )
+    if memory_type and memory_type not in MEMORY_TYPES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid memory_type '{memory_type}'. Must be one of: {', '.join(MEMORY_TYPES)}",
+            ),
+            t0,
+        )
+    if status and status not in MEMORY_STATUSES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}",
+            ),
+            t0,
+        )
+    if sort not in {"created_at", "weight", "recall_count"}:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid sort '{sort}'. Must be one of: created_at, weight, recall_count.",
+            ),
+            t0,
+        )
+    if order not in {"asc", "desc"}:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "order must be 'asc' or 'desc'."),
+            t0,
+        )
+    if cursor and (sort != "created_at" or order != "desc"):
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                "cursor pagination requires sort=created_at and order=desc.",
+            ),
+            t0,
+        )
+    capped_limit = max(1, min(int(limit), 50))
+
+    tenant_id = _get_tenant()
+    agent_id = canonical_service_agent_id(_get_agent_id() or agent_id)
+    if written_by is not None:
+        written_by = canonical_service_agent_id(written_by)
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+
+    if scope == "agent" and written_by is not None and written_by != agent_id:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"written_by must be omitted or match your own agent_id ('{agent_id}') when scope='agent'.",
+            ),
+            t0,
+        )
+
+    # Trust ladder resolves by TARGET (spec: L1 = read within own fleet, L2 =
+    # cross-fleet read): scope='agent' and an own-fleet scope='fleet' read stay
+    # at L1; a different fleet or tenant-wide scope='all' needs L2. Also pins an
+    # omitted fleet_id to the caller's home fleet for constrained callers (see
+    # _resolve_read_fleet_gate) so scope='fleet' can't leak other fleets' rows.
+    # The gate does a storage get_agent (scope='fleet'); catch its failures here
+    # so they surface as a structured envelope rather than an unstructured raise.
+    try:
+        min_level, fleet_id = await _resolve_read_fleet_gate(tenant_id, agent_id, scope, fleet_id)
+    except httpx.HTTPStatusError as e:
+        return _storage_error_envelope(e, t0)
+    except Exception as e:
+        logger.error("MCP list fleet-gate error: %s", e, exc_info=True)
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+    # ``_require_trust`` is storage-routed (trust_service → storage client) and
+    # ``log_cross_tenant_read`` is fire-and-forget (audit queue → storage); the
+    # only db-bound call, ``memory_repo.list_by_filters``, becomes the storage
+    # client's ``list_memories_by_filters`` (same visibility predicate + cursor
+    # + readable widening, ported verbatim into PostgresService). ``_no_db()`` ⇒
+    # db=None. Tenant isolation: the READ widens via ``readable_tenant_ids`` ONLY
+    # for scope!='agent' (exactly as before); scope='agent' stays home-only and
+    # forces ``written_by`` to the caller. ``caller_agent_id`` carries the
+    # scope_agent visibility gate explicitly to storage.
+    async with _no_db():
+        try:
+            trust, _, terr = await _require_trust(tenant_id, agent_id, min_level=min_level)
+            if terr:
+                return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
+
+            # scope='agent': force written_by to the caller's agent_id so they
+            # can only see their own memories regardless of other filters.
+            effective_written_by = agent_id if scope == "agent" else written_by
+
+            # include_deleted is silently ignored below trust 3
+            effective_include_deleted = include_deleted and trust >= 3
+
+            # Parse ISO date strings (validated early to avoid repo-level errors).
+            ts_after = ts_before = None
+            if created_after:
+                try:
+                    ts_after = _dt.fromisoformat(created_after)
+                except ValueError:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "created_after must be ISO8601."), t0
+                    )
+            if created_before:
+                try:
+                    ts_before = _dt.fromisoformat(created_before)
+                except ValueError:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "created_before must be ISO8601."), t0
+                    )
+
+            c_ts = c_id = None
+            if cursor:
+                try:
+                    c_ts, c_id = decode_cursor(cursor)
+                except Exception:
+                    return _with_latency(_error_response("INVALID_ARGUMENTS", "Invalid cursor."), t0)
+
+            # Cross-tenant credentials widen via ``readable_tenant_ids`` —
+            # the gateway plumbs ``X-Readable-Tenant-IDs`` into the MCP
+            # context var. ``scope='all'`` aggregates across the widened set;
+            # ``scope='agent'`` still filters to the caller's own writes
+            # in the home tenant. Single-tenant credentials leave the var
+            # empty; storage falls back to ``tenant_id = $1``. Request
+            # ``limit + 1`` so we detect ``has_more`` + build the next cursor.
+            readable = _get_readable_tenants() or None
+            list_payload: dict[str, Any] = {
+                "tenant_id": tenant_id,
+                "caller_agent_id": agent_id,
+                "caller_tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "written_by": effective_written_by,
+                "memory_type": memory_type,
+                "status": status,
+                "weight_min": weight_min,
+                "weight_max": weight_max,
+                "created_after": ts_after.isoformat() if ts_after else None,
+                "created_before": ts_before.isoformat() if ts_before else None,
+                "include_deleted": effective_include_deleted,
+                "sort": sort,
+                "order": order,
+                "limit": capped_limit,
+                "cursor_ts": c_ts.isoformat() if c_ts else None,
+                "cursor_id": str(c_id) if c_id else None,
+                "readable_tenant_ids": readable if scope != "agent" else None,
+            }
+            rows = await get_storage_client().list_memories_by_filters(list_payload)
+            has_more = len(rows) > capped_limit
+            # ``_memory_to_out`` accepts either an ORM row or a storage dict.
+            items = [_memory_to_out(m).model_dump(mode="json") for m in rows[:capped_limit]]
+            next_cursor = None
+            # OSS 09/02 L-23 — mint only what the gate above would take back.
+            # This is the third copy of the pair and was the one still drifted:
+            # the gate rejects a cursor unless ``created_at``/``desc``, and this
+            # minted one for every sort. ``caura_list`` is the agent-facing
+            # surface, so it was also the highest-traffic instance.
+            if has_more and rows and cursor_sortable(sort, order):
+                last = rows[capped_limit - 1]
+                next_cursor = encode_cursor(_dt.fromisoformat(last["created_at"]), UUID(last["id"]))
+            # Cross-tenant audit (F2): count per tenant from the served rows.
+            source_tenants = [t for t in (readable or []) if t and t != tenant_id]
+            if source_tenants:
+                counts: dict[str, int] = {}
+                for row in rows[:capped_limit]:
+                    rt = row.get("tenant_id")
+                    if rt:
+                        counts[rt] = counts.get(rt, 0) + 1
+                await log_cross_tenant_read(
+                    home_tenant_id=tenant_id,
+                    home_agent_id=agent_id,
+                    source_tenants=source_tenants,
+                    surface="caura_list",
+                    result_count_by_tenant=counts,
+                )
+            # C31/D1 — ``items`` is the canonical list key everywhere, and
+            # ``caura_recall`` already dual-emits it beside ``results``. This
+            # envelope did not, so REST ``MemoryList.items`` and MCP
+            # ``results`` named the same list two ways and no client could
+            # share a response parser across the surfaces. Same list object,
+            # two keys; ``results`` stays as a permanent alias.
+            return _with_latency(
+                _dumps(
+                    {
+                        "count": len(items),
+                        "results": items,
+                        "items": items,
+                        "next_cursor": next_cursor,
+                        "scope": scope,
+                    }
+                ),
+                t0,
+            )
+        except HTTPException as e:
+            logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
+            return _with_latency(
+                _error_response(_detail_code(e.detail, e.status_code), _detail_text(e.detail)), t0
+            )
+        except httpx.HTTPStatusError as e:
+            return _storage_error_envelope(e, t0)
+        except Exception as e:
+            logger.error("MCP list error: %s", e, exc_info=True)
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+async def caura_stats(
+    scope: Annotated[
+        str,
+        Field(
+            description="agent|fleet|all. 'agent' (default) = your memories only (trust ≥ 1). 'fleet' = aggregate cross-agent in a fleet: your OWN fleet trust ≥ 1, a different fleet trust ≥ 2. 'all' = tenant-wide (trust ≥ 2)."
+        ),
+    ] = "agent",
+    fleet_id: Annotated[
+        str | None,
+        Field(description="Filter by fleet. When scope='fleet' and omitted, defaults to your home fleet."),
+    ] = None,
+    agent_id: Annotated[str, Field(description=_AGENT_ID_DESC)] = DEFAULT_AGENT_ID,
+    memory_type: Annotated[str | None, Field(description="Filter by type.")] = None,
+    status: Annotated[str | None, Field(description="Filter by status.")] = None,
+    include_deleted: Annotated[
+        bool,
+        Field(
+            description="When true, also return 'deleted' (soft-deleted count) and 'total_including_deleted'. 'total' and breakdowns stay non-deleted regardless."
+        ),
+    ] = False,
+) -> ToolReply:
+    """Aggregate counts: total plus breakdowns by type, agent, status.
+    scope='agent' (default) requires trust ≥ 1. scope='fleet' aggregates
+    cross-agent within a fleet: the caller's OWN fleet requires trust ≥ 1, a
+    different fleet requires trust ≥ 2. scope='all' (tenant-wide) requires
+    trust ≥ 2. scope='agent' counts only memories visible to the caller (mirrors
+    caura_list visibility scoping); broader scopes drop the per-caller filter.
+    Counts exclude soft-deleted memories by default; pass include_deleted=true
+    for additional 'deleted' and 'total_including_deleted' fields."""
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if scope not in VALID_SCOPES:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", f"Invalid scope '{scope}'. Must be: agent, fleet, all."),
+            t0,
+        )
+    if memory_type and memory_type not in MEMORY_TYPES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid memory_type '{memory_type}'. Must be one of: {', '.join(MEMORY_TYPES)}",
+            ),
+            t0,
+        )
+    if status and status not in MEMORY_STATUSES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}",
+            ),
+            t0,
+        )
+
+    tenant_id = _get_tenant()
+    agent_id = canonical_service_agent_id(_get_agent_id() or agent_id)
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+    # Trust ladder resolves by TARGET (spec: L1 = read within own fleet, L2 =
+    # cross-fleet): own-fleet scope='fleet' aggregates stay at L1; a different
+    # fleet or tenant-wide scope='all' needs L2. Pins an omitted fleet_id to the
+    # caller's home fleet for constrained callers so the aggregate can't span
+    # fleets at L1 (mirrors caura_list / caura_recall).
+    # The gate does a storage get_agent (scope='fleet'); catch its failures here
+    # so they surface as a structured envelope rather than an unstructured raise.
+    # Mirrors caura_list: an httpx error keeps its upstream status/body via
+    # _storage_error_envelope; anything else degrades to INTERNAL_ERROR.
+    try:
+        min_level, fleet_id = await _resolve_read_fleet_gate(tenant_id, agent_id, scope, fleet_id)
+    except httpx.HTTPStatusError as e:
+        return _storage_error_envelope(e, t0)
+    except Exception as e:
+        logger.error("MCP stats fleet-gate error: %s", e, exc_info=True)
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+    # ``_require_trust`` is storage-routed; ``compute_memory_stats`` (db-bound
+    # GROUPING SETS) becomes the storage client's ``memory_stats_breakdown``
+    # (ported verbatim into PostgresService — same visibility scoping, GROUPING
+    # SETS, ``by_tenant`` widening, and ``include_deleted`` CTE). ``_no_db()`` ⇒
+    # db=None. Tenant isolation: scope='agent' pins the read to the HOME tenant
+    # and to the caller's own visibility (``agent_id`` doubles as the visibility
+    # identity); scope='fleet'/'all' widens via ``readable_tenant_ids`` exactly
+    # as before.
+    async with _no_db():
+        trust, _, terr = await _require_trust(tenant_id, agent_id, min_level=min_level)
+        if terr:
+            return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
+
+        # scope='agent' filters to caller's own memories (mirrors caura_list);
+        # scope='fleet'/'all' drops the per-caller filter so cross-agent
+        # aggregates surface — fleet_id (if supplied) still narrows the pool.
+        # Visibility is the caller's at every scope, as on caura_list, so its
+        # own private rows count in the wider aggregates too (M-104).
+        effective_agent_id = agent_id if scope == "agent" else None
+        effective_include_deleted = include_deleted and trust >= 3
+
+        try:
+            # Cross-tenant credentials with scope='fleet'/'all' aggregate
+            # across the widened readable set; scope='agent' stays
+            # home-only because per-agent stats are intrinsically tied
+            # to the home tenant identity.
+            readable = _get_readable_tenants() or None
+            stats = await get_storage_client().memory_stats_breakdown(
+                {
+                    "tenant_id": tenant_id,
+                    "fleet_id": fleet_id,
+                    "agent_id": effective_agent_id,
+                    "caller_agent_id": agent_id,
+                    "memory_type": memory_type,
+                    "status": status,
+                    "include_deleted": effective_include_deleted,
+                    "readable_tenant_ids": readable if scope != "agent" else None,
+                }
+            )
+            source_tenants = [t for t in (readable or []) if t and t != tenant_id]
+            if source_tenants and scope != "agent":
+                # by_tenant breakdown is already in stats — reuse for the audit.
+                await log_cross_tenant_read(
+                    home_tenant_id=tenant_id,
+                    home_agent_id=agent_id,
+                    source_tenants=source_tenants,
+                    surface="caura_stats",
+                    result_count_by_tenant=stats.get("by_tenant") or {},
+                )
+            return _with_latency(_dumps({**stats, "scope": scope}), t0)
+        except Exception as e:
+            logger.exception("Unhandled error in caura_stats")
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+# ---------------------------------------------------------------------------
+# Intelligence tools (Karpathy Loop)
+# ---------------------------------------------------------------------------
+
+
+async def caura_insights(
+    focus: Annotated[
+        str,
+        Field(
+            description="contradictions|failures|stale|divergence|patterns|discover.",
+        ),
+    ],
+    scope: Annotated[str, Field(description="agent|fleet|all.")] = "agent",
+    fleet_id: Annotated[str | None, Field(description="Required when scope='fleet'.")] = None,
+    agent_id: Annotated[str, Field(description=_AGENT_ID_DESC)] = DEFAULT_AGENT_ID,
+) -> ToolReply:
+    """Analyze the memory store for patterns, contradictions, stale knowledge,
+    or unexpected clusters; persist findings as ``insight`` memories.
+    Consolidates onto the Karpathy Loop reflection step.
+    scope='agent' (default) requires trust ≥ 1; scope='fleet'/'all' requires
+    trust ≥ 2.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    # Write tool despite the name: Phase 3's ``_persist_findings`` creates and
+    # supersedes ``insight`` memories. REST gates the same work —
+    # ``POST /insights/generate`` calls ``auth.enforce_read_only()``.
+    if err := _check_write_scope():
+        return err
+    tenant_id = _get_tenant()
+    agent_id = canonical_service_agent_id(_get_agent_id() or agent_id)
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+
+    # Pre-validate inputs before consuming rate-limit budget.
+    if focus not in INSIGHTS_FOCUS_MODES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid focus '{focus}'. Must be one of: {', '.join(INSIGHTS_FOCUS_MODES)}",
+            ),
+            t0,
+        )
+    if scope not in VALID_SCOPES:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", f"Invalid scope '{scope}'. Must be: agent, fleet, all"), t0
+        )
+    if scope == "fleet" and not fleet_id:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "fleet_id is required when scope is 'fleet'."), t0
+        )
+    if focus == "divergence" and scope == "agent":
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "Focus 'divergence' requires scope='fleet' or scope='all'."),
+            t0,
+        )
+
+    # Dynamic trust: scope='agent' requires trust ≥ 1, 'fleet'/'all' requires ≥ 2.
+    min_level = 1 if scope == "agent" else 2
+
+    # Audit finding P3 (insights portion): the prior implementation held a
+    # single ``_mcp_session()`` open across the multi-second LLM analysis
+    # round-trip, pinning a pooled DB connection during work that is entirely
+    # network-bound to the LLM provider. The three-phase split is retained, and
+    # post-Fix-2-Ph5b every phase is storage-routed (no pooled connection held):
+    #   1. ``_no_db`` — trust + usage gates, query memories, resolve config
+    #   2. no DB      — synthesize_insights (LLM)
+    #   3. ``_no_db`` — persist findings (storage-routed; no commit)
+    from core_api.services.insights_service import (
+        _QUERY_DISPATCH,
+        _build_method,
+        _DiscoverResult,
+        _persist_findings,
+        synthesize_insights,
+    )
+    from core_api.services.organization_settings import resolve_config
+
+    try:
+        # ── Phase 1: gates + storage-routed reads ──────────────────
+        # Fix 2 Ph5b: the trust/usage gates and the analytic memory reads are
+        # storage-routed (``_no_db()`` ⇒ db=None) — ``_require_trust`` /
+        # ``check_and_increment`` ignore db and the ``_QUERY_DISPATCH`` fns
+        # call core-storage-api. No pooled DB connection is held.
+        async with _no_db():
+            # Broker ownership boundary before the trust gate, so trust is read
+            # for — and findings are attributed to — the identity actually
+            # written (parity with REST ``resolve_caller_and_gate``).
+            agent_id = await _broker_owned_tool_agent_id(agent_id)
+            # Mirror the REST insights gate: ``require_trust`` soft-passes
+            # a missing Agent row at ``DEFAULT_TRUST_LEVEL`` (read-only
+            # ergonomics — see ``caura_list`` below for the intended
+            # consumer), but this handler persists insight memories +
+            # audit-log rows keyed to ``agent_id``. Without a registered
+            # row backing the name, attribution becomes unverifiable, so
+            # re-block unregistered agents on the write path.
+            _, not_found, terr = await _require_trust(tenant_id, agent_id, min_level=min_level)
+            if not_found:
+                return _with_latency(
+                    _error_response(
+                        "FORBIDDEN",
+                        f"Agent '{agent_id}' is not registered. Register the agent by writing one memory first.",
+                    ),
+                    t0,
+                )
+            if terr:
+                return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
+            await check_and_increment(tenant_id, "insights")
+            # Shape varies by focus — each dispatch entry returns its own, and
+            # ``discover`` returns a wrapper unpacked just below. Every
+            # consumer downstream is shape-agnostic, so ``Any`` states that
+            # rather than a union that would need narrowing at each use.
+            memories_or_clusters: Any = await _QUERY_DISPATCH[focus](tenant_id, fleet_id, agent_id, scope)
+            if focus == "discover" and isinstance(memories_or_clusters, _DiscoverResult):
+                is_clustered = memories_or_clusters.is_clustered
+                memories_or_clusters = memories_or_clusters.data
+            else:
+                is_clustered = False
+            # Short-circuit when the query found no candidate memories —
+            # no LLM work, no second session, just a stable empty result.
+            if not memories_or_clusters:
+                return _with_latency(
+                    _dumps(
+                        {
+                            "focus": focus,
+                            "scope": scope,
+                            "memories_analyzed": 0,
+                            "findings": [],
+                            "summary": "No relevant memories found for this analysis.",
+                            "insight_memory_ids": [],
+                            "gate_rejected": 0,
+                            "insights_ms": int((time.perf_counter() - t0) * 1000),
+                        }
+                    ),
+                    t0,
+                )
+            config = await resolve_config(tenant_id)
+        # ── Session closed. The LLM analysis runs with no DB held. ──
+
+        # ── Phase 2: LLM (no DB) ───────────────────────────────────
+        synth = await synthesize_insights(
+            memories_or_clusters,
+            is_clustered,
+            config,
+            focus=focus,
+            scope=scope,
+        )
+        findings = synth["findings"]
+
+        # ── Phase 3: persist findings (storage-routed) ─────────────
+        # Fix 2 Ph5b: the supersede/restore + bulk-create inside
+        # ``_persist_findings`` are each storage-committed independently, so
+        # there's no session to open or commit here (``_no_db()`` ⇒ db=None).
+        async with _no_db():
+            insight_ids = await _persist_findings(
+                tenant_id,
+                agent_id,
+                fleet_id,
+                focus,
+                scope,
+                findings,
+                method=_build_method(focus, scope, is_clustered, synth),
+            )
+
+        result = {
+            "focus": focus,
+            "scope": scope,
+            "memories_analyzed": synth["memories_analyzed"],
+            "findings": [{**f, "insight_memory_id": mid} for f, mid in zip(findings, insight_ids)],
+            "summary": synth["summary"],
+            "insight_memory_ids": [mid for mid in insight_ids if mid],
+            "gate_rejected": synth.get("gate_rejected", 0),
+            "insights_ms": int((time.perf_counter() - t0) * 1000),
+        }
+        return _with_latency(_dumps(result), t0)
+    except HTTPException as e:
+        return _with_latency(
+            _error_response(_detail_code(e.detail, e.status_code), _detail_text(e.detail)), t0
+        )
+    except Exception as e:
+        logger.exception("Unhandled error in caura_insights")
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+async def caura_evolve(
+    outcome: Annotated[str, Field(description="Natural-language description of what happened.")],
+    outcome_type: Annotated[str, Field(description="success|failure|partial.")],
+    related_ids: Annotated[
+        list[str] | None,
+        # OSS 09/02 L-22 — the same cap the REST twin applies. Both boundaries
+        # reach the same ``report_outcome``, and ``test_c31_mcp_rest_parity``
+        # pins that they agree; bounding only REST left an MCP caller with
+        # exactly the behaviour the cap exists to prevent — an oversized list
+        # written verbatim into the outcome memory's metadata by
+        # ``_persist_outcome``, then silently cut to 50 by ``_adjust_weights``.
+        # The cap rides the inputSchema as ``maxItems`` and is deliberately NOT
+        # repeated in the description: tool-surface tokens are paid on every
+        # agent call, and tests/fixtures/README.md asks that anything the
+        # inputSchema already states be trimmed rather than duplicated in prose.
+        Field(
+            description="Memory UUIDs that influenced the action.",
+            max_length=EVOLVE_MAX_RELATED_IDS,
+        ),
+    ] = None,
+    scope: Annotated[str, Field(description="agent|fleet|all.")] = "agent",
+    agent_id: Annotated[str, Field(description=_AGENT_ID_DESC)] = DEFAULT_AGENT_ID,
+    fleet_id: Annotated[str | None, Field(description="Required when scope='fleet'.")] = None,
+) -> ToolReply:
+    """Record a real-world outcome against the memories that influenced the
+    action: adjust weights, generate preventive rules on failure. Closes the
+    Karpathy Loop feedback edge.
+
+    scope='agent' (default) requires trust ≥ 1 and limits adjustments to
+    memories the caller wrote. scope='fleet'/'all' requires trust ≥ 2.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if err := _check_write_scope():
+        return err
+    tenant_id = _get_tenant()
+    agent_id = canonical_service_agent_id(_get_agent_id() or agent_id)
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+
+    # Pre-validate inputs before consuming rate-limit budget.
+    if outcome_type not in EVOLVE_OUTCOME_TYPES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid outcome_type '{outcome_type}'. Must be one of: {', '.join(EVOLVE_OUTCOME_TYPES)}",
+            ),
+            t0,
+        )
+    if not outcome or not outcome.strip():
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "outcome must be a non-empty description."), t0
+        )
+    if scope not in VALID_SCOPES:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", f"Invalid scope '{scope}'. Must be: agent, fleet, all."), t0
+        )
+    if scope == "fleet" and not fleet_id:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "fleet_id is required when scope is 'fleet'."), t0
+        )
+
+    # Dynamic trust: scope='agent' requires trust ≥ 1, 'fleet'/'all' requires ≥ 2.
+    min_level = 1 if scope == "agent" else 2
+
+    # Audit finding P3 (evolve portion): prior implementation held a
+    # single ``_mcp_session()`` open across the rule-generation LLM
+    # round-trip — multiple seconds during which a pooled DB connection
+    # was pinned for work that is entirely network-bound to the LLM
+    # provider. The three-phase split is retained, and post-Fix-2-Ph5b-PR2
+    # every phase is storage-routed (no pooled connection held):
+    #   1. ``_no_db`` — trust + usage gates, filter_by_scope, resolve_config
+    #   2. no DB      — _maybe_generate_rule (LLM)
+    #   3. ``_no_db`` — _apply_outcome_to_db (persist + weights + backfill;
+    #                   storage-committed, no local commit)
+    from core_api.services.evolve_service import (
+        _apply_outcome_to_db,
+        _filter_by_scope,
+        _log_weight_adjustment_skip,
+        _maybe_generate_rule,
+    )
+    from core_api.services.organization_settings import resolve_config
+
+    try:
+        # ── Phase 1: gates + storage-routed reads ──────────────────
+        # Fix 2 Ph5b (PR2): the trust/usage gates and the scope-filter read are
+        # storage-routed (``_no_db()`` ⇒ db=None) — ``_require_trust`` /
+        # ``check_and_increment`` ignore db and ``_filter_by_scope`` calls
+        # core-storage-api. No pooled DB connection is held.
+        async with _no_db():
+            # Broker ownership boundary before the trust gate — see
+            # ``caura_insights`` above.
+            agent_id = await _broker_owned_tool_agent_id(agent_id)
+            # Mirror the REST evolve gate (and ``caura_insights`` above):
+            # block unregistered agents on the write path so the
+            # outcome/rule memories + audit-log rows have a real
+            # registered ``agent_id`` backing them.
+            _, not_found, terr = await _require_trust(tenant_id, agent_id, min_level=min_level)
+            if not_found:
+                return _with_latency(
+                    _error_response(
+                        "FORBIDDEN",
+                        f"Agent '{agent_id}' is not registered. Register the agent by writing one memory first.",
+                    ),
+                    t0,
+                )
+            if terr:
+                return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
+            await check_and_increment(tenant_id, "evolve")
+
+            # A15: classify why no weights will move, mirroring the REST
+            # report_outcome path. _apply_outcome_to_db requires this slug;
+            # the MCP path previously omitted it, raising a TypeError on the
+            # write path (prod incident). A deeper stage (_adjust_weights
+            # race / DB failure) may still override it.
+            in_scope_ids = related_ids or []
+            out_of_scope_count = 0
+            weight_adjustment_skipped_reason: str | None = None
+            if not in_scope_ids:
+                weight_adjustment_skipped_reason = "no_related_ids"
+            else:
+                original_count = len(in_scope_ids)
+                in_scope_ids, out_of_scope_count = await _filter_by_scope(
+                    tenant_id=tenant_id,
+                    caller_agent_id=agent_id,
+                    fleet_id=fleet_id,
+                    scope=scope,
+                    related_ids=in_scope_ids,
+                )
+                if not in_scope_ids and out_of_scope_count >= original_count:
+                    # Filter dropped everything. Map scope → slug.
+                    weight_adjustment_skipped_reason = {
+                        "agent": "agent_id_mismatch",
+                        "fleet": "fleet_id_mismatch",
+                        "all": "all_out_of_scope",
+                    }.get(scope, "all_out_of_scope")
+                    _log_weight_adjustment_skip(
+                        weight_adjustment_skipped_reason,
+                        tenant_id,
+                        scope,
+                        out_of_scope_count=out_of_scope_count,
+                        caller_agent_id=agent_id,
+                        fleet_id=fleet_id,
+                    )
+            config = await resolve_config(tenant_id)
+        # ── Session closed. The LLM rule generation runs with no DB held. ──
+
+        # ── Phase 2: LLM (no DB) ───────────────────────────────────
+        rule_result, rule_skipped_reason = await _maybe_generate_rule(
+            tenant_id,
+            outcome,
+            outcome_type,
+            in_scope_ids,
+            config,
+            agent_id,
+            fleet_id,
+            ids_supplied=bool(related_ids),
+        )
+
+        # ── Phase 3: persist (storage-routed) ──────────────────────
+        # Fix 2 Ph5b (PR2): the rule/outcome create_memory writes + the atomic
+        # weight-adjust/backfill all route through core-storage-api, so there's
+        # no session to open or commit here (``_no_db()`` ⇒ db=None).
+        async with _no_db():
+            result = await _apply_outcome_to_db(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                fleet_id=fleet_id,
+                outcome=outcome,
+                outcome_type=outcome_type,
+                related_ids=in_scope_ids,
+                rule_result=rule_result,
+                rule_skipped_reason=rule_skipped_reason,
+                scope=scope,
+                out_of_scope_count=out_of_scope_count,
+                weight_adjustment_skipped_reason=weight_adjustment_skipped_reason,
+                t0=t0,
+            )
+        return _with_latency(_dumps(result), t0)
+    except HTTPException as e:
+        return _with_latency(
+            _error_response(_detail_code(e.detail, e.status_code), _detail_text(e.detail)), t0
+        )
+    except Exception as e:
+        logger.exception("Unhandled error in caura_evolve")
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# caura_keystones / caura_keystones_set — CAURA-000
+# ──────────────────────────────────────────────────────────────────────
+#
+# Keystones are mandatory governance rules. They live in core-storage
+# under the system-managed ``_keystones`` collection (PR1); this layer
+# wraps them in MCP tools and a REST surface (route file
+# ``routes/keystones.py``).
+#
+# Two separate handlers (not op-dispatched into one) because:
+#   * Different audiences — agents READ keystones at session start,
+#     admins/governance AUTHOR them. Surfacing them as two named tools
+#     keeps the read tool discoverable in ``instructions`` without the
+#     write surface bleeding into low-trust contexts.
+#   * Different trust profiles. Read is open (``trust_required=0``).
+#     Write declares ``trust_required=1`` as the minimum any successful
+#     call needs, then the handler computes the per-call floor from
+#     the rule's scope/agent_id: ``scope=agent`` carrying an EXPLICIT
+#     ``agent_id`` equal to the caller is the self-author tier (≥1);
+#     everything else stays at the cross-agent governance bar (≥2) —
+#     ``scope=fleet``, ``scope=tenant``, cross-agent ``scope=agent``,
+#     and also ``scope=agent`` with ``agent_id`` OMITTED, which names
+#     no target and therefore cannot be self-authored. The ≥2 tier is
+#     what blocks a prompt-injected freshly-registered agent from
+#     planting a tenant-wide rule or impersonating another agent.
+#
+#     The omitted-agent_id case is the one callers trip over: the rule
+#     shape is invalid anyway (storage: "scope=agent requires agent_id")
+#     but the trust gate runs first, so the 403 lands before the 422.
+#     ``keystone_trust_hint`` appends the remedy to that 403 rather
+#     than reordering the checks — the gate must stay ahead of the
+#     storage read for anti-probing reasons.
+
+
+async def caura_keystones(
+    agent_id: Annotated[str, Field(description=_AGENT_ID_DESC)] = DEFAULT_AGENT_ID,
+    fleet_id: Annotated[
+        str | None,
+        Field(description="Scope filter; supply to include fleet- and agent-scoped rules."),
+    ] = None,
+) -> ToolReply:
+    """Retrieve the scope-merged set of keystone rules for the caller.
+
+    Returns ``{"count": N, "truncated": bool, "rules": [...]}`` — the
+    merged rule set lives under ``rules``. The field name is ``rules``
+    (not ``keystones``) for backwards compatibility with existing
+    clients; if you build a new integration, key off ``rules``.
+
+    Includes tenant + fleet + agent-scope rules ordered by weight.
+    Agents should call this once per session, surface the result as
+    mandatory rules, and obey them. Do not pass a query — there is no
+    semantic search here; the whole point of keystones is deterministic
+    retrieval.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    tenant_id = _get_tenant()
+    agent_id_effective = canonical_service_agent_id(_get_agent_id() or agent_id)
+    if refuse := _refuse_default_agent_on_gateway(agent_id_effective):
+        return _with_latency(refuse, t0)
+
+    sc = get_storage_client()
+    try:
+        rows, truncated = await sc.list_keystones(
+            tenant_id=tenant_id,
+            fleet_id=fleet_id,
+            agent_id=agent_id_effective if fleet_id else None,
+        )
+    except HTTPException as e:
+        return _with_latency(
+            _error_response(_detail_code(e.detail, e.status_code), _detail_text(e.detail)), t0
+        )
+    except httpx.HTTPStatusError as e:
+        # storage_client raises this on non-2xx — surface the upstream
+        # status + detail so a 4xx from storage doesn't surface as a 500.
+        # Mirrors the catch in ``caura_keystones_set`` and the
+        # ``_surface_storage_error`` helper in ``routes/keystones.py``.
+        try:
+            detail = e.response.json()
+        except ValueError:
+            detail = e.response.text or str(e)
+        return _with_latency(
+            _error_response(code_for_status(e.response.status_code), str(detail)),
+            t0,
+        )
+    except Exception as e:
+        logger.exception("Unhandled error in caura_keystones")
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+    payload: dict = {"count": len(rows), "truncated": truncated, "rules": rows}
+    if not rows:
+        payload["hint"] = KEYSTONES_EMPTY_HINT
+    return _with_latency(_dumps(payload), t0)
+
+
+async def caura_keystones_set(
+    op: Annotated[str, Field(description="set|delete.")],
+    doc_id: Annotated[str, Field(description="Stable slug identifying the rule.")],
+    title: Annotated[str | None, Field(description="op=set: human-readable title.")] = None,
+    content: Annotated[str | None, Field(description="op=set: the rule text.")] = None,
+    scope: Annotated[str | None, Field(description="op=set: tenant|fleet|agent.")] = None,
+    weight: Annotated[str | None, Field(description="op=set: low|med|high.")] = None,
+    fleet_id: Annotated[
+        str | None, Field(description="op=set: required for scope=fleet|agent; omit for scope=tenant.")
+    ] = None,
+    agent_id: Annotated[
+        str | None,
+        Field(
+            description=(
+                "op=set: TARGET agent the rule binds to — required for "
+                "scope=agent, must be omitted for scope=tenant or scope=fleet. "
+                "This is NOT the caller's identity (which is derived from the "
+                "API key or gateway headers); it's the agent whose behaviour "
+                "the rule constrains."
+            ),
+        ),
+    ] = None,
+    author_user_id: Annotated[
+        str | None, Field(description="op=set: optional author identity for audit.")
+    ] = None,
+) -> ToolReply:
+    """Author or remove a keystone rule.
+
+    ``agent_id`` is the TARGET agent the rule binds to — not the
+    caller's identity. Caller identity comes from the API key or the
+    gateway-injected ``X-Agent-ID``. Pass ``agent_id`` only for
+    ``scope=agent``; passing it for ``scope=tenant`` or ``scope=fleet``
+    returns ``INVALID_ARGUMENTS``.
+
+    Trust gating is dynamic: ``scope=agent`` carrying an **explicit**
+    ``agent_id`` that matches the caller is the self-author tier (trust
+    ≥ 1); everything else stays at the cross-agent governance bar
+    (trust ≥ 2) — ``scope=fleet``, ``scope=tenant``, ``scope=agent``
+    targeting a different agent, and ``scope=agent`` with ``agent_id``
+    omitted (no target named, so nothing to self-author). Mirror of the
+    REST policy in ``routes/keystones.py``.
+
+    Use this rarely and deliberately — keystones override conflicting
+    user instructions and apply to every future session in scope.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if err := _check_write_scope():
+        return err
+    if op not in {"set", "delete"}:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", f"Unknown op '{op}'. Expected set|delete."),
+            t0,
+        )
+    if not doc_id:
+        return _with_latency(_error_response("INVALID_ARGUMENTS", "doc_id is required."), t0)
+    # Slug shape mirrors KeystoneSetRequest.doc_id in routes/keystones.py
+    # (filesystem-safe identifier). Validate here as well so MCP callers
+    # get the same constraint as REST callers — the regex isn't applied
+    # by Pydantic on this surface.
+    # ``re.fullmatch`` anchors both ends implicitly — no ^/$ needed. The
+    # error message keeps the anchored form because that's how the
+    # equivalent Pydantic ``Field(pattern=...)`` in routes/keystones.py
+    # advertises the constraint to API clients.
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,99}", doc_id):
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                "doc_id must match ^[a-z0-9][a-z0-9._-]{0,99}$ (filesystem-safe identifier).",
+            ),
+            t0,
+        )
+
+    tenant_id = _get_tenant()
+    caller_agent_id = canonical_service_agent_id(_get_agent_id() or "mcp-agent")
+    if agent_id is not None:
+        agent_id = canonical_service_agent_id(agent_id)
+    if refuse := _refuse_default_agent_on_gateway(caller_agent_id):
+        return _with_latency(refuse, t0)
+
+    # Already storage-routed for the keystone CRUD (``sc.get_document`` /
+    # ``upsert_keystone`` / ``delete_keystone``); Fix 2 Phase 4 only drops the
+    # residual ``_mcp_session`` (``_no_db()`` ⇒ db=None) since ``_require_trust``
+    # is storage-routed, ``log_action`` / ``check_and_increment`` ignore the
+    # ``db`` arg (audit queue / usage stub), and the keystone writes commit
+    # storage-side — so the ``db.commit()`` calls are gone. Tenant isolation is
+    # unchanged: every keystone op is scoped to the explicit home ``tenant_id``
+    # (writes never widen to a readable set).
+    async with _no_db():
+        # The whole body sits inside the try so the catch-all also covers
+        # ``_require_trust`` and the trust-error return paths — any of which can
+        # raise errors that aren't ``HTTPStatusError`` or ``HTTPException``.
+        # Mirrors caura_keystones' fallback.
+        try:
+            sc = get_storage_client()
+
+            if op == "set":
+                # Surface missing fields BEFORE the trust gate so we can
+                # compute ``min_level`` from a non-None ``scope``. We
+                # check ``is None`` (not ``not v``) so an explicit empty
+                # string falls through to storage's ``min_length=1``
+                # check and surfaces the correct error.
+                required = {
+                    "title": title,
+                    "content": content,
+                    "scope": scope,
+                    "weight": weight,
+                }
+                missing = [k for k, v in required.items() if v is None]
+                if missing:
+                    return _with_latency(
+                        _error_response(
+                            "INVALID_ARGUMENTS",
+                            f"op=set requires: {', '.join(missing)}.",
+                        ),
+                        t0,
+                    )
+
+                # ONE trust round-trip — mirrors the op=delete path.
+                # Ask ``_require_trust`` for the anti-probing minimum (1)
+                # and reuse the returned ``trust`` value for the in-memory
+                # floor check after the storage lookup. This collapses
+                # two DB queries into one while preserving both the
+                # registration-check guarantee (so an unregistered caller
+                # can't probe doc_id existence via sc.get_document) and
+                # the scope-derived floor check.
+                trust, early_not_found, _early_terr = await _require_trust(
+                    tenant_id, caller_agent_id, min_level=1
+                )
+                if early_not_found:
+                    return _with_latency(
+                        _error_response(
+                            "FORBIDDEN",
+                            f"Agent '{caller_agent_id}' is not registered. "
+                            "Register the agent by writing one memory first.",
+                        ),
+                        t0,
+                    )
+                if _early_terr:
+                    return _with_latency(
+                        _error_response("FORBIDDEN", parse_trust_error(_early_terr)),
+                        t0,
+                    )
+
+                # Look up the existing rule (if any) so the trust floor
+                # combines the NEW body shape and the STORED shape.
+                # Without this, a trust-1 agent could overwrite a
+                # ``scope=fleet`` rule by submitting
+                # ``scope=agent``+``agent_id=<self>`` — the new-shape
+                # floor (1) would pass the gate and storage would
+                # upsert unconditionally. Mirrors the REST upsert.
+                existing = await sc.get_document(
+                    tenant_id=tenant_id,
+                    collection="_keystones",
+                    doc_id=doc_id,
+                )
+                existing_data = (existing or {}).get("data") or {}
+                # ``cast`` is a static-only hint (no runtime branch — unlike
+                # ``assert``, which becomes a no-op under ``python -O``).
+                # ``scope`` is guaranteed non-None by the required-fields
+                # check above; this just makes that visible to mypy.
+                new_scope_str = cast("str", scope)
+                min_level = effective_keystone_min_trust(
+                    new_scope=new_scope_str,
+                    new_target_agent_id=agent_id,
+                    stored_scope=existing_data.get("scope") if existing else None,
+                    stored_target_agent_id=existing_data.get("agent_id") if existing else None,
+                    caller_agent_id=caller_agent_id,
+                )
+                if trust < min_level:
+                    # Append (never replace) the self-scope remedy so the
+                    # pinned ``Agent '…' (trust_level=N) < required M.``
+                    # shape survives for anything parsing it.
+                    return _with_latency(
+                        _error_response(
+                            "FORBIDDEN",
+                            f"Agent '{caller_agent_id}' (trust_level={trust}) < required {min_level}."
+                            + keystone_trust_hint(new_scope_str, agent_id, caller_agent_id),
+                        ),
+                        t0,
+                    )
+                # TOCTOU narrowing: re-fetch the stored row immediately
+                # before the upsert and abort if the shape changed. A
+                # legitimate concurrent upsert could otherwise promote
+                # the stored scope between the gate read and the write
+                # below, letting a caller authorised for the looser
+                # earlier shape overwrite a stricter rule. Window is
+                # now reduced to (recheck → write), matching the delete
+                # path; storage-side conditional upsert remains the
+                # proper fix.
+                recheck = await sc.get_document(tenant_id=tenant_id, collection="_keystones", doc_id=doc_id)
+                recheck_data = (recheck or {}).get("data") or {}
+                if (existing is None) != (recheck is None) or (
+                    existing is not None
+                    and recheck is not None
+                    and (
+                        recheck_data.get("scope") != existing_data.get("scope")
+                        or recheck_data.get("agent_id") != existing_data.get("agent_id")
+                    )
+                ):
+                    return _with_latency(
+                        _error_response(
+                            "CONFLICT",
+                            "Keystone scope changed during operation; aborting upsert.",
+                        ),
+                        t0,
+                    )
+
+                # Bump the tenant's write quota — matches every other MCP
+                # write handler (caura_write/doc/manage/evolve). OSS
+                # impl is a no-op; enterprise can wire real metering
+                # without touching this call site. Skipped for op=delete
+                # because deletes don't charge the write budget (mirrors
+                # the REST route skipping ``enforce_usage_limits`` on
+                # DELETE).
+                #
+                # That reasoning, and the matching decision for ``transition``,
+                # are recorded in ``usage_service.WRITE_QUOTA_OPS`` /
+                # ``PLAN_LIMIT_GATED_OPS``. Keystone ops are their own verb
+                # namespace and are NOT in those tables, so this branch stays
+                # hand-coded — the memory-CRUD call sites on both surfaces are
+                # the ones wired through the lookup.
+                await check_and_increment(tenant_id, "write")
+                # Storage owns scope/weight/fleet/agent shape validation;
+                # surface its 422s directly so we don't drift from the
+                # canonical error list.
+                #
+                # Build the TypedDict explicitly so mypy catches missing
+                # required fields. Optional fields are only added when
+                # set (rather than included as None) because storage
+                # rejects e.g. ``"fleet_id": null`` for ``scope=tenant``
+                # ("scope=tenant must not include fleet_id") — mirrors
+                # the REST path's ``exclude_none=True`` behaviour.
+                payload: KeystoneUpsertPayload = {
+                    "tenant_id": tenant_id,
+                    "doc_id": doc_id,
+                    "title": title,  # type: ignore[typeddict-item]
+                    "content": content,  # type: ignore[typeddict-item]
+                    "scope": scope,  # type: ignore[typeddict-item]
+                    "weight": weight,  # type: ignore[typeddict-item]
+                }
+                if fleet_id is not None:
+                    payload["fleet_id"] = fleet_id
+                if agent_id is not None:
+                    payload["agent_id"] = agent_id
+                if author_user_id is not None:
+                    payload["author_user_id"] = author_user_id
+                payload["actor_agent_id"] = caller_agent_id
+                actor_user_id = _user_id_var.get(None)
+                if actor_user_id is not None:
+                    payload["actor_user_id"] = actor_user_id
+                doc = await sc.upsert_keystone(payload)
+                await log_action(
+                    tenant_id=tenant_id,
+                    agent_id=caller_agent_id,
+                    action="keystone.set",
+                    resource_type="keystone",
+                    resource_id=doc.get("id") if isinstance(doc, dict) else None,
+                    detail={
+                        "doc_id": doc_id,
+                        "scope": scope,
+                        "fleet_id": fleet_id,
+                        "agent_id": agent_id,
+                        "weight": weight,
+                        "author_user_id": author_user_id,
+                        "via": "mcp",
+                        **_audit_actor(),
+                    },
+                )
+                return _with_latency(
+                    _dumps({"ok": True, "action": "set", "doc_id": doc_id}),
+                    t0,
+                )
+            # op == "delete"
+            # ONE trust round-trip for both the pre-lookup registration
+            # check (≥ 1, anti-probing — collapses 404 vs. 403 leak so
+            # unregistered callers can't probe ``doc_id`` existence)
+            # and the post-lookup floor check. Ask ``_require_trust``
+            # for the minimum the caller could possibly need (1), then
+            # compare the returned trust level against the scope-derived
+            # floor below.
+            trust, not_found, terr = await _require_trust(tenant_id, caller_agent_id, min_level=1)
+            if not_found:
+                return _with_latency(
+                    _error_response(
+                        "FORBIDDEN",
+                        f"Agent '{caller_agent_id}' is not registered. "
+                        "Register the agent by writing one memory first.",
+                    ),
+                    t0,
+                )
+            if terr:
+                return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
+
+            # Look up the rule so the floor check sees the stored
+            # ``scope`` + ``agent_id`` rather than trusting any caller
+            # assertion. The documents-store GET ignores the system-
+            # collection guard (it only fires on write/delete), so this
+            # needs no new storage endpoint.
+            existing = await sc.get_document(tenant_id=tenant_id, collection="_keystones", doc_id=doc_id)
+            if not existing:
+                return _with_latency(
+                    _error_response("NOT_FOUND", f"Keystone '{doc_id}' not found."),
+                    t0,
+                )
+            existing_data = existing.get("data") or {}
+            min_level = keystone_min_trust(
+                existing_data.get("scope", ""),
+                existing_data.get("agent_id"),
+                caller_agent_id,
+            )
+            if trust < min_level:
+                return _with_latency(
+                    _error_response(
+                        "FORBIDDEN",
+                        f"Agent '{caller_agent_id}' (trust_level={trust}) < required {min_level}.",
+                    ),
+                    t0,
+                )
+
+            # TOCTOU narrowing: re-fetch the stored row immediately
+            # before the delete and abort if the shape changed. Without
+            # this, a legitimate concurrent upsert can promote a
+            # ``scope=agent`` rule to ``scope=fleet`` between the first
+            # read and the storage delete, letting a trust-1 caller
+            # delete a now-fleet rule it was never authorised for. The
+            # remaining race window (recheck → delete) is a single
+            # storage round-trip; the proper fix is a storage-side
+            # compare-and-delete with preconditions. Mirrors the REST
+            # delete path.
+            recheck = await sc.get_document(tenant_id=tenant_id, collection="_keystones", doc_id=doc_id)
+            if not recheck:
+                return _with_latency(_error_response("NOT_FOUND", f"Keystone '{doc_id}' not found."), t0)
+            recheck_data = recheck.get("data") or {}
+            if recheck_data.get("scope") != existing_data.get("scope") or recheck_data.get(
+                "agent_id"
+            ) != existing_data.get("agent_id"):
+                return _with_latency(
+                    _error_response(
+                        "CONFLICT",
+                        "Keystone scope changed during operation; aborting delete.",
+                    ),
+                    t0,
+                )
+            deleted = await sc.delete_keystone(
+                tenant_id=tenant_id,
+                doc_id=doc_id,
+                actor_agent_id=caller_agent_id,
+                actor_user_id=_user_id_var.get(None),
+            )
+            if not deleted:
+                return _with_latency(_error_response("NOT_FOUND", f"Keystone '{doc_id}' not found."), t0)
+            await log_action(
+                tenant_id=tenant_id,
+                agent_id=caller_agent_id,
+                action="keystone.delete",
+                resource_type="keystone",
+                resource_id=None,
+                detail={"doc_id": doc_id, "via": "mcp", **_audit_actor()},
+            )
+            return _with_latency(_dumps({"ok": True, "action": "delete", "doc_id": doc_id}), t0)
+        except httpx.HTTPStatusError as e:
+            # storage_client._post / _delete call raise_for_status(); a
+            # storage-side 422 (bad scope/weight) raises this — surface
+            # the upstream status + detail instead of crashing the tool.
+            # Mirrors routes/keystones.py:_surface_storage_error.
+            try:
+                detail = e.response.json()
+            except ValueError:
+                detail = e.response.text or str(e)
+            return _with_latency(
+                _error_response(code_for_status(e.response.status_code), str(detail)),
+                t0,
+            )
+        except HTTPException as e:
+            return _with_latency(
+                _error_response(_detail_code(e.detail, e.status_code), _detail_text(e.detail)), t0
+            )
+        except Exception as e:
+            logger.exception("Unhandled error in caura_keystones_set")
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+# ── Mountable app + lifespan ──
+
+_mcp_starlette_app = mcp.streamable_http_app(
+    streamable_http_path="/",
+    json_response=True,
+    stateless_http=True,
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
+
+
+def get_mcp_app() -> ASGIApp:
+    return MCPAuthMiddleware(_mcp_starlette_app)
+
+
+@contextlib.asynccontextmanager
+async def mcp_lifespan():
+    """Run MCP session manager lifecycle. Enter during FastAPI lifespan."""
+    async with mcp.session_manager.run():
+        yield
+
+
+# ── SoT registration ──────────────────────────────────────────────────────
+# Triggers loading of every `core_api.tools.caura_*.py` spec module. Each
+# spec module registers itself in the REGISTRY and calls `mcp_register(mcp, spec)`
+# to wire the handler to the MCPServer. This import must run AFTER the `caura_*`
+# handler functions above are defined — spec modules reference them via
+# `core_api.mcp_server.caura_X` attribute lookup. Deliberately no count here:
+# this said "the 16 handler functions" from the initial release until 2026-09,
+# which was the PRE-consolidation figure and never matched the 12 that exist.
+# `test_tools_registry` pins the real number; prose beside it only drifts.
+# The `noqa: E402,F401` silences "module-level import not at top" and
+# "imported but unused" — both are intentional.
+from core_api import tools  # noqa: F401

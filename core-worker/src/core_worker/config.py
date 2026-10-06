@@ -1,0 +1,109 @@
+"""Service configuration — env vars validated at startup."""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from common.storage_auth import read_shared_secret_file
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    environment: Literal["development", "production", "sandbox"] = "development"
+
+    # Logging
+    log_level: str = "INFO"
+    log_format_json: bool = False
+    log_file: str = ""
+
+    # Storage backend — the worker PATCHes embeddings to core-storage-api
+    # via this URL. Defaults to the local docker-compose service name.
+    core_storage_api_url: str = "http://oss-core-storage-api:8002"
+    core_storage_shared_secret: SecretStr = Field(default=SecretStr(""), repr=False, exclude=True)
+    core_storage_shared_secret_file: str = ""
+
+    @model_validator(mode="after")
+    def resolve_core_storage_shared_secret(self) -> Settings:
+        if not self.core_storage_shared_secret.get_secret_value():
+            self.core_storage_shared_secret = SecretStr(
+                read_shared_secret_file(self.core_storage_shared_secret_file)
+            )
+        return self
+
+    # NO event-bus fields here, deliberately. ``EVENT_BUS_BACKEND``,
+    # ``GCP_PROJECT_ID`` and ``EVENT_BUS_SUBSCRIPTION_PREFIX`` are read from the
+    # PROCESS ENVIRONMENT by ``common.events.factory.get_event_bus``, which is
+    # shared and cannot import this module. Neither core-api nor
+    # core-storage-api declares them either.
+    #
+    # Declaring them here was worse than absent: ``env_file=".env"`` loads a
+    # value onto the settings OBJECT without exporting it to ``os.environ``, so
+    # ``EVENT_BUS_BACKEND=pubsub`` in .env produced a worker that looked
+    # configured and silently ran the in-process bus. A field the code does not
+    # read is how that stays invisible; ``lifespan`` now logs the backend the
+    # factory actually resolved instead.
+    #
+    # Containers are unaffected either way: compose/Cloud Run put env_file
+    # entries into the real environment, which is what the factory reads.
+
+    # HTTP timeout for the storage PATCH. The worker is off the request
+    # hot path so a longer timeout is fine; we'd rather wait + succeed
+    # than 504 + nack + redeliver.
+    storage_http_timeout_s: float = 30.0
+
+    # Per-tenant cap on concurrent storage PATCH-backs (embed/enrich
+    # results). Keep aligned with core-api's
+    # ``per_tenant_storage_write_concurrency`` so a single tenant's
+    # combined occupancy of the storage-writer pool stays bounded
+    # across both services. CAURA-636 — tenant-A storm fans into ~2
+    # PATCHes per write (embed + enrich); without this cap one
+    # tenant's burst saturates the pool and pushes other tenants into
+    # 12x write-latency regression.
+    per_tenant_storage_write_concurrency: int = 2
+
+    # Outstanding-publish cap for the scheduled embed-backfill sweep, well
+    # under ``run_embedding_backfill``'s own default of 100. It bounds how fast
+    # the sweep ENQUEUES work, not how fast it is embedded — provider calls are
+    # paced by the per-tenant slots above and the embedding concurrency gate.
+    # Deliberately low anyway: the sweep shares ``EMBED_REQUESTED`` with live
+    # deferred writes, so a large backlog in front of them delays real traffic,
+    # and the backend it feeds serves roughly 30 concurrent. Env-tunable so a
+    # sweep competing with live load can be throttled without a deploy.
+    embed_backfill_max_inflight: int = 25
+
+    @field_validator("embed_backfill_max_inflight")
+    @classmethod
+    def _embed_backfill_inflight_must_be_positive(cls, v: int) -> int:
+        # 0 would make ``asyncio.Semaphore(0)`` block every publish forever,
+        # so the sweep would hang rather than fail — same trap as the
+        # per-tenant cap above. Reject at config load.
+        if v < 1:
+            raise ValueError("embed_backfill_max_inflight must be >= 1; 0 would hang every sweep")
+        return v
+
+    @field_validator("per_tenant_storage_write_concurrency")
+    @classmethod
+    def _per_tenant_cap_must_be_positive(cls, v: int) -> int:
+        # ``asyncio.Semaphore(0)`` is valid Python — no ValueError at
+        # construction — but every ``acquire()`` would block forever
+        # with no error or log, silently deadlocking every storage
+        # PATCH-back. Reject at config load instead so the misconfig
+        # surfaces at startup.
+        if v < 1:
+            raise ValueError(
+                "per_tenant_storage_write_concurrency must be >= 1; 0 would deadlock every storage PATCH-back"
+            )
+        return v
+
+
+# Module-level singleton — matches core-api's ``core_api.config.settings``
+# pattern. Modules that need a config value should ``from core_worker.config
+# import settings`` rather than reconstruct ``Settings()``: pydantic-settings
+# isn't cached, so every reconstruction re-reads env + re-runs validators.
+# Also lets call sites drop the ``# type: ignore[call-arg]`` that mypy needs
+# at the construction site.
+settings = Settings()  # type: ignore[call-arg]

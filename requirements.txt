@@ -1,0 +1,59 @@
+fastapi>=0.141.1,<1
+# Floor is 0.37, not 0.34: common/serve.py passes
+# ``timeout_worker_healthcheck`` to uvicorn.run(), and that parameter landed
+# in uvicorn 0.37.0 (verified absent in 0.36.0's Config.__init__). Below the
+# floor the launcher raises TypeError on startup, so >=0.34 declared a range
+# this code cannot actually run on. Container images do not resolve from this
+# file — they install frozen from each service's uv.lock — but this is the
+# local-dev install path (AGENT-INSTALL.md) and it should not lie either.
+uvicorn[standard]>=0.53.0,<1
+sqlalchemy[asyncio]>=2.0.52,<3
+asyncpg>=0.30,<1
+pgvector>=0.5.0,<1
+alembic>=1.20.0,<2
+pydantic>=2.13.5,<3
+pydantic-settings>=2.15.0,<3
+google-cloud-aiplatform>=2.2.0,<3
+# Floor matches core-api/pyproject.toml and core-worker's ``vertex``
+# extra so this local-dev install path resolves the same SDK range the
+# services do. (Not a feature floor: ``HttpOptions(base_url=...)``,
+# which VertexLLMProvider's multi-region handling uses, predates even
+# 1.74.0 — verified by constructing it there.)
+google-genai>=2.23.0
+# Used directly by core_api.clients.identity_token (Cloud Run ID-token
+# fetch) — explicit here instead of relying on google-cloud-aiplatform's
+# transitive pull, so a future GCP-SDK cleanup can't silently break it.
+requests>=2.34.2
+openai>=3,<4
+python-dateutil>=2.9.0.post0,<3
+httpx>=0.28.1,<1
+httpx2>=2,<3
+mcp>=2.2.0,<3
+
+# Auth: password hashing, JWT, TOTP, encryption
+argon2-cffi>=25.1.0
+cryptography>=50.0.1
+python-jose[cryptography]>=3.5.0
+pyotp>=2.10.0
+cachetools>=7.2.0
+
+croniter>=6.2.4
+
+# Redis cache (optional — falls back to in-memory if not configured)
+redis[hiredis]>=8.1.0,<9
+
+# Rate limiting — backed by Redis when REDIS_URL is set, in-memory otherwise
+slowapi>=0.1.10,<1.0
+
+# Error tracking (optional — set SENTRY_DSN to enable)
+sentry-sdk[fastapi]>=2.69.2,<3
+
+# Structured logging with GCP Cloud Logging severity mapping (common/structlog_config.py)
+structlog>=26.1.0,<27
+
+# NOTE: google-cloud-pubsub is NOT listed here so OSS standalone deploys
+# (EVENT_BUS_BACKEND=inprocess, default) stay lightweight. GCP/SaaS
+# deployments that need the Pub/Sub backend install it via the [pubsub]
+# extra on each service, e.g. `pip install 'core-api[pubsub]'`. The
+# lazy import in common/events/pubsub.py keeps the rest of the code
+# loadable without the SDK.

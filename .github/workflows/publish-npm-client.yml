@@ -1,0 +1,142 @@
+name: Publish the canonical TypeScript client to npm
+
+# Publishes `clients/typescript` as `@caura/client`, the implementation package.
+# Version 1.0.0 under that name was a thin alias; 1.0.1 is the first version to
+# carry the implementation directly. The public API is unchanged.
+#
+# THIS WORKFLOW HAS NEVER RUN. Treat the first real run as unproven, and check
+# the registry afterwards rather than trusting the green tick.
+#
+# One-time setup by a maintainer:
+#   1. Ensure the @caura npm org/scope exists and the publisher has access.
+#   2. Add an `NPM_TOKEN` repository secret — an npm automation token with
+#      publish rights. Automation tokens are exempt from 2FA/OTP prompts by
+#      design; an OTP is never entered in CI. As of 2026-08-23 this secret does
+#      NOT exist, so this workflow cannot publish.
+#
+# Release: bump the version in clients/typescript/package.json, then push
+# `caura-client-ts-v<version>` or `caura-npm-v<version>` (or run this workflow
+# manually). Both Caura-spelled tag patterns now reach the same canonical
+# artifact; the latter was the original runbook for `@caura/client` and remains
+# supported.
+#
+# The package name is read from package.json throughout rather than written
+# out, so the rename lands in one place and these steps keep working.
+
+on:
+  push:
+    # Keep these two patterns aligned with the single pre-build agreement step.
+    tags:
+      - "caura-client-ts-v*"
+      - "caura-npm-v*"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      # Both, and `contents: read` is not redundant: declaring a permissions
+      # block sets every scope NOT listed to `none`, so naming only id-token
+      # leaves `contents: none` and `actions/checkout` authenticating with a
+      # token that cannot read the repo.
+      contents: read
+      id-token: write # npm provenance
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      # A tag that disagrees with package.json does not fail naturally: npm
+      # publishes the manifest's name and version under a misleading release
+      # tag. Validate both in one place before any credential or build work.
+      - name: The tag must agree with package.json
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          case "${GITHUB_REF_NAME}" in
+            caura-client-ts-v*) TAG_VERSION="${GITHUB_REF_NAME#caura-client-ts-v}" ;;
+            caura-npm-v*) TAG_VERSION="${GITHUB_REF_NAME#caura-npm-v}" ;;
+            *)
+              echo "::error::tag ${GITHUB_REF_NAME} does not use a supported client prefix"
+              exit 1
+              ;;
+          esac
+
+          case "${PKG_NAME}" in
+            *memclaw*) # legacy-name-ok: reject the preserved alias name on this canonical path
+              echo "::error::tag ${GITHUB_REF_NAME} is Caura-spelled but package.json publishes ${PKG_NAME}"
+              exit 1
+              ;;
+            @caura/*) ;;
+            *)
+              echo "::error::tag ${GITHUB_REF_NAME} is Caura-spelled but package.json publishes ${PKG_NAME}, whose brand is not recognized"
+              exit 1
+              ;;
+          esac
+          echo "tag ${GITHUB_REF_NAME} and package.json name ${PKG_NAME} are both Caura-spelled"
+
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [[ "${TAG_VERSION}" != "${PKG_VERSION}" ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} says ${TAG_VERSION} but package.json says ${PKG_VERSION}"
+            exit 1
+          fi
+          echo "publishing ${PKG_NAME}@${PKG_VERSION}"
+
+      # Checked explicitly because the failure it prevents is a confusing one.
+      # Without the secret, `npm publish` authenticates as nobody and fails
+      # with a 401 or ENEEDAUTH that reads like an npm-side problem rather
+      # than a missing repository secret.
+      - name: The publish credential must exist
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [[ -z "${NPM_TOKEN}" ]]; then
+            echo "::error::NPM_TOKEN repository secret is not set. Add an npm automation token with publish rights; nothing here can publish without it."
+            exit 1
+          fi
+
+      - name: Install + build
+        run: npm install
+
+      - name: Publish
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # A green publish step is not evidence the registry serves it. #870
+      # merged a version bump, every check passed, and both registries went on
+      # serving the old build because no tag had been pushed — the tick meant
+      # "nothing went wrong", not "it shipped". Ask the registry.
+      - name: The registry must actually serve it
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          # Give the registry five minutes, not fifty seconds. The run for
+          # caura-client-ts-v1.0.2 (actions/runs/35459496398, 2026-09-19)
+          # published cleanly, polled 5 x 10 s, went red — and the registry was
+          # serving 1.0.2 a couple of minutes later. `--prefer-online` matters
+          # as much as the budget: the registry answers packuments with
+          # `cache-control: max-age=300`, so without it npm can satisfy every
+          # retry from the packument it cached on attempt 1, which predates
+          # the publish becoming visible.
+          ATTEMPTS=20
+          INTERVAL=15
+          START=$SECONDS
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            PUBLISHED=$(npm view --prefer-online "${PKG_NAME}@${PKG_VERSION}" version 2>/dev/null || true)
+            if [[ "$PUBLISHED" == "$PKG_VERSION" ]]; then
+              echo "registry serves ${PKG_NAME}@${PUBLISHED} after $((SECONDS - START))s"
+              exit 0
+            fi
+            echo "attempt ${attempt}/${ATTEMPTS} ($((SECONDS - START))s elapsed): registry does not serve ${PKG_VERSION} yet, waiting ${INTERVAL}s"
+            sleep "$INTERVAL"
+          done
+          echo "::error::published without error but the registry does not serve ${PKG_NAME}@${PKG_VERSION} after $((SECONDS - START))s"
+          exit 1

@@ -1,0 +1,164 @@
+"""Test-only time-warp endpoint for E2E temporal manipulation.
+
+Gated behind TESTING=1, which also registers the route. Production refuses to
+boot with TESTING=1, and the guard below refuses production on its own (L-68).
+"""
+
+import logging
+import os
+import uuid as _uuid
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from core_api.auth import AuthContext, get_auth_context
+from core_api.config import settings
+from core_api.errors import (
+    AUTH_FEATURE_DISABLED,
+    AUTH_TENANT_MISMATCH,
+    coded_detail,
+)
+from core_api.schemas import STRICT_WRITE_BODY
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/testing", tags=["Testing"])
+
+
+# ── Allowlisted tables and fields (defense in depth) ──
+
+ALLOWED_FIELDS: dict[str, set[str]] = {
+    "memories": {
+        "created_at",
+    },
+}
+
+
+# ── Request schemas ──
+
+
+class TimeWarpRequest(BaseModel):
+    model_config = STRICT_WRITE_BODY
+
+    action: str
+
+    # For set_field
+    table: str | None = None
+    id: str | None = None
+    field: str | None = None
+    value: str | None = None  # ISO-8601
+
+
+class TimeWarpResponse(BaseModel):
+    ok: bool
+    affected: int
+
+
+# ── Helpers ──
+
+
+def _require_testing_mode() -> None:
+    """Fail fast unless TESTING=1, and always in production.
+
+    The environment check does not rely on the variable that registered the
+    route, so one inherited from a CI image still leaves production closed.
+    """
+    if os.getenv("TESTING") != "1":
+        raise HTTPException(
+            status_code=403, detail=coded_detail(AUTH_FEATURE_DISABLED, "Testing endpoints require TESTING=1")
+        )
+    if settings.environment == "production":
+        raise HTTPException(
+            status_code=403,
+            detail=coded_detail(AUTH_FEATURE_DISABLED, "Testing endpoints are disabled in production"),
+        )
+
+
+# ── Endpoint ──
+
+
+@router.post("/time-warp", response_model=TimeWarpResponse)
+async def time_warp(
+    body: TimeWarpRequest,
+    auth: AuthContext = Depends(get_auth_context),
+) -> TimeWarpResponse:
+    """Manipulate temporal state for E2E tests.
+
+    Actions:
+    - set_field: Update a timestamp column on an allowlisted table
+    """
+    _require_testing_mode()
+
+    if body.action == "set_field":
+        return await _handle_set_field(body, auth)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown action: {body.action}")
+
+
+async def _handle_set_field(body: TimeWarpRequest, auth: AuthContext) -> TimeWarpResponse:
+    """Update a single allowlisted field on a row."""
+    from core_api.clients.storage_client import get_storage_client
+
+    if not body.table or not body.id or not body.field or body.value is None:
+        raise HTTPException(
+            status_code=400,
+            detail="set_field requires: table, id, field, value",
+        )
+
+    allowed = ALLOWED_FIELDS.get(body.table)
+    if allowed is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Table '{body.table}' is not in the allowlist. Allowed: {sorted(ALLOWED_FIELDS.keys())}",
+        )
+    if body.field not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Field '{body.field}' is not allowed on '{body.table}'. Allowed: {sorted(allowed)}",
+        )
+
+    try:
+        _uuid.UUID(body.id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="id must be a valid UUID")
+
+    # Parse ISO value to datetime
+    try:
+        parsed_value = datetime.fromisoformat(body.value.replace("Z", "+00:00"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid ISO-8601 value: {e}")
+
+    sc = get_storage_client()
+    if body.table == "memories":
+        # Tenant isolation. This used to fetch the row unscoped and then compare
+        # ``row["tenant_id"] != auth.tenant_id`` in Python — a correct check, but
+        # one that pulled another tenant's row across the boundary to make it.
+        # The fetch is scoped now, so a row belonging to someone else is never
+        # read; the 404 below covers "no such memory" and "not yours" alike,
+        # which is also one less existence oracle for memory UUIDs.
+        if auth.tenant_id is None:
+            # Admin credentials carry no tenant. The old comparison rejected
+            # them here too — ``memories.tenant_id`` is NOT NULL, so it could
+            # never equal None — and there is no tenant to scope the fetch to.
+            raise HTTPException(status_code=403, detail=coded_detail(AUTH_TENANT_MISMATCH, "Tenant mismatch"))
+        row = await sc.get_memory(body.id, auth.tenant_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        # Pass the row's HOME tenant so the storage-side guard scopes the write;
+        # row["tenant_id"] is a non-null column, unlike the Optional
+        # auth.tenant_id.
+        result = await sc.update_memory(body.id, row["tenant_id"], {body.field: parsed_value.isoformat()})
+        affected = 1 if result else 0
+    else:
+        affected = 0
+
+    logger.info(
+        "time-warp set_field: %s.%s = %s (id=%s, affected=%d)",
+        body.table,
+        body.field,
+        body.value,
+        body.id,
+        affected,
+    )
+    return TimeWarpResponse(ok=True, affected=affected)

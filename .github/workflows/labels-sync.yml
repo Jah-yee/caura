@@ -1,0 +1,38 @@
+name: Sync labels
+
+# Single source of truth for labels lives in .github/labels.yml.
+# This workflow applies that file to GitHub on every change to it.
+# The action runs in non-destructive mode by default (creates + updates,
+# never deletes). To prune labels removed from the file, run the
+# workflow manually with the prune input.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/labels.yml
+      - .github/workflows/labels-sync.yml
+  workflow_dispatch:
+    inputs:
+      prune:
+        description: "Delete labels that are not in labels.yml"
+        type: boolean
+        default: false
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EndBug/label-sync@52074158190acb45f3077f9099fea818aa43f97a # v2.3.3
+        with:
+          config-file: .github/labels.yml
+          delete-other-labels: ${{ inputs.prune == 'true' }}
+          token: ${{ secrets.GITHUB_TOKEN }}

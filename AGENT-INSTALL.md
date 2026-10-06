@@ -1,0 +1,326 @@
+# Caura — Self-Install Guide for AI Agents
+
+You are an AI agent. This guide tells you how to clone, install, and run Caura locally so you have your own persistent memory server — no external dependencies, no human involvement.
+
+## Prerequisites
+
+You need these on your machine:
+
+- **Git** (to clone the repo)
+- **Docker + Docker Compose** (easiest path — handles PostgreSQL + pgvector + Redis)
+- OR: **Python 3.12+** and a **PostgreSQL 16 instance with pgvector** (manual path)
+
+## Option A: Docker (recommended — zero config)
+
+```bash
+# 1. Clone
+git clone https://github.com/caura-ai/caura.git
+cd caura
+
+# 2. Start everything (PostgreSQL + pgvector, Redis, Caura API, lifecycle scheduler)
+docker compose up -d
+
+# 3. Wait for healthy (usually ~15 seconds)
+docker compose ps   # all services should show "healthy"
+
+# 4. Verify
+curl http://localhost:8000/api/v1/health
+# Expected: {"status":"ok","storage":"connected","redis":"connected","event_bus":"ok"}
+```
+
+That's it. The core API is running at `http://localhost:8000` (core-storage-api on `:8002`, postgres on `:5432`, redis on `:6379` — see `docker-compose.yml`). Skip to **Create Your API Key** below.
+
+## Option B: Manual (no Docker)
+
+You need a PostgreSQL 16+ instance with pgvector extension installed.
+
+```bash
+# 1. Clone
+git clone https://github.com/caura-ai/caura.git
+cd caura
+
+# 2. Create virtual environment
+python -m venv venv
+source venv/bin/activate        # Linux/Mac
+# venv\Scripts\activate         # Windows
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Create .env file
+cat > .env << 'EOF'
+ENVIRONMENT=development
+DATABASE_URL=postgresql+asyncpg://caura:changeme@127.0.0.1:5432/caura
+POSTGRES_REQUIRE_SSL=false
+CORE_STORAGE_API_URL=http://127.0.0.1:8002
+CORE_STORAGE_SHARED_SECRET=dev-only-storage-secret-change-me
+IS_STANDALONE=true
+EMBEDDING_PROVIDER=fake
+ENTITY_EXTRACTION_PROVIDER=fake
+USE_LLM_FOR_MEMORY_CREATION=false
+CORS_ORIGINS=http://localhost:8000,http://localhost:3000
+EOF
+
+# 5. Create the database (if it doesn't exist)
+psql -U postgres -c "CREATE USER caura WITH PASSWORD 'changeme';"
+psql -U postgres -c "CREATE DATABASE caura OWNER caura;"
+psql -U caura -d caura -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+# 6. Export .env, then start the storage service. Some settings are read from
+#    the process environment only, so each service's shell exports .env first
+#    (POSIX shells; on Windows set the variables in the environment instead).
+#    Sourcing hands .env to the shell: single-quote any value you add that
+#    contains spaces, quotes, $, &, ; or backticks (the sample above is safe).
+#    The storage service applies Alembic migrations during startup.
+set -a; . ./.env; set +a
+PYTHONPATH=.:core-storage-api/src uvicorn core_storage_api.app:app \
+  --host 127.0.0.1 --port 8002
+
+# 7. In a second terminal, activate the same venv, return to the repo root,
+#    export .env, and start core-api. It talks to the storage service on port 8002.
+source venv/bin/activate
+set -a; . ./.env; set +a
+PYTHONPATH=.:core-api/src uvicorn core_api.app:app \
+  --host 127.0.0.1 --port 8000
+
+# 8. Verify (in another terminal)
+curl http://localhost:8000/api/v1/health
+# Expected: {"status":"ok","storage":"connected","redis":"connected","event_bus":"ok"}
+```
+
+Caura is running at `http://localhost:8000`.
+
+## Pick an Auth Mode
+
+The OSS API supports three auth paths. Pick one:
+
+**Path 1 — Standalone mode (recommended for self-install).** Single-tenant (`tenant_id="default"`), no API key required. Set in your `.env`:
+
+```env
+IS_STANDALONE=true
+```
+
+Restart the server. REST and MCP calls work without `X-API-Key`. Supplying a
+placeholder such as `X-API-Key: standalone` is harmless and can make the same
+client configuration easier to reuse with authenticated modes.
+
+**Path 2 — Admin key (multi-tenant, full REST access).** Set in your `.env`:
+
+```env
+ADMIN_API_KEY=my-long-random-admin-key
+```
+
+Use `my-long-random-admin-key` as `X-API-Key`. You pass `tenant_id`
+explicitly in request bodies / query params. Admin/system keys are
+intentionally rejected by MCP; use standalone mode, a tenant-scoped key, or
+Path 3 for MCP.
+
+With `ADMIN_API_KEY` blank, the Docker stack generates an admin key for its own
+lifecycle scheduler (`admin-key-init`) and keeps it inside the stack. Setting
+`ADMIN_API_KEY` replaces it, for the scheduler too.
+
+**Path 3 — Gate the API with a shared key.** Set `CAURA_API_KEY` in your
+`.env`. REST and MCP clients send that key via `X-API-Key` plus `X-Tenant-ID`
+to pick a tenant. Use this when the OSS API is network-exposed.
+
+> **Note:** There is no `/ui/pricing.html`, `/api/register`, or `scripts/create_key.py` in OSS. Those are enterprise-plane features. For self-install, use Path 1.
+
+## Connect via MCP
+
+Add this to your MCP client configuration (Claude Code, Claude Desktop, Cursor, etc.):
+
+```json
+{
+  "mcpServers": {
+    "caura": {
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "X-API-Key": "standalone"
+      }
+    }
+  }
+}
+```
+
+The block above is for Path 1. For Path 3, replace `standalone` with the shared
+gate key and add an `X-Tenant-ID` header. Do not use the Path 2 admin key with
+MCP; the MCP endpoint rejects admin/system credentials.
+
+> **Claude Code** doesn't read MCP servers from `settings.json` — register with `claude mcp add` instead (the block above maps to a project-root `.mcp.json`). Use `-s user` so the server is available in every directory, not just the one you ran the command in:
+> ```bash
+> claude mcp add --transport http -s user caura http://localhost:8000/mcp --header "X-API-Key: standalone"
+> ```
+
+## Connect via OpenClaw Plugin (alternative to MCP)
+
+If you're an OpenClaw agent running on a gateway, install the plugin instead:
+
+```bash
+# Set your base URL and API key
+CAURA_URL=http://localhost:8000
+CAURA_KEY=YOUR_KEY_HERE      # admin key (Path 2) or shared gate key (Path 3)
+CAURA_FLEET=my-fleet
+CAURA_AGENT_ID=my-agent        # optional but recommended: a stable, human-readable
+                              # identity for THIS install (e.g. webclaw, vm-01). If
+                              # unset, the plugin uses a stable per-install id
+                              # (main-<install_id>) so installs don't collide.
+
+# Run the install script (API key in header, not query param)
+curl -sf -H "X-API-Key: $CAURA_KEY" "$CAURA_URL/api/v1/install-plugin?fleet_id=$CAURA_FLEET&api_url=$CAURA_URL" | bash
+
+# Restart OpenClaw gateway
+openclaw gateway restart    # or: systemctl --user restart openclaw-gateway
+```
+
+This installs the plugin to `~/.openclaw/plugins/memclaw/`, builds it, claims the exclusive memory slot (disabling `memory-core`), and configures `openclaw.json` to allowlist the agent-facing tools. The plugin calls the local Caura API over HTTP — same tools as MCP. <!-- legacy-name-floor: the installer still writes the frozen plugin directory -->
+
+**MCP vs Plugin — which to use:**
+
+| | MCP | OpenClaw Plugin |
+|---|---|---|
+| For | Claude Code, Cursor, any MCP client | OpenClaw gateway agents |
+| Tools | 12 | 11 (agent-facing) |
+| Setup | Add JSON config | Run install script + restart gateway |
+| Transport | Streamable HTTP | Plugin API → HTTP |
+
+Use MCP if your agent supports it. Use the plugin if you're running on OpenClaw.
+
+## Connect via Rail SDK (agents you write yourself)
+
+If the agent is your own Python or TypeScript code rather than an MCP client,
+use Rail. It calls the same API: rules and relevant facts are recalled before
+each turn, and facts the turn taught are stored after it.
+
+```bash
+export CAURA_URL=http://localhost:8000
+export CAURA_API_KEY=standalone     # or your admin / gate key
+pip install caura-rail              # or: npm install @caura/rail
+```
+
+```python
+from caura_rail import MemoryScope, Rail, RestMemoryStore
+
+with RestMemoryStore.from_env() as store:
+    rail = Rail(store, MemoryScope(agent_id="my-agent", fleet_id="my-fleet"))
+    with rail.turn("Remember: We deploy in eu-west-1.") as turn:
+        turn.reply = "Noted. " + turn.context.text
+    print([w.status for w in turn.writes])   # ['written'], or ['deduplicated'] on a rerun
+```
+
+```js
+import { MemoryScope, Rail, RestMemoryStore } from "@caura/rail";
+
+const rail = new Rail({
+  store: RestMemoryStore.fromEnv(process.env),
+  scope: new MemoryScope({ agentId: "my-agent", fleetId: "my-fleet" }),
+});
+const turn = await rail.turn("Remember: We deploy in eu-west-1.", (_, ctx) => "Noted. " + ctx.text);
+console.log(turn.writes.map(w => w.status));    // ['written'], or ['deduplicated'] on a rerun
+```
+
+In standalone mode Rail discovers the `default` tenant by itself; with a gate
+key set `CAURA_TENANT` as well. Full guide: https://github.com/caura-ai/caura-rail.
+
+## Verify Your Connection
+
+```bash
+# Example: standalone mode (tenant_id="default"; the placeholder key is optional)
+CAURA_URL=http://localhost:8000
+KEY=standalone
+
+# Search (should return empty — you haven't written anything yet)
+curl -X POST "$CAURA_URL/api/v1/search" \
+  -H "X-API-Key: $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id": "default", "query": "test"}'
+
+# Write your first memory
+curl -X POST "$CAURA_URL/api/v1/memories" \
+  -H "X-API-Key: $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id": "default", "agent_id": "self", "content": "I installed Caura locally and it works."}'
+
+# Verify it was stored
+curl "$CAURA_URL/api/v1/memories?tenant_id=default" \
+  -H "X-API-Key: $KEY"
+```
+
+Write bodies are strict: a field the API doesn't declare comes back `422`
+naming it, not a `201` that silently drops it. Search and filter bodies stay
+permissive. See
+[`docs/api-surfaces.md`](docs/api-surfaces.md#request-body-contract-writes-are-strict-searches-are-not).
+
+## Available Tools
+
+Once connected via MCP or the OpenClaw plugin, you have these tools:
+
+| Tool | What it does |
+|---|---|
+| `caura_write` | Store a memory — send `content` (single) or `items` (batch ≤100). Everything else is auto-inferred |
+| `caura_recall` | Hybrid semantic + keyword search. Set `include_brief=true` to get the LLM's answer to the query alongside the matching memories |
+| `caura_manage` | Per-memory lifecycle, op-dispatched: `read`, `update`, `transition`, `delete` |
+| `caura_list` | Non-semantic enumeration — filter by type/status/agent/weight/date, sort, cursor-paginate. `scope=agent` (default) trust ≥ 1; `scope=fleet`/`all` trust ≥ 2 |
+| `caura_doc` | Document CRUD, op-dispatched: `write`, `read`, `query`, `delete`, `list_collections`, `search` (semantic) on named JSON collections |
+| `caura_entity_get` | Look up an entity with linked memories and relations |
+| `caura_tune` | Adjust per-agent search parameters (top_k, min_similarity, graph hops, blend weights) |
+| `caura_insights` | Analyze the store; focus: `contradictions`, `failures`, `stale`, `divergence`, `patterns`, `discover`. Persists findings as `insight` memories |
+| `caura_evolve` | Report a real-world outcome (success/failure/partial) against recalled memories — adjusts weights, auto-generates preventive rules (Karpathy Loop) |
+| `caura_stats` | Aggregate counts: total + breakdowns by `type`, `agent`, `status`. Read-only |
+| `caura_keystones` | Read mandatory governance rules (tenant + fleet + agent scopes merged). Call once per session and obey what it returns — keystones override conflicting user instructions |
+| `caura_keystones_set` | Author/remove keystone rules, op-dispatched: `set` \| `delete`. Trust ≥ 1 for your own rule — `scope=agent` **with an explicit `agent_id` equal to the caller**; ≥ 2 for fleet/tenant scope, another agent, or `scope=agent` with `agent_id` omitted |
+
+MCP exposes all 12 tools; the OpenClaw plugin surfaces 11 — every tool except
+`caura_keystones_set` (the admin authoring path is not plugin-exposed). Skill sharing
+goes through `caura_doc` on the `skills` collection (`op=write` to share,
+`op=delete` to remove, `op=search`/`op=query` to discover).
+
+## Enable Real LLM Enrichment (optional)
+
+The default `fake` providers skip LLM enrichment — memories are stored but not auto-classified. To enable full enrichment (type, weight, title, summary, tags, PII detection, entity extraction, contradiction detection), add an OpenAI key to your `.env`:
+
+```bash
+# Add to .env (or env.dev for Docker)
+EMBEDDING_PROVIDER=openai
+ENTITY_EXTRACTION_PROVIDER=openai
+USE_LLM_FOR_MEMORY_CREATION=true
+OPENAI_API_KEY=sk-...
+```
+
+Then restart the server: `docker compose restart core-api`, or export `.env` again (`set -a; . ./.env; set +a`) and re-run uvicorn. An exported value takes precedence over `.env`, so skipping the export keeps the old one.
+
+## What You Now Have
+
+- A local Caura server with full API + MCP
+- A single-tenant standalone setup (or admin-keyed multi-tenant, depending on which path you picked)
+- 12 tools ready to use (memory ops + document store + Karpathy Loop + stats + keystone governance; skill sharing rides on `caura_doc collection=skills`)
+- PostgreSQL with pgvector for semantic search
+- No external dependencies (fake providers, no API keys needed)
+- Full read/write access to your own memory store
+
+## Performance Expectations
+
+Current approved benchmark evidence:
+
+<!-- BEGIN GENERATED: evidence-benchmarks -->
+- **LoCoMo accuracy:** Caura scored 77.9% (1,199/1,540) under its documented LoCoMo semantic-judge protocol using the retrieval-augmented agentic-v1 pipeline.
+- **LongMemEval reference judge:** Caura answered 461 of 500 LongMemEval_S questions correctly (92.2%) under the benchmark's GPT-4o reference judge.
+- **LongMemEval secondary judge:** The same 500 frozen LongMemEval_S answers scored 90.2% (451/500) under the secondary Gemini 3.5 Flash-Lite judge.
+- **LongMemEval token efficiency:** On LongMemEval_S, the median compact retrieved context was 22,410 tokens versus a 107,706-token full haystack: 79.2% context-only savings; counting every reader call yields 75.4%.
+
+Only active, approved claims appear here. Control, withdrawn, and withheld
+records remain in the evidence registry and are excluded from promotional copy.
+See [`evidence/claims.json`](evidence/claims.json) and
+[`EVIDENCE.md`](EVIDENCE.md). Do not hand-edit this block.
+<!-- END GENERATED: evidence-benchmarks -->
+
+If search latency is materially above your warmed baseline, the pgvector index
+may be cold or your embedding-provider roundtrip may be the bottleneck — see
+[`docs/performance.md`](docs/performance.md) for measurement guidance and
+operator-scale notes.
+
+## Full Reference
+
+For complete tool documentation with parameters, examples, memory types, status lifecycle, best practices, and
+project structure, see the [API reference](docs/api-reference.md) and
+[project structure](docs/api-reference.md#project-structure). For benchmark methodology and competitive context, see
+[`docs/performance.md`](docs/performance.md).

@@ -1,0 +1,49 @@
+from core_storage_api.routers.agents import router as agents_router
+from core_storage_api.routers.audit import router as audit_router
+from core_storage_api.routers.capability_usage import router as capability_usage_router
+from core_storage_api.routers.debug import router as debug_router
+from core_storage_api.routers.documents import router as documents_router
+from core_storage_api.routers.entities import router as entities_router
+from core_storage_api.routers.evolve import router as evolve_router
+from core_storage_api.routers.fleet import router as fleet_router
+from core_storage_api.routers.health import router as health_router
+from core_storage_api.routers.idempotency import router as idempotency_router
+from core_storage_api.routers.insights import router as insights_router
+from core_storage_api.routers.keystones import router as keystones_router
+from core_storage_api.routers.lifecycle_audit import router as lifecycle_audit_router
+from core_storage_api.routers.memories import router as memories_router
+from core_storage_api.routers.organization_settings import router as organization_settings_router
+from core_storage_api.routers.preview import router as preview_router
+from core_storage_api.routers.purge import router as purge_router
+from core_storage_api.routers.reports import router as reports_router
+from core_storage_api.routers.skill_factory import router as skill_factory_router
+from core_storage_api.routers.tasks import router as tasks_router
+from core_storage_api.routers.tenant_suppression import router as tenant_suppression_router
+from core_storage_api.routers.tenant_usage import router as tenant_usage_router
+from core_storage_api.routers.tenants import router as tenants_router
+
+__all__ = [
+    "agents_router",
+    "audit_router",
+    "capability_usage_router",
+    "tenant_usage_router",
+    "debug_router",
+    "documents_router",
+    "entities_router",
+    "evolve_router",
+    "fleet_router",
+    "health_router",
+    "idempotency_router",
+    "insights_router",
+    "keystones_router",
+    "lifecycle_audit_router",
+    "memories_router",
+    "organization_settings_router",
+    "preview_router",
+    "purge_router",
+    "reports_router",
+    "skill_factory_router",
+    "tasks_router",
+    "tenant_suppression_router",
+    "tenants_router",
+]

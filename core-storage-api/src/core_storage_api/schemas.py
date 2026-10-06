@@ -1,0 +1,292 @@
+"""ORM-to-dict helpers and per-model field lists for core-storage-api.
+
+Seven pydantic request schemas used to live at the bottom of this file —
+``ScoredSearchRequest`` and friends. Every one was unreferenced, and every one
+that could be paired with a live endpoint was also WRONG about it: the
+handlers read their bodies as plain dicts, and the schemas had not followed
+them. ``MemoryEntityLinksRequest`` declared ``entity_ids`` where
+``/entity-links`` reads ``memory_ids``; ``ScoredSearchRequest`` was missing
+five fields ``/scored-search`` reads, ``readable_tenant_ids`` among them.
+
+They were deleted rather than corrected because a reader who found them and
+did the obvious thing — annotate the handler with the schema it looks written
+for — would have silently dropped those fields. pydantic ignores unknown keys
+by default, so cross-tenant read scoping would have gone quiet rather than
+loud. See ``tests/test_declarations_are_not_stale.py``.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# ORM → dict helper
+# ---------------------------------------------------------------------------
+
+
+def _serialise_value(val: Any) -> Any:
+    """Recursively convert non-JSON-native types in nested structures."""
+    if val is None:
+        return None
+    if isinstance(val, uuid.UUID):
+        return str(val)
+    if isinstance(val, datetime):
+        return val.isoformat()
+    if hasattr(val, "tolist"):
+        return val.tolist()
+    if isinstance(val, dict):
+        return {k: _serialise_value(v) for k, v in val.items()}
+    if isinstance(val, (list, tuple)):
+        return [_serialise_value(v) for v in val]
+    return val
+
+
+def orm_to_dict(obj: Any, fields: list[str]) -> dict[str, Any]:
+    """Convert a SQLAlchemy ORM instance to a plain dict.
+
+    Type coercions applied per-value (recursively for dicts/lists):
+    - UUID          → str
+    - datetime      → isoformat string
+    - pgvector      → list[float]
+    - None          → None (passthrough)
+    - everything else passes through unchanged
+    """
+    result: dict[str, Any] = {}
+    for f in fields:
+        result[f] = _serialise_value(getattr(obj, f, None))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Field lists — one per model, consumed by orm_to_dict callers
+# ---------------------------------------------------------------------------
+
+MEMORY_FIELDS: list[str] = [
+    "id",
+    "tenant_id",
+    "fleet_id",
+    "agent_id",
+    # Not a memories column — a LEFT JOIN output attached to the ORM instance by
+    # the query methods that join agents (scored-search, list, get-detail,
+    # load-by-ids, find-successors). orm_to_dict reads it via getattr, so it is
+    # null on any path that doesn't attach it.
+    "agent_display_name",
+    "memory_type",
+    "content",
+    "embedding",
+    "weight",
+    "source_uri",
+    "run_id",
+    "metadata_",
+    "created_at",
+    "title",
+    "content_hash",
+    # Which content the row's vector was computed from (migration 037).
+    # Exposed so a single row's provenance can be inspected — without it the
+    # only view is the aggregate coverage counters, which tell an operator that
+    # N rows are stale but never which, or why a specific row was classified.
+    "embedded_content_hash",
+    "client_request_id",
+    "expires_at",
+    "deleted_at",
+    "search_vector",
+    "subject_entity_id",
+    "predicate",
+    "object_value",
+    "ts_valid_start",
+    "ts_valid_end",
+    "status",
+    "visibility",
+    "recall_count",
+    "last_recalled_at",
+    "last_dedup_checked_at",
+    "supersedes_id",
+    # Unified contradiction model (A55) — system-populated (never agent-supplied);
+    # surfaced on read so recall/get/list expose the classification signals.
+    "confidence",
+    "is_inferred",
+    "scope",
+]
+
+# Same as MEMORY_FIELDS minus the two large columns (the 1024-dim ``embedding``
+# vector + the ``search_vector`` tsvector). Use for multi-row endpoints whose
+# core-api consumers don't read the vector (scored-search, admin list,
+# contradiction rows): serialising the full vector ships ~20 KB of JSON floats
+# per row over the internal network only for the consumer to discard it.
+# ``has_embedding`` (a projected boolean, where a route provides it) is the
+# presence signal; the vector itself is fetched by id when actually needed.
+MEMORY_LIST_FIELDS: list[str] = [f for f in MEMORY_FIELDS if f not in ("embedding", "search_vector")]
+
+ENTITY_FIELDS: list[str] = [
+    "id",
+    "tenant_id",
+    "fleet_id",
+    "canonical_name",
+    "entity_type",
+    "attributes",
+]
+
+RELATION_FIELDS: list[str] = [
+    "id",
+    "tenant_id",
+    "fleet_id",
+    "from_entity_id",
+    "to_entity_id",
+    "relation_type",
+    "weight",
+    "evidence_memory_id",
+]
+
+AGENT_FIELDS: list[str] = [
+    "id",
+    "tenant_id",
+    "fleet_id",
+    "agent_id",
+    "display_name",
+    "install_id",
+    "owner_install_uuid",
+    "trust_level",
+    "search_profile",
+    "belonging_type",
+    "owner_ref",
+    "created_at",
+    "updated_at",
+]
+
+DOCUMENT_FIELDS: list[str] = [
+    "id",
+    "tenant_id",
+    "fleet_id",
+    "collection",
+    "doc_id",
+    "data",
+    # ax-0917-m-14 — author attribution. Present but NULL on every row
+    # written before the column existed.
+    "agent_id",
+    "created_at",
+    "updated_at",
+]
+
+# A keystone version as the versions routes summarise it (migration 061). Not
+# the snapshot: a version is read as the rules it gives an agent.
+KEYSTONE_VERSION_FIELDS: list[str] = [
+    "version",
+    "op",
+    "doc_id",
+    "actor_agent_id",
+    "actor_user_id",
+    "created_at",
+]
+
+IDEMPOTENCY_RESPONSE_FIELDS: list[str] = [
+    "tenant_id",
+    "idempotency_key",
+    "request_hash",
+    "response_body",
+    "status_code",
+    "created_at",
+    "expires_at",
+    "is_pending",
+]
+
+FLEET_NODE_FIELDS: list[str] = [
+    "id",
+    "tenant_id",
+    "fleet_id",
+    "node_name",
+    "hostname",
+    "ip",
+    "openclaw_version",
+    "plugin_version",
+    "plugin_hash",
+    "os_info",
+    "agents_json",
+    "tools_json",
+    "channels_json",
+    "extra",
+    "owner_principal",
+    "last_heartbeat",
+    "created_at",
+]
+
+FLEET_COMMAND_FIELDS: list[str] = [
+    "id",
+    "tenant_id",
+    "node_id",
+    "command",
+    "payload",
+    "status",
+    "result",
+    "created_at",
+    "acked_at",
+    "completed_at",
+]
+
+MEMORY_ENTITY_LINK_FIELDS: list[str] = [
+    "memory_id",
+    "entity_id",
+    "role",
+]
+
+AUDIT_LOG_FIELDS: list[str] = [
+    "id",
+    "tenant_id",
+    "fleet_id",
+    "agent_id",
+    "action",
+    "resource_type",
+    "resource_id",
+    "detail",
+    "created_at",
+    # Chain seq surfaces in list responses (JSON-safe int); the raw
+    # ``prev_hash``/``event_hash`` bytes are intentionally NOT listed
+    # here — the /verify endpoint hex-encodes them in its own response.
+    "seq",
+]
+
+REPORT_FIELDS: list[str] = [
+    "id",
+    "tenant_id",
+    "fleet_id",
+    "trigger",
+    "status",
+    "started_at",
+    "completed_at",
+    "duration_ms",
+    "summary",
+    "hygiene",
+    "health",
+    "usage_data",
+    "issues",
+    "crystallization",
+]
+
+BACKGROUND_TASK_FIELDS: list[str] = [
+    "id",
+    "tenant_id",
+    "task_type",
+    "error_message",
+    "created_at",
+]
+
+AGENT_DIGEST_FIELDS: list[str] = [
+    "id",
+    "run_id",
+    "tenant_id",
+    "fleet_id",
+    "agent_id",
+    "period",
+    "window_start",
+    "window_end",
+    "narrative",
+    "sections",
+    "subagents",
+    "source_count",
+    "recall_count",
+    "model",
+    "status",
+    "error_detail",
+    "generated_at",
+]

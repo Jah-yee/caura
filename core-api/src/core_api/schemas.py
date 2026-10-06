@@ -1,0 +1,1355 @@
+from datetime import datetime
+from typing import Any, Literal
+from uuid import UUID
+
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, create_model, model_validator
+
+from common.constants import AGENT_TUNABLE_KEYS, SEARCH_KNOBS
+from core_api.constants import (
+    BULK_MAX_ITEMS,
+    CALLER_METADATA_DESCRIPTION,
+    DEFAULT_MEMORY_TYPE,
+    DEFAULT_SEARCH_TOP_K,
+    EXPIRES_AT_DESCRIPTION,
+    MAX_CONTENT_LENGTH,
+    MAX_QUERY_LENGTH,
+    MAX_SEARCH_TOP_K,
+    MAX_TRUST_LEVEL,
+    MEMORY_STATUSES_PATTERN,
+    MEMORY_TYPES_FILTER_DESCRIPTION,
+    MEMORY_TYPES_WRITE_DESCRIPTION,
+    MEMORY_VISIBILITIES_PATTERN,
+    MIN_TRUST_LEVEL,
+    MemoryType,
+)
+
+# --- Request-body strictness (SAFE-01) ---
+#
+# WRITE request bodies reject unknown fields; SEARCH / FILTER / QUERY request
+# bodies keep accepting them. That asymmetry is deliberate and is the whole
+# point of this constant existing instead of a bare ``extra="forbid"`` sprinkled
+# around — a future "tidy-up" that makes the two sides match would reintroduce
+# one of the two bugs below, so each side is pinned by its own test
+# (``tests/test_unknown_field_rejection.py``).
+#
+# WHY WRITES ARE STRICT. Pydantic's default is ``extra="ignore"``: a field the
+# model does not declare is dropped without a word. On a write that means a
+# misspelled key ("contnet", "memory_typ", "meta_data") returns 201 Created with
+# the caller's data silently missing, and nothing in the response says so. Found
+# wet-testing register/write (SAFE-01). ``extra="forbid"`` turns that into a 422
+# naming the offending field — see ``app.validation_exception_handler``, which
+# lifts ``extra_forbidden`` errors into the canonical envelope's message and a
+# ``details.unknown_fields`` list.
+#
+# WHY SEARCH IS NOT. A filter that arrives misspelled returns *more* rows, not
+# corrupted ones — the caller sees the wrong answer, not a wrong write. And the
+# C1+C2 incident (see ``SearchRequest`` below) left the search surface carrying
+# historical spellings that are absorbed by ``AliasChoices``; the permissiveness
+# there is a compatibility promise to existing integrators, not an oversight.
+# Product decision, not a detail to optimise.
+#
+# Declared aliases are NOT extra fields, so ``forbid`` never breaks an
+# ``AliasChoices`` spelling. No model in the strict set below declares one
+# today; the alias-safety test pins that the search aliases still work.
+STRICT_WRITE_BODY = ConfigDict(extra="forbid")
+
+# C6 — fields the SERVER owns on a memory row. A caller may never supply these
+# on a write body; ``MemoryCreate._refuse_server_owned_fields`` turns them into
+# an explanatory 422 instead of the generic unknown-field one. Deliberately a
+# short explicit list rather than a pattern: everything not named here keeps the
+# ordinary ``extra="forbid"`` behaviour, so a typo is still just a typo.
+SERVER_OWNED_MEMORY_FIELDS = ("supersedes_id",)
+
+
+# --- tenant_id defaulting (ax-0917-m-12) ---
+
+
+class TenantScopedBody(BaseModel):
+    """Request body whose ``tenant_id`` falls back to the caller's credential.
+
+    ``tenant_id`` was required in every request body even though the
+    credential already resolves one, so the first call any agent could make
+    was never the one it came for: it had to ``GET /whoami``, read the tenant
+    back, and echo it into the body. Both independent probes of this API
+    (Hermes and Codex, 2026-09-17) paid that round-trip before they could
+    write or recall anything, and an agent that skips it gets a 422 naming a
+    field whose value it was never given — a dead end unless it already knows
+    the fix.
+
+    The credential is the authority on which tenant a caller belongs to, so
+    it is also the sensible default. An explicit ``tenant_id`` still wins:
+    a cross-tenant read names its source tenant, and the ``enforce_tenant`` /
+    ``enforce_readable_tenant`` gates in the routes are untouched and run
+    against whichever value resolved. Defaulting therefore grants no access
+    that naming the same tenant would not.
+
+    **Why a validator and not ``str | None``.** Making the field optional at
+    the type level is the obvious move and it is the wrong one here:
+    ``body.tenant_id`` flows from these bodies deep into services typed
+    ``str`` — 77 new mypy errors across governance, entity, contradiction and
+    memory services on the attempt. The value is never actually absent by the
+    time a route runs, so widening the type to describe a state that cannot
+    be observed costs a large edit everywhere and buys nothing.
+
+    **Why the contextvar is populated here.** FastAPI solves dependencies
+    before it validates the body, so ``get_auth_context`` — and its
+    ``set_current_tenant`` call — has already run by the time this validator
+    executes. ``tests/test_ax_m12_tenant_from_credential.py`` pins that
+    ordering, because it is a framework behaviour this depends on and not one
+    we control.
+    """
+
+    # Empty string, not ``None``: the field stays ``str`` for every consumer
+    # downstream. The validator below rejects a body that still has no tenant
+    # after defaulting, so the empty default is never observable from a route.
+    #
+    # The description carries its weight in the published contract, where the
+    # schema can only say ``"default": ""`` — which is true of the field and
+    # false about the behaviour. A reader needs to be told that omitting it
+    # resolves the caller's own tenant, or the contract reads as "send an
+    # empty string".
+    tenant_id: str = Field(
+        default="",
+        description=(
+            "Tenant to operate on. Omit it and the tenant is resolved from the "
+            "credential, which is what a tenant- or agent-scoped key already "
+            "identifies — no prior /whoami call is needed. Supply it to act on "
+            "a different tenant your credential may read (and for an admin key, "
+            "which belongs to no single tenant, it is required)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _default_tenant_from_credential(self):
+        if self.tenant_id:
+            return self
+        from core_api.tenant_context import get_current_tenant
+
+        resolved = get_current_tenant()
+        if not resolved:
+            # The admin-key case: ``AuthContext.tenant_id`` is None by design
+            # (admin bypasses RLS), so an admin caller genuinely has to say
+            # which tenant it means. Say that, rather than "field required".
+            raise ValueError(
+                "tenant_id is required for this credential. A tenant-scoped or "
+                "agent-scoped key supplies it automatically; an admin key does "
+                "not belong to one tenant, so name it in the request body."
+            )
+        object.__setattr__(self, "tenant_id", resolved)
+        return self
+
+
+# --- Memory ---
+
+
+class EntityLinkIn(BaseModel):
+    model_config = STRICT_WRITE_BODY
+
+    entity_id: UUID
+    role: str
+
+
+class MemoryCreate(TenantScopedBody):
+    model_config = STRICT_WRITE_BODY
+
+    fleet_id: str | None = None
+    # Optional like ``BulkMemoryCreate.agent_id``, and the route decides who may
+    # omit it: an AGENT-scoped credential supplies its own verified identity
+    # (ax-0917-m-16), and the standalone single-tenant path fills the reserved
+    # ``"mcp-agent"`` identity. A credential that authenticates no agent — a
+    # tenant key, the gateway's tenant path — must still pass an explicit
+    # agent_id (enforced in the route) so writes are never silently attributed
+    # to one shared identity. min_length=1 rejects an empty string at the schema
+    # layer (None still means "unset").
+    agent_id: str | None = Field(default=None, min_length=1)
+    memory_type: MemoryType | None = Field(default=None, description=MEMORY_TYPES_WRITE_DESCRIPTION)
+    content: str = Field(min_length=1, max_length=MAX_CONTENT_LENGTH)
+    weight: float | None = Field(default=None, ge=0.0, le=1.0)
+    source_uri: str | None = None
+    run_id: str | None = None
+    metadata: dict | None = Field(default=None, description=CALLER_METADATA_DESCRIPTION)
+    entity_links: list[EntityLinkIn] = []
+    expires_at: datetime | None = Field(default=None, description=EXPIRES_AT_DESCRIPTION)
+    # RDF triple
+    subject_entity_id: UUID | None = None
+    predicate: str | None = None
+    object_value: str | None = None
+    # Temporal validity
+    ts_valid_start: datetime | None = None
+    ts_valid_end: datetime | None = None
+    # Reference datetime for LLM enrichment (resolves relative dates like "last week")
+    reference_datetime: datetime | None = None
+    # Status lifecycle
+    status: str | None = Field(default=None, pattern=MEMORY_STATUSES_PATTERN)
+    # Visibility scope
+    visibility: str | None = Field(default=None, pattern=MEMORY_VISIBILITIES_PATTERN)
+    # Extract-only mode: run enrichment + embedding but skip DB insert
+    persist: bool = True
+    write_mode: Literal["fast", "strong", "auto", "stm"] | None = Field(
+        default=None,
+        description=(
+            "Write-mode dial. 'fast' = embed-only, LLM enrichment deferred to the "
+            "background; 'strong' = full pipeline inline; 'auto' = the system picks. "
+            "'strong' also embeds inline regardless of the deployment's embedding "
+            "mode, which makes it the supported opt-out when a caller must search "
+            "for what it just wrote — see `MemoryOut.metadata.embedding_pending`. "
+            "It costs the embedding provider call on the request path, which is "
+            "exactly what fast mode's sub-2s p99 visibility SLA exists to avoid, so "
+            "it is a per-write choice rather than a default to flip."
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_server_owned_fields(cls, data):
+        """C6 — refuse ``supersedes_id`` on create, and say why.
+
+        Supersession is established by the SERVER, never by the caller: the
+        contradiction detector decides that a new memory retires an older one
+        and writes the pointer through ``update_memory_status``, which is
+        CAS-guarded against NULL so two concurrent detections cannot both claim
+        the same predecessor. There is deliberately no public route that sets
+        ``supersedes_id`` directly.
+
+        Accepting it here would hand a caller a pointer at an arbitrary
+        predecessor with no check that the row exists, shares the tenant, or is
+        not already superseded — and would bypass the CAS entirely. So the
+        answer to C6's "intentional or oversight?" is *intentional*.
+
+        ``extra="forbid"`` already rejected this, but with pydantic's generic
+        "Extra inputs are not permitted", which cannot tell a caller whether the
+        field is misspelled, unsupported, or deliberately refused. This runs
+        BEFORE that check (mode="before" sees the raw payload) purely to replace
+        the message. Every other unknown field still falls through to the
+        existing unknown-field 422 — the denylist is named, not a category, so a
+        genuine typo keeps its old behaviour.
+        """
+        if isinstance(data, dict):
+            present = [f for f in SERVER_OWNED_MEMORY_FIELDS if f in data]
+            if present:
+                raise ValueError(
+                    f"{', '.join(present)} is set by the server, not by the caller, and cannot be "
+                    "supplied on create. Supersession is established by contradiction detection: "
+                    "write the corrected fact as an ordinary memory and the detector links it to "
+                    "the row it supersedes."
+                )
+        return data
+
+
+class BulkMemoryItem(BaseModel):
+    """Single item in a bulk write request. tenant_id/fleet_id/agent_id inherited from parent."""
+
+    # Additive-tolerance policy (broker↔cloud API-versioning RFC): a bulk write
+    # must NOT 422 the whole batch because one item has a bad field — the valid
+    # items must still be written. So schema-level constraints that would reject
+    # the ENTIRE request are deliberately dropped here (unlike single-write
+    # ``MemoryCreate`` / ``MemoryUpdate``, which keep them) and re-enforced PER
+    # ITEM in ``create_memories_bulk``, aggregated into one ``status="error"``
+    # 207 row per item:
+    #   - memory_type ∉ MEMORY_TYPES → memory_type_errors. The field is ``str``
+    #     here (not the typed ``MemoryType`` enum used on single-write), so an
+    #     unknown type is a per-item error, not a whole-batch 422.
+    #   - content length → short_content_errors
+    #     (``< CRYSTALLIZER_SHORT_CONTENT_CHARS`` = 10, subsumes the old
+    #     ``min_length=1``) + oversized_content_errors (``> MAX_CONTENT_LENGTH``).
+    #   - weight range [0.0, 1.0] → weight_errors.
+    #   - status enum → status_errors.
+    #   - unknown field names → unknown_field_errors (SAFE-01).
+    #
+    # SAFE-01 note. This model is the one write body that is NOT
+    # ``extra="forbid"``, and the reason is the policy above, not an oversight:
+    # ``forbid`` raises during parsing of the whole ``BulkMemoryCreate``, so one
+    # item with a typo'd key would 422 the entire batch and discard its valid
+    # siblings — exactly what this model exists to prevent. ``extra="allow"``
+    # instead of the pydantic default ``extra="ignore"`` so the unknown keys
+    # survive parsing into ``model_extra``; ``create_memories_bulk`` reads them
+    # there and emits one ``status="error"`` row per offending item. Same
+    # outcome as ``forbid`` — the caller is told, by name, which field was not
+    # understood — delivered per item instead of per batch.
+    model_config = ConfigDict(extra="allow")
+
+    memory_type: str | None = Field(default=None, description=MEMORY_TYPES_WRITE_DESCRIPTION)
+    content: str
+    weight: float | None = Field(default=None)
+    source_uri: str | None = None
+    run_id: str | None = None
+    metadata: dict | None = None
+    entity_links: list[EntityLinkIn] = []
+    expires_at: datetime | None = Field(default=None, description=EXPIRES_AT_DESCRIPTION)
+    subject_entity_id: UUID | None = None
+    predicate: str | None = None
+    object_value: str | None = None
+    ts_valid_start: datetime | None = None
+    ts_valid_end: datetime | None = None
+    reference_datetime: datetime | None = None
+    status: str | None = Field(default=None)  # validated per-item (status_errors); see note above
+    # Per ITEM, not per batch, deliberately: callers that funnel through the bulk
+    # endpoint may coalesce writes from unrelated sources into one request (the
+    # broker's durable queue does exactly this), so one item asking for 'strong'
+    # must not force inline embedding on everything batched alongside it.
+    #
+    # Untyped ``str`` rather than a Literal, per this model's additive-tolerance
+    # policy above: a Literal would 422 the WHOLE batch over one item's unknown
+    # value (e.g. 'stm' copied from a single-write payload). Only 'strong' has an
+    # effect; every other value, known or not, behaves as 'fast'.
+    write_mode: str | None = Field(
+        default=None,
+        description=(
+            "Per-item write mode. 'strong' embeds this item inline, so it is "
+            "searchable as soon as the write is persisted rather than after the "
+            "background backfill — at the cost of an embedding provider call on "
+            "the request path. Any other value behaves as 'fast': the item follows "
+            "the deployment's embedding mode. On a deployment that already embeds "
+            "inline this has no effect, since every item is embedded inline anyway. "
+            "Narrower than MemoryCreate.write_mode: on the bulk path 'strong' "
+            "affects only the embedding — LLM enrichment defers either way — and "
+            "the tenant's default_write_mode is not consulted, so only an explicit "
+            "per-item opt-in embeds inline."
+        ),
+    )
+
+
+class BulkMemoryCreate(TenantScopedBody):
+    # Strict at the ENVELOPE level only: a typo among the five keys below is a
+    # whole-request mistake, so 422-ing the request is the right answer. Per-item
+    # unknown keys are handled inside ``BulkMemoryItem`` (see its note).
+    model_config = STRICT_WRITE_BODY
+
+    fleet_id: str | None = None
+    # Optional on the wire so caura-daemon broker calls (cloud-data-plane.md
+    # §2.4) can omit it — the route handler defaults to
+    # ``broker:<install_uuid>`` when the caller authenticates with an
+    # install credential, and an agent-scoped credential likewise supplies its
+    # own verified identity (ax-0917-m-16). A caller whose credential
+    # authenticates no agent (dashboard / SDK tenant keys) still must populate
+    # it; both relaxation branches key off the credential, not the body.
+    agent_id: str | None = None
+    items: list[BulkMemoryItem] = Field(min_length=1, max_length=BULK_MAX_ITEMS)
+    visibility: str | None = Field(default=None, pattern=MEMORY_VISIBILITIES_PATTERN)
+
+
+class BulkItemResult(BaseModel):
+    """Per-item outcome of a bulk write (CAURA-602).
+
+    Status semantics:
+
+    - ``"created"``: this attempt newly inserted the row; ``id`` is the
+      new row's id.
+    - ``"duplicate_attempt"``: same ``X-Bulk-Attempt-Id``+index already
+      committed in a prior call. ``id`` is the canonical row from that
+      first attempt. Returned when a retry hits the per-item unique
+      constraint — what eliminates the silent-create class.
+    - ``"duplicate_content"``: a different attempt's row with the same
+      ``content_hash`` already exists. ``id`` and ``duplicate_of`` both
+      point at the existing row; emitted in place of an insert.
+    - ``"error"``: the row could not be processed (validation,
+      enrichment timeout, missing storage id). ``error`` describes.
+
+    The legacy ``"duplicate"`` status is gone — callers must read
+    ``duplicate_attempt`` vs ``duplicate_content`` because they imply
+    different client-side actions (an idempotent retry succeeded vs
+    "you already wrote this content earlier").
+    """
+
+    index: int
+    client_request_id: str | None = None
+    status: Literal["created", "duplicate_attempt", "duplicate_content", "error"]
+    id: UUID | None = None
+    duplicate_of: UUID | None = None
+    error: str | None = None
+
+
+class BulkMemoryResponse(BaseModel):
+    """Aggregate response from the bulk-write endpoint.
+
+    ``duplicates`` rolls up both ``duplicate_attempt`` and
+    ``duplicate_content`` for top-level metric continuity; per-item
+    detail lives in ``results``. The route returns 200 when everything
+    succeeded and 207 Multi-Status when at least one item is in error —
+    callers must read per-item ``status`` and never infer success from
+    a 2xx alone.
+    """
+
+    created: int
+    duplicates: int
+    errors: int
+    results: list[BulkItemResult]
+    bulk_ms: int
+
+
+class RedistributeRequest(BaseModel):
+    model_config = STRICT_WRITE_BODY
+
+    memory_ids: list[UUID] = Field(..., min_length=1, max_length=500)
+    target_agent_id: str = Field(..., min_length=1, max_length=256)
+
+
+class RedistributeResponse(BaseModel):
+    moved: int
+    promoted: int  # scope_agent → scope_team auto-promotions
+    skipped: int  # already owned by target
+    errors: list[str]
+    redistribute_ms: int
+
+
+class MemoryUpdate(BaseModel):
+    model_config = STRICT_WRITE_BODY
+
+    content: str | None = Field(default=None, min_length=1, max_length=MAX_CONTENT_LENGTH)
+    memory_type: MemoryType | None = Field(default=None, description=MEMORY_TYPES_WRITE_DESCRIPTION)
+    weight: float | None = Field(default=None, ge=0.0, le=1.0)
+    title: str | None = None
+    status: str | None = Field(default=None, pattern=MEMORY_STATUSES_PATTERN)
+    visibility: str | None = Field(default=None, pattern=MEMORY_VISIBILITIES_PATTERN)
+    metadata: dict | None = Field(default=None, description=CALLER_METADATA_DESCRIPTION)
+    metadata_mode: str | None = Field(
+        default=None,
+        pattern="^(merge|replace)$",
+        description=(
+            "How to apply ``metadata``: ``merge`` (default when omitted "
+            "or ``null``) does a top-level JSONB ``||`` merge, preserving "
+            "keys not present in the patch; ``replace`` overwrites the "
+            "column wholesale."
+        ),
+    )
+    source_uri: str | None = None
+    subject_entity_id: UUID | None = None
+    predicate: str | None = None
+    object_value: str | None = None
+    ts_valid_start: datetime | None = None
+    ts_valid_end: datetime | None = None
+    expires_at: datetime | None = Field(default=None, description=EXPIRES_AT_DESCRIPTION)
+    entity_links: list[EntityLinkIn] | None = Field(
+        default=None,
+        description=(
+            "Entity links to **add** to this memory. Additive, unlike "
+            "``metadata``: links already on the memory are kept even when this "
+            "list does not name them, and re-sending a pair already present "
+            "leaves its existing ``role`` unchanged rather than overwriting it. "
+            "There is no replace mode and no way to remove a link through this "
+            "endpoint. An ``entity_id`` outside the caller's tenant is rejected "
+            "with 422."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def metadata_mode_requires_metadata(self) -> "MemoryUpdate":
+        """Reject ``{"metadata_mode": "<merge|replace>"}`` (a real
+        value, not None) without a matching ``metadata`` field.
+        Pre-fix, sending only the mode flag was a silent 200 no-op
+        (the request bypassed the "no fields to update" guard
+        because ``metadata_mode`` is set, but produced no patch and
+        no changes). Surface as 422 so the client knows the intent
+        didn't land — and pair-fix prevents the phantom audit-record
+        path entirely.
+
+        The ``is not None`` guard matters for SDK clients that
+        serialise the full schema with ``exclude_none=True``: the
+        explicit-default-None lets them drop the field silently
+        rather than always sending ``"merge"`` and tripping the
+        validator on every non-metadata PATCH.
+        """
+        if (
+            "metadata_mode" in self.model_fields_set
+            and self.metadata_mode is not None
+            and "metadata" not in self.model_fields_set
+        ):
+            raise ValueError("metadata_mode is only valid when metadata is also provided")
+        return self
+
+
+class EntityLinkOut(BaseModel):
+    entity_id: UUID
+    role: str
+
+
+class UsageSummary(BaseModel):
+    memories_stored: int | None = None
+    memories_limit: int | None = None
+    writes_remaining: int | None = None
+
+
+class ScoreParts(BaseModel):
+    """D12 — per-factor breakdown of the ranking composite ``MemoryOut.score``.
+
+    Every factor mirrors a column the scored-search SQL already computes and
+    returns per row; this model only surfaces them. All fields are nullable:
+    FTS-only rows have no ``vec_sim``, entity-lookup short-circuit rows have no
+    FTS rank, and successor-injected rows were never scored at all.
+    """
+
+    vec_sim: float | None = None
+    fts_score: float | None = None
+    freshness: float | None = None
+    entity_boost: float | None = None
+    recall_boost: float | None = None
+    temporal_boost: float | None = None
+    status_penalty: float | None = None
+
+
+class MemoryOut(BaseModel):
+    id: UUID
+    tenant_id: str
+    fleet_id: str | None = None
+    agent_id: str
+    # Human-readable agent label (agents.display_name), NULL-safe: null when the
+    # agent has no agents row yet (e.g. broker:<install> ids) — clients fall back
+    # to agent_id. Populated via a LEFT JOIN in the storage query methods, not
+    # stored on the memory row.
+    agent_display_name: str | None = None
+    memory_type: str
+    title: str | None = None
+    content: str
+    weight: float
+    source_uri: str | None
+    run_id: str | None
+    # Two flags here tell a caller the write is not fully settled yet:
+    #
+    #   embedding_pending: true   — the row was stored without an embedding and a
+    #     background backfill is scheduled. Until it lands the memory is reachable
+    #     by keyword (FTS) and by the non-semantic `GET /memories` list, but it
+    #     does not compete on semantic similarity, so a `search` for a paraphrase
+    #     of it can come back empty. Observed time-to-searchable: ~15-20s on
+    #     production, and over 10 minutes on staging, whose backfill is slower —
+    #     so do not treat it as "a moment".
+    #   enrichment_pending: true  — title/memory_type/weight/status/ts_valid_* are
+    #     still the caller-supplied or default values; the LLM pass will PATCH them.
+    #
+    # Absent (or false) means that stage ran inline. On the single-write path
+    # `write_mode="strong"` embeds and enriches inline, so neither flag appears —
+    # that is the supported read-your-own-write opt-out, at the cost of the
+    # provider calls on the request path. A deployment running embedding inline
+    # (OSS local default) never sets embedding_pending, even in fast mode.
+    #
+    # `BulkMemoryItem.write_mode` is narrower: there 'strong' governs the
+    # embedding only and enrichment defers either way. ax-0917-h-06: the bulk
+    # path now DOES set `embedding_pending` on items written without a vector,
+    # so a bulk caller can read pendingness off its own write response.
+    # lme-0929-m-03: it now also sets `enrichment_pending` when the deployment
+    # defers enrichment (the case it publishes ENRICH_REQUESTED for), so the
+    # store-level `GET /memories/stats` `pending.enrichment` count can see bulk
+    # rows; an inline-enriching deployment enriches bulk items inline and sets
+    # neither.
+    metadata: dict | None
+    # C25 — platform-written telemetry/enrichment (llm_ms, write_latency_ms,
+    # semantic_dedup_ms, summary, tags, pii flags, write-mode flags …) exposed
+    # under their own namespace. For one release the same keys ALSO remain in
+    # ``metadata`` (dual-emit) — reading them from ``metadata`` is deprecated.
+    # Derived for historical rows too; None when nothing platform-written
+    # exists. A caller's own ``metadata.summary`` / ``metadata.tags`` are no
+    # longer overwritten by enrichment (the platform's copy lives here).
+    system_metadata: dict | None = None
+    created_at: datetime
+    expires_at: datetime | None
+    entity_links: list[EntityLinkOut] = []
+    similarity: float | None = None
+    # D12 — the multiplicative ranking composite (similarity * freshness *
+    # entity/recall/temporal boosts * status_penalty) that actually ordered
+    # this row, plus its factors. ``similarity`` above stays the raw 0..1
+    # cosine (the ``min_similarity``-comparable value); ``score`` routinely
+    # exceeds 1.0 and is for explaining rank, not for threshold gating.
+    # Populated only on scored-search hits; None on list/get reads and on
+    # successor-injected rows, which were never scored.
+    score: float | None = None
+    score_parts: ScoreParts | None = None
+    # D16 — true when the row was not matched by the query but injected as the
+    # newest successor of a returned outdated/conflicted row (hence its
+    # ``score``/``similarity`` are null — never scored). Injected rows arrive
+    # BEYOND the caller's ``top_k`` budget, at most one per stale row, ranked
+    # immediately above the row they supersede (A34). A successor the query
+    # recalled on its own merit is NOT marked — this flag says "you would not
+    # have gotten this row from ranking alone", not "this row supersedes
+    # something" (``supersedes_id`` already says that). Always false outside
+    # search responses.
+    injected: bool = False
+    # RDF triple
+    subject_entity_id: UUID | None = None
+    predicate: str | None = None
+    object_value: str | None = None
+    # Temporal validity
+    ts_valid_start: datetime | None = None
+    ts_valid_end: datetime | None = None
+    # Status lifecycle
+    status: str = "active"
+    # Visibility scope
+    visibility: str = "scope_team"
+    # Recall tracking
+    recall_count: int = 0
+    last_recalled_at: datetime | None = None
+    # Contradiction tracking
+    supersedes_id: UUID | None = None
+    superseded_by: list["ContradictionInfo"] | None = None
+    # Unified contradiction model (A55) — system-populated, read-only on the API.
+    # confidence: confidence in this memory's claim (None = unknown/legacy).
+    # is_inferred: True when the system materialised this memory by inference.
+    # scope: structured validity qualifiers (role/task/location).
+    confidence: float | None = None
+    is_inferred: bool = False
+    scope: dict | None = None
+    # Usage info (populated on write responses)
+    usage: UsageSummary | None = None
+
+    model_config = {"from_attributes": True}
+
+
+# Kept to ONE line, because a model docstring becomes the schema's public
+# ``description`` in ``openapi.broker.json`` — maintainer rationale belongs here, in a
+# comment, not in the frozen contract. Three things about this model are load-bearing:
+#
+# FIELD ORDER IS THE CONTRACT. FastAPI serialises in model-field order, not dict
+# order, and this endpoint has always emitted these 29 keys in this order. Reordering
+# them changes the response bytes for every caller;
+# ``tests/test_memory_get_serialization_contract.py`` pins it.
+#
+# THE TIMESTAMPS ARE ``str``, NOT ``datetime``, ON PURPOSE. They arrive as ISO strings
+# — the route reads them out of core-storage-api's JSON and passes them through — and
+# ``datetime`` would not merely annotate, it re-serialises: pydantic v2 renders
+# ``2026-08-13T18:52:48.040997+00:00`` as ``...040997Z``. Measured, not assumed. That
+# is a wire change on a live endpoint, not a side effect to take on while adding a
+# schema. The fleet is already inconsistent here: ``MemoryOut`` (the POST/PATCH model)
+# types them as ``datetime`` and emits the ``Z`` form for the same row. Aligning the
+# two is an API decision with its own migration story; ``str`` documents what ships.
+#
+# NULLABILITY MIRRORS THE TABLE, plus the two computed fields that are ``None`` for an
+# un-embedded row. A field marked required here that is NULL in practice turns a 200
+# into a 500 via ``ResponseValidationError``, so this errs toward optional wherever the
+# column is nullable.
+class MemoryDetailResponse(BaseModel):
+    """Full detail for one memory: row fields, entity links, embedding stats."""
+
+    id: str
+    tenant_id: str
+    fleet_id: str | None = None
+    agent_id: str
+    agent_display_name: str | None = None
+    memory_type: str
+    title: str | None = None
+    content: str
+    weight: float | None = None
+    source_uri: str | None = None
+    run_id: str | None = None
+    # Exposed as ``metadata``; storage serialises the JSONB column as ``metadata_``
+    # and the route renames it on the way out.
+    metadata: dict | None = None
+    # C25 — platform-written view; same contract as ``MemoryOut.system_metadata``.
+    system_metadata: dict | None = None
+    content_hash: str | None = None
+    created_at: str | None = None
+    expires_at: str | None = None
+    deleted_at: str | None = None
+    subject_entity_id: str | None = None
+    predicate: str | None = None
+    object_value: str | None = None
+    ts_valid_start: str | None = None
+    ts_valid_end: str | None = None
+    status: str
+    visibility: str
+    recall_count: int
+    last_recalled_at: str | None = None
+    supersedes_id: str | None = None
+    entity_links: list[dict] = []
+    # Both None unless the row has a non-empty embedding: the raw pgvector never
+    # crosses the wire, only a first-20 preview and the server-computed stats.
+    embedding_preview: list[float] | None = None
+    embedding_stats: dict | None = None
+
+
+class ContradictionInfo(BaseModel):
+    """Summary of a contradiction detected on write.
+
+    ``old_memory_id`` always refers to the **pre-existing candidate**
+    (never to ``new_memory``), regardless of which row ended up being
+    the older one in the supersession chain. The ``direction`` field
+    disambiguates the two cases:
+
+      - ``"canonical"`` — the candidate is older than ``new_memory``;
+        the candidate became outdated/conflicted, ``new_memory``
+        carries ``supersedes_id`` pointing at it. (Historical behaviour.)
+      - ``"flipped"`` — the candidate is newer than ``new_memory``;
+        ``new_memory`` is the row that became outdated/conflicted, and
+        the candidate now carries ``supersedes_id`` pointing back at
+        ``new_memory``. This branch was previously unreachable
+        (CAURA-125; gap A6) and is now exercised by deferred-embedding
+        races and ``created_at`` ties.
+    """
+
+    old_memory_id: UUID
+    old_status: str
+    reason: str  # "rdf_conflict" or "semantic_conflict"
+    old_content_preview: str
+    # CAURA-125 — defaults to "canonical" so any existing caller that
+    # constructs ``ContradictionInfo`` without supplying ``direction``
+    # keeps producing the same shape it did before this PR.
+    direction: Literal["canonical", "flipped"] = "canonical"
+
+
+# --- Search ---
+
+
+class PaginatedMemoryResponse(BaseModel):
+    items: list[MemoryOut]
+    next_cursor: str | None = None
+
+
+class SearchDiagnostic(BaseModel):
+    """D12 — retrieval trace returned when ``SearchRequest.diagnostic`` is true.
+
+    Answers "why did each result appear (and what got cut)": the full widened
+    candidate set with per-row score factors and exclusion reasons, the applied
+    knobs, and the strategy the classifier picked. Requesting it does NOT change
+    the ``items`` a caller gets back, and a diagnostic call never bumps
+    ``recall_count`` — it is inspection, not use.
+    """
+
+    retrieval_strategy: str | None = None
+    top_k_requested: int | None = None
+    min_similarity_applied: float | None = None
+    candidates_considered: int = 0
+    returned: int = 0
+    excluded_below_min_similarity: int = 0
+    excluded_by_top_k_trim: int = 0
+    # The resolved knob set the scoring SQL ran with (profile → tenant → constant,
+    # after any per-request ``min_similarity`` override).
+    search_params: dict = {}
+    # One entry per widened candidate: id/title/type/status + score + factors +
+    # ``excluded`` (None | "below_min_similarity" | "trimmed_by_top_k").
+    #
+    #
+    # KNOWN GAP (CAURA-722, not fixed here): five of these factors —
+    # ``entity_boost``, ``freshness``, ``recall_boost``, ``temporal_boost``,
+    # ``fts_score`` — are ``None`` on every row of the scored-search path.
+    # Storage computes them in the scored CTE, uses them to build ``score``,
+    # and then omits them from the outer ``select()``, so the route never
+    # serializes them (``postgres_service.memory_scored_search``). Only
+    # ``score``, ``vec_sim``, ``fts_match`` and ``status_penalty`` are real
+    # today. Do not read a null factor as "this signal did not apply" — it
+    # applied to ``score`` and was simply not reported.
+    #
+    # This matters most for ``entity_boost``, because it is the ONLY place the
+    # entity *boost* is observable. ``retrieval_strategy`` reports only the
+    # ENTITY_LOOKUP *short-circuit*, which fires solely when the entity-linked
+    # pool fills ``top_k`` unaided — so a run that reads the strategy alone and
+    # concludes "entity retrieval contributed nothing" has measured the
+    # short-circuit, not the subsystem, and the field that would settle it is
+    # currently null.
+    all_candidates: list[dict] = []
+    # CAURA-722 — the two facts that separate the reasons entity retrieval
+    # stayed out of a query. Before these, ``retrieval_strategy`` said only
+    # that it was not ENTITY_LOOKUP, and the three causes below were
+    # indistinguishable from outside the server; they belong to different
+    # owners, so the ambiguity blocked the follow-up.
+    #
+    #   entity_matches | declined | meaning
+    #   ---------------|----------|----------------------------------------
+    #   None           |  false   | entity FTS never ran — retrieval disabled
+    #                  |          | by org setting, no entity-shaped tokens in
+    #                  |          | the query, or the lookup raised and was
+    #                  |          | swallowed
+    #   0              |  false   | FTS ran and matched nothing → extraction /
+    #                  |          | linking question
+    #   > MAX_MATCHES  |  TRUE    | over-broad, declined by CAURA-698 → the
+    #                  |          | entity boost is SUPPRESSED for this query,
+    #                  |          | so entity really did contribute nothing
+    #   1..MAX_MATCHES |  false   | matched; if the strategy is not
+    #                  |          | ENTITY_LOOKUP the pool under-filled top_k
+    #                  |          | and the boost WAS still applied
+    #
+    # The last two rows are the pair worth the field: they have opposite
+    # answers to "did the entity signal affect this result?" and looked
+    # identical before.
+    #
+    # ``None`` vs ``0`` is load-bearing — "never asked" against "asked, got
+    # nothing" — so this is deliberately nullable rather than defaulting to 0.
+    entity_matches: int | None = Field(
+        default=None,
+        description=(
+            "Entities the query's tokens matched in entity FTS, counted "
+            "before the over-broad decline empties the set. None means the "
+            "lookup never ran (entity retrieval off, no entity-shaped tokens, "
+            "or a swallowed failure) — distinct from 0, which means it ran and "
+            "matched nothing."
+        ),
+    )
+    entity_match_declined: bool = Field(
+        default=False,
+        description=(
+            "True when the entity match was refused as over-broad "
+            "(> ENTITY_LOOKUP_MAX_MATCHES). This is the only decline that also "
+            "suppresses the per-row entity boost; an under-filled pool falls "
+            "through with the boost still applied and reports False here."
+        ),
+    )
+
+
+class ConflictOut(BaseModel):
+    """D11 — a detected conflict plus its human-review state.
+
+    The detector's own fields (``relationship`` / ``diagnosis`` / ``action``)
+    and the reviewer's (``resolution_action`` / ``resolution_note``) are kept
+    side by side on purpose: comparing them IS the precision measurement, and
+    collapsing them into one field would destroy the only record of the
+    detector being wrong.
+    """
+
+    id: UUID
+    tenant_id: str
+    fleet_id: str | None = None
+    new_memory_id: UUID
+    old_memory_id: UUID
+    relationship: str
+    relationship_confidence: float | None = None
+    diagnosis: str | None = None
+    diagnosis_confidence: float | None = None
+    evidence_strength: str | None = None
+    action: str | None = Field(default=None, description="What the DETECTOR proposed.")
+    audit_reason: str | None = None
+    created_by: str | None = None
+    created_at: datetime | None = None
+    review_status: str = Field(description="pending | resolved | dismissed")
+    resolution_action: str | None = Field(
+        default=None, description="What the REVIEWER chose, from the same vocabulary as `action`."
+    )
+    resolution_note: str | None = None
+    resolved_by: str | None = None
+    resolved_at: datetime | None = None
+
+
+class ConflictListResponse(BaseModel):
+    """Envelope for the review queue — ``items`` per the ratified wire contract."""
+
+    items: list[ConflictOut]
+
+
+class ConflictResolveRequest(TenantScopedBody):
+    model_config = STRICT_WRITE_BODY
+
+    review_status: Literal["resolved", "dismissed"] = Field(
+        description=(
+            "Terminal state only. 'pending' is rejected: this endpoint records a "
+            "decision, and re-opening a reviewed conflict would erase the audit trail "
+            "of who decided what."
+        )
+    )
+    resolution_action: str | None = Field(
+        default=None,
+        description="Optional; the action the reviewer chose. Validated against the shared vocabulary.",
+    )
+    resolution_note: str | None = Field(default=None, max_length=2000)
+
+
+class SearchWarning(BaseModel):
+    """A28 — a coded, non-fatal caveat about the result set.
+
+    The search succeeded, but something the caller would reasonably assume
+    happened did not. Distinct from ``SearchDiagnostic``: that is opt-in
+    introspection, this is unsolicited and only present when there is something
+    to say.
+    """
+
+    code: str = Field(description="Stable slug, e.g. 'successor_enrichment_incomplete'.")
+    message: str = Field(description="Human-readable summary of what is incomplete.")
+    details: dict = Field(default_factory=dict, description="Machine-readable context.")
+
+
+class SearchResponse(BaseModel):
+    """Envelope for search results — matches PaginatedMemoryResponse shape."""
+
+    items: list[MemoryOut]
+    # Whether this search dispatched a ``recall_count`` bump for the rows it
+    # returned. False means the returned memories were NOT reinforced, and the
+    # three reasons are all invisible from the request alone: the caller
+    # presented no agent identity (a tenant-scoped key with no
+    # ``filter_agent_id`` — the counter is then pinned at 0 for that caller
+    # forever, and ``recall_boost`` never engages), the call set
+    # ``diagnostic=true``, or the search matched nothing. Before this field the
+    # first case was a permanent, silent behaviour that a client could only
+    # discover by watching a counter never move.
+    recall_tracked: bool = Field(
+        default=False,
+        description=(
+            "Whether this search bumped recall_count for the memories it "
+            "returned. False means they were not reinforced: the caller "
+            "presented no agent identity (a tenant-scoped key that did not set "
+            "filter_agent_id — recall_count stays 0 for that caller and "
+            "recall_boost never engages), the call set diagnostic=true or "
+            "recall_boost=false, or nothing matched."
+        ),
+    )
+    # D12 — present only when the request set ``diagnostic=true``.
+    diagnostic: SearchDiagnostic | None = None
+    # A28 — ``null`` when there is nothing to warn about, exactly as
+    # ``diagnostic`` already behaves (FastAPI serializes None fields rather than
+    # dropping them). Deliberately NOT switched to exclude_none: that would also
+    # change ``diagnostic``'s existing serialization. Additive for integrators —
+    # a new nullable key alongside one they already tolerate.
+    warnings: list[SearchWarning] | None = None
+
+
+class SearchRequest(TenantScopedBody):
+    # DELIBERATELY PERMISSIVE — do not add ``STRICT_WRITE_BODY`` here. SAFE-01
+    # made every WRITE body ``extra="forbid"`` and deliberately left the
+    # search/filter/query bodies alone; see the note at the top of this file for
+    # why the two sides differ. ``tests/test_unknown_field_rejection.py`` pins an
+    # unknown field on /search returning 2xx precisely so a later pass that
+    # "finishes the job" fails loudly instead of quietly breaking integrators.
+    #
+    # ax-0917-h-05 — ``extra="allow"``, not the inherited ``extra="ignore"``.
+    # Permissive still means 2xx (that product decision stands), but pydantic's
+    # ``ignore`` DISCARDS the unknown keys, so the route cannot tell that a
+    # caller sent ``limit: 2`` or ``bogus_param_xyz: 2`` and cannot say a word
+    # about it. ``allow`` keeps them in ``model_extra`` so the route can warn —
+    # accepting a key and never mentioning it again is what turned a reasonable
+    # guess into a silent 3.5x payload. Nothing dumps this model wholesale (the
+    # routes read fields individually), so carrying the extras costs nothing.
+    #
+    # ``tenant_id`` is NOT redeclared here: AX-M12 moved it to
+    # ``TenantScopedBody`` so an omitted tenant resolves from the credential.
+    # Restating it as a bare ``str`` would shadow that default and make the
+    # field required again, undoing the round-trip that change removes.
+    model_config = ConfigDict(extra="allow")
+
+    fleet_ids: list[str] | None = None
+    query: str = Field(min_length=1, max_length=MAX_QUERY_LENGTH)
+    filter_agent_id: str | None = None
+    # The identity knob, separate from the filter above. Before this, the two
+    # were one field: the visibility identity was DERIVED from
+    # ``filter_agent_id``, so a tenant-scoped key (``auth.agent_id`` is None)
+    # could only present an identity by also narrowing results to that agent's
+    # authored rows. ``GET /memories`` has drawn the same distinction in
+    # production for a while; /search was the odd one out.
+    #
+    # Grants no new visibility. ``scope_agent`` rows are admitted by
+    # ``visibility == "scope_agent" AND agent_id == caller_agent_id`` — keyed
+    # on the author column, the same one the filter matches — so naming X here
+    # admits exactly X's own scope_agent rows plus the shared rows, both
+    # already reachable today. The restriction that an AGENT credential may
+    # only name itself carries over unchanged.
+    caller_agent_id: str | None = Field(
+        default=None,
+        description=(
+            "Assert the agent identity this search runs as, WITHOUT filtering "
+            "results to that agent's own memories (use filter_agent_id for "
+            "that). Determines which scope_agent memories are visible and "
+            "whose trust/fleet level the read is gated against. Ignored when "
+            "the credential already carries an agent identity, which wins. An "
+            "agent-scoped credential may only name itself."
+        ),
+    )
+    # C31/D2 — the short names are canonical (the spellings the MCP tools use);
+    # the historical `*_filter` forms stay accepted forever as aliases. Before
+    # this, `memory_type=fact` (the MCP spelling) was silently DROPPED by the
+    # extra="ignore" contract — the C1+C2 trap. When both spellings arrive,
+    # the long form wins (first in AliasChoices).
+    memory_type_filter: MemoryType | None = Field(
+        default=None,
+        validation_alias=AliasChoices("memory_type_filter", "memory_type"),
+        description=MEMORY_TYPES_FILTER_DESCRIPTION,
+    )
+    status_filter: str | None = Field(
+        default=None,
+        pattern=MEMORY_STATUSES_PATTERN,
+        validation_alias=AliasChoices("status_filter", "status"),
+        # D6 — the default is NOT "every status". With this unset, search
+        # excludes rows the contradiction detector has retired: ``outdated``
+        # always, and ``conflicted`` unless the row is an exact lexical match
+        # for the query. That is deliberate (a stale claim shouldn't dilute
+        # ranking) but it was undocumented, which is what made it feel silent:
+        # a caller could not tell "nothing matched" from "matches were withheld".
+        # Setting this to an explicit status turns the default policy off and
+        # returns that status verbatim.
+        description=(
+            "Restrict results to one status. When omitted, superseded memories are "
+            "hidden: 'outdated' rows are excluded, and 'conflicted' rows are excluded "
+            "unless they exactly match the query text. Their replacements are injected "
+            "in their place. Pass an explicit status to bypass this and read the "
+            "superseded rows directly."
+        ),
+    )
+    valid_at: datetime | None = Field(
+        default=None,
+        description=(
+            "As-of time for the question (ISO 8601). Rows whose ts_valid_start is "
+            "after this date are excluded and rows whose ts_valid_end is before it "
+            "are down-weighted; relative dates in the query ('last month') are "
+            "resolved against it. When the tenant's search.default_profile sets "
+            "freshness_reference=1, freshness and the temporal window are ALSO "
+            "measured from this time against each row's event time "
+            "(ts_valid_start, else created_at) instead of from now() — the "
+            "setting for backfilled corpora where ingest time carries no signal. "
+            "Naive values are read as UTC."
+        ),
+    )
+    top_k: int = Field(
+        default=DEFAULT_SEARCH_TOP_K,
+        ge=1,
+        le=MAX_SEARCH_TOP_K,
+        # ax-0917-h-05 — ``limit`` is the same trap C31/D2 fixed for
+        # ``memory_type``: a spelling agents reasonably guess, dropped in
+        # silence by the ``extra`` contract. ``GET /memories`` DOES take
+        # ``limit``, so an agent that has used the list endpoint sends
+        # ``limit: 2`` here and gets the default 5 rows back with nothing
+        # saying why (audit measurement on live traffic: top_k:2 -> 2 rows /
+        # 34 KB, limit:2 -> 5 rows / 120 KB, and bogus_param_xyz:2 identical to
+        # limit — which is what proved the mechanism was "unknown keys vanish"
+        # rather than anything about ``limit``). Absorbed as an alias rather
+        # than rejected, for the same
+        # reason ``memory_type`` was: rejecting unknown keys on this surface is
+        # a breaking change for integrators already sending junk, and this
+        # model's own note calls the permissiveness a compatibility promise.
+        # ``top_k`` stays first, so it wins when both spellings arrive.
+        #
+        # This does NOT make ``limit`` a synonym for the list endpoint's
+        # ``limit``: there it is a page size, here it is the recall budget that
+        # successor injection is allowed to exceed (see below).
+        validation_alias=AliasChoices("top_k", "limit"),
+        # D16 — top_k bounds what the query RECALLS, not the response length:
+        # successor injection is additive on purpose (suppressing a correction
+        # to honor a count would return stale claims as current), so the
+        # description states the real contract instead of promising a maximum
+        # the behavior never kept.
+        description=(
+            f"Maximum results the query returns (1-{MAX_SEARCH_TOP_K}, default "
+            f"{DEFAULT_SEARCH_TOP_K}). Not the response ceiling: each returned "
+            "outdated/conflicted row also carries its newest correction, "
+            "injected beyond this budget and marked injected: true (with "
+            "score: null), so a response holds at most 2*top_k items. "
+            "Also accepted as 'limit': sent on its own it is absorbed silently "
+            "and no warning is raised. Sent together with 'top_k', top_k wins "
+            "and the response carries a 'superseded_parameter_alias' warning "
+            "naming 'limit' as superseded by 'top_k' — not an "
+            "'unrecognized_parameters' one, because the endpoint does read "
+            "'limit'; it was simply outranked."
+        ),
+    )
+    # D12 — per-request cosine floor. Overrides the resolved profile/tenant
+    # default for THIS call only (request beats profile beats tenant beats
+    # constant). Gates on the raw ``vec_sim`` — the same value returned in
+    # ``MemoryOut.similarity`` — never on the boosted composite ``score``.
+    # FTS-only rows (no embedding yet) bypass the floor by contract.
+    min_similarity: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Per-request similarity floor (0.0-1.0) applied to the raw cosine; "
+            "overrides the agent/tenant search-profile value for this call."
+        ),
+    )
+    # D12 — when true, the response carries a ``diagnostic`` retrieval trace
+    # (full candidate set, score factors, exclusion reasons, applied knobs).
+    # Results are unchanged and no recall_count is bumped on a diagnostic call.
+    diagnostic: bool = False
+    # pm-0918-c-03. Inherited by ``RecallRequest`` below, deliberately: /recall
+    # summarises these rows into a brief, so a short fragment restating its
+    # parent costs brief tokens on exactly the surface where they are scarcest.
+    include_derived: bool | None = Field(
+        default=None,
+        description=(
+            "Whether to return atomic-fact fan-out children — short single-claim "
+            "rows the platform derives from a memory you wrote, which stay "
+            "retrievable alongside it. Omit to inherit the tenant's "
+            "search.include_derived setting, which in turn falls back to the "
+            "global default (currently true). Precedence: this field beats the "
+            "tenant setting beats the global default. Excluded rows are dropped "
+            "BEFORE the top_k trim, so top_k still returns top_k rows. Does not "
+            "affect auto-chunk children, which are the only sub-document vectors "
+            "a long document has. REST only: the MCP tools do not expose this "
+            "per request — an MCP caller sets the tenant's search.include_derived "
+            "instead, and an unknown argument sent to an MCP tool is dropped "
+            "silently rather than reported (oss-0923-h-01)."
+        ),
+    )
+    # ``bool | None``, not ``bool = True``. The tri-state is load-bearing: the
+    # tenant setting can turn derived rows off store-wide, and a caller that
+    # wants them back needs to be able to say ``true`` in a way that is
+    # distinguishable from not asking. A plain ``bool`` default would make every
+    # request an explicit vote and the tenant setting would never be consulted.
+    #
+    # NOTE for a caller on an older server: this model is ``extra="allow"``, so a
+    # server that predates this field does not reject the key — it lands in
+    # ``model_extra`` and comes back in ``SearchResponse.warnings`` as a name the
+    # endpoint does not read (ax-0917-h-05). A server older than THAT discards it
+    # silently. Check the warnings rather than assuming the filter applied.
+
+    # lme-0929-h-01 (SIDE-54) — per-request "plain hybrid ranking" knobs. Both
+    # are OPT-OUT only: ``None`` (and ``true``) leave the tenant/profile
+    # behaviour exactly as it was; ``false`` neutralises that factor for THIS
+    # call. A request cannot switch a factor ON over a tenant that disabled it
+    # — the tenant setting stays the ceiling, the request can only subtract.
+    #
+    # Why they exist: every returned row gets ``recall_count + 1`` and
+    # ``recall_boost`` then ranks it higher next time, and the entity boost
+    # reorders on top of that, so re-running the same query on the same store
+    # returns a different order each run. Before these, the only way out was a
+    # tenant setting or a search profile — store-wide, for a need that is
+    # per-call (a benchmark, an A/B, a reproducibility check).
+    #
+    # ``recall_boost=false`` ALSO skips the ``recall_count`` bump for this
+    # call: a plain read that still reinforced its rows would neutralise the
+    # boost for itself while feeding it for every later caller — the exact
+    # run-to-run drift the knob is meant to remove.
+    recall_boost: bool | None = Field(
+        default=None,
+        description=(
+            "Set false for this call only to neutralise the popularity "
+            "recall_boost factor (score multiplier fixed at 1.0) AND to skip "
+            "the recall_count bump for the returned rows, so the read neither "
+            "uses nor feeds the recall signal (the response reports "
+            "recall_tracked: false). Omit (or true) for the tenant's behaviour; "
+            "a request cannot enable the boost over a tenant that disabled it. "
+            "REST only: the MCP tools do not expose this per request."
+        ),
+    )
+    entity_boost: bool | None = Field(
+        default=None,
+        description=(
+            "Set false for this call only to rank by the plain hybrid "
+            "(vector + full-text) score: entity/graph retrieval is skipped, so "
+            "no entity boost multiplier is applied and the ENTITY_LOOKUP "
+            "short-circuit cannot fire. Omit (or true) for the tenant's "
+            "search.entity_retrieval behaviour; a request cannot enable entity "
+            "retrieval over a tenant that disabled it. REST only: the MCP tools "
+            "do not expose this per request."
+        ),
+    )
+
+
+class RecallRequest(SearchRequest):
+    """``/recall``'s body: ``SearchRequest`` plus the envelope-shape knob.
+
+    A subclass rather than another field on ``SearchRequest`` because
+    ``items_alias`` means nothing on ``/search``, where ``items`` is the
+    canonical key rather than an alias — putting it there would publish a
+    no-op field on the busier surface.
+    """
+
+    # ax-0917-h-03 — /recall returns the identical result set under BOTH
+    # ``memories`` and ``items``. The Python list is shared, but JSON
+    # serialises it twice: measured 49.6% of a 5-row brief and 49.9% of a
+    # 20-row one. Set false when you read ``memories`` (both first-party SDKs
+    # do) and the response halves.
+    #
+    # Default True, not False. ``RecallResponse.items`` is in the published
+    # OpenAPI schema and ``docs/public-api-stability.md`` makes REST response
+    # shapes part of the SemVer contract, so flipping the default is a MAJOR
+    # release's change to make, not a perf patch's. The MCP brief — whose
+    # response shape that document does not pin — already opts out.
+    items_alias: bool = Field(
+        default=True,
+        description=(
+            "Emit the back-compat 'items' alias of 'memories' (C4). Set false "
+            "to halve the response; 'memories' is unaffected either way."
+        ),
+    )
+
+
+# --- Entity ---
+
+
+class EntityUpsert(TenantScopedBody):
+    model_config = STRICT_WRITE_BODY
+
+    fleet_id: str | None = None
+    entity_type: str
+    canonical_name: str
+    attributes: dict | None = None
+
+
+class RelationOut(BaseModel):
+    id: UUID
+    relation_type: str
+    to_entity_id: UUID
+    to_entity_name: str | None = None
+    weight: float
+    evidence_memory_id: UUID | None
+
+    model_config = {"from_attributes": True}
+
+
+class EntityOut(BaseModel):
+    id: UUID
+    tenant_id: str
+    fleet_id: str | None = None
+    entity_type: str
+    canonical_name: str
+    attributes: dict | None
+    linked_memories: list[MemoryOut] = []
+    relations: list[RelationOut] = []
+
+    model_config = {"from_attributes": True}
+
+
+# --- Relation ---
+
+
+class RelationUpsert(TenantScopedBody):
+    model_config = STRICT_WRITE_BODY
+
+    fleet_id: str | None = None
+    from_entity_id: UUID
+    relation_type: str
+    to_entity_id: UUID
+    # L-49. Optional: omitted, a new relation starts at 1.0 and an existing one
+    # keeps the weight it has. A 1.0 default meant every re-upsert, including
+    # every extraction, overwrote the graded weight ``entity_infer_relations``
+    # had built up.
+    weight: float | None = Field(default=None, ge=0.0, le=1.0)
+    evidence_memory_id: UUID | None = None
+
+
+# --- Ingest ---
+
+
+class IngestRequest(TenantScopedBody):
+    model_config = STRICT_WRITE_BODY
+
+    fleet_id: str | None = None
+    agent_id: str = "ingest-agent"
+    url: str | None = None
+    content: str | None = None
+    focus: str | None = None
+    # Optional caller-supplied source label. Used by the multipart upload
+    # endpoint (``/ingest/file``) to thread ``upload:<filename>`` through
+    # so the per-fact ``source_uri`` carries the original filename instead
+    # of being stamped as the generic ``"text-input"`` marker. When
+    # absent, ``ingest_preview`` falls back to ``url`` (URL ingest) or
+    # ``"text-input"`` (pasted content) — unchanged behavior.
+    source_uri: str | None = None
+
+
+class IngestFact(BaseModel):
+    model_config = STRICT_WRITE_BODY
+
+    content: str
+    suggested_type: str = DEFAULT_MEMORY_TYPE
+    # Provenance: ``ingest_preview`` stamps this on every fact it returns
+    # (the URL it fetched from, or "text-input" for a pasted body). When
+    # the caller round-trips the preview output straight to commit without
+    # explicitly re-passing ``url``, this is the only thing that lets us
+    # persist the right ``source_uri``. ``IngestCommitRequest.url`` still
+    # wins if provided (dashboard back-compat).
+    source_uri: str | None = None
+    # A1 (PR #5): LLM-emitted salience score, 0.0-1.0. Preview's validator
+    # already dropped sub-0.5 facts before returning, so any value seen
+    # here passed the floor at preview time. Persisted on the memory so
+    # an A2-cache-hit preview can restore it; not used for filtering at
+    # commit time.
+    salience: float | None = None
+
+
+class IngestCommitRequest(TenantScopedBody):
+    model_config = STRICT_WRITE_BODY
+
+    fleet_id: str | None = None
+    agent_id: str = "ingest-agent"
+    url: str | None = None
+    facts: list[IngestFact]
+    run_id: str | None = None
+    # A2: optional. When the caller echoes the ``doc_hash`` from a prior
+    # preview, commit stamps it on every persisted memory's metadata so
+    # the *next* preview of the same content can short-circuit the LLM
+    # call (cache-hit). Backward-compatible: omitting it just disables
+    # the cache for future previews of this content.
+    doc_hash: str | None = None
+
+
+class RelationUpsertOut(BaseModel):
+    id: UUID
+    tenant_id: str
+    fleet_id: str | None = None
+    from_entity_id: UUID
+    relation_type: str
+    to_entity_id: UUID
+    weight: float
+    evidence_memory_id: UUID | None
+
+    model_config = {"from_attributes": True}
+
+
+# --- Agent ---
+
+
+class AgentOut(BaseModel):
+    id: UUID
+    tenant_id: str
+    fleet_id: str | None = None
+    agent_id: str
+    trust_level: int
+    search_profile: dict | None = None
+    created_at: datetime
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class AgentTrustUpdate(BaseModel):
+    model_config = STRICT_WRITE_BODY
+
+    trust_level: int = Field(ge=MIN_TRUST_LEVEL, le=MAX_TRUST_LEVEL)
+    fleet_id: str | None = None
+
+
+# Derived from ``SEARCH_KNOBS`` rather than written out. The fields and their
+# bounds were hand-maintained here, in the MCP ``caura_tune`` signature and in
+# the knob table, and they had already drifted: ``graph_max_hops`` was capped at 3
+# here while the table allowed 5, so a tenant-wide default could hold a depth no
+# agent profile could set (#730). One declaration removes the class of drift
+# rather than testing for it.
+#
+# ``agent_tunable`` is what selects the nine; the three A/B knobs
+# (``fts_rank_scale``, ``candidate_pool_size``, ``score_formula``) stay off this
+# surface deliberately — they are tenant-level A/B levers, not per-agent tuning.
+# ``dict[str, Any]`` explicitly: ``create_model``'s overloads take
+# ``**field_definitions: Any | tuple[Any, Any]``, and mypy will not match a
+# comprehension it infers as ``dict[Any, tuple[Any, None]]`` against them.
+_PROFILE_FIELDS: dict[str, Any] = {
+    name: (
+        SEARCH_KNOBS[name].value_type | None,
+        Field(default=None, ge=SEARCH_KNOBS[name].bounds[0], le=SEARCH_KNOBS[name].bounds[1]),
+    )
+    for name in AGENT_TUNABLE_KEYS
+}
+
+# ``__config__`` rather than a ``model_config`` entry in ``_PROFILE_FIELDS``:
+# ``create_model`` treats every kwarg it doesn't recognise as a FIELD, so a
+# ``model_config`` key there would declare a field literally named
+# "model_config". Strict for the same reason as every other mutation body — a
+# tune that misspells ``min_similarity`` currently returns 200 with the knob
+# untouched, which reads as "the knob did nothing" rather than "you typo'd it".
+SearchProfileUpdate = create_model(
+    "SearchProfileUpdate",
+    __doc__="Per-agent search tuning knobs. All fields optional — only override what you set.",
+    __config__=STRICT_WRITE_BODY,
+    **_PROFILE_FIELDS,
+)
+
+
+# --- Background Task ---
+
+
+class STMWriteResponse(BaseModel):
+    """Response for STM writes — different shape from MemoryOut."""
+
+    id: str
+    write_mode: str = "stm"
+    target: str  # "notes" | "bulletin"
+    tenant_id: str
+    agent_id: str
+    content: str
+    ttl: int
+    posted_at: datetime
+    latency_ms: int = 0
+
+
+class BackgroundTaskOut(BaseModel):
+    id: UUID
+    task_name: str
+    memory_id: UUID | None = None
+    tenant_id: str
+    status: str
+    error_message: str | None = None
+    error_traceback: str | None = None
+    created_at: datetime
+    completed_at: datetime | None = None
+
+    model_config = {"from_attributes": True}

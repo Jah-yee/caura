@@ -1,0 +1,362 @@
+"""FastAPI application for core-storage-api."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+from collections.abc import AsyncIterator
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from common import permanent_failure
+from common.structlog_config import configure_logging
+from core_storage_api.config import settings
+from core_storage_api.services.postgres_service import (
+    BulkRowShapeError,
+    DuplicateContentHashError,
+    PointerNotInTenantError,
+)
+
+# Must run before any other module-level import emits a log record —
+# database.init and the routers below pull in SQLAlchemy, httpx, etc., all
+# of which log at import time. Placed after `config` so we can read
+# settings, but before everything else so their records hit our handler.
+configure_logging(
+    settings.environment,
+    settings.log_level,
+    json_logs=settings.log_format_json,
+    log_file=settings.log_file or None,
+)
+
+from sqlalchemy import text
+
+from core_storage_api.database.init import get_engine, init_database
+from core_storage_api.database.migration_postconditions import MIGRATION_POSTCONDITIONS
+from core_storage_api.middleware import (
+    RejectWritesOnReaderMiddleware,
+    RequireStorageSharedSecretMiddleware,
+)
+from core_storage_api.routers import (
+    agents_router,
+    audit_router,
+    capability_usage_router,
+    debug_router,
+    documents_router,
+    entities_router,
+    evolve_router,
+    fleet_router,
+    health_router,
+    idempotency_router,
+    insights_router,
+    keystones_router,
+    lifecycle_audit_router,
+    memories_router,
+    organization_settings_router,
+    preview_router,
+    purge_router,
+    reports_router,
+    skill_factory_router,
+    tasks_router,
+    tenant_suppression_router,
+    tenant_usage_router,
+    tenants_router,
+)
+
+logger = logging.getLogger(__name__)
+
+_INVALID_INDEXES = text(
+    """
+    SELECT c.relname
+    FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE NOT i.indisvalid
+      AND n.nspname NOT IN ('pg_catalog', 'pg_toast')
+    ORDER BY c.relname
+    """
+)
+
+
+async def report_schema_drift() -> None:
+    """Report known migration soft-failures without blocking startup."""
+    if settings.core_storage_role == "reader":
+        return
+
+    try:
+        async with get_engine().connect() as connection:
+            invalid_indexes = (await connection.execute(_INVALID_INDEXES)).scalars().all()
+            if invalid_indexes:
+                logger.error(
+                    "Invalid PostgreSQL indexes detected: %s. Repair with DROP INDEX CONCURRENTLY, "
+                    "then CREATE INDEX CONCURRENTLY, from a session that will not be killed mid-build.",
+                    ", ".join(invalid_indexes),
+                )
+
+            for postcondition in MIGRATION_POSTCONDITIONS:
+                try:
+                    async with connection.begin_nested():
+                        effect_is_present = await connection.scalar(text(postcondition.predicate))
+                except Exception:
+                    logger.exception(
+                        "Schema drift post-condition probe failed [%s/%s]; startup will continue",
+                        postcondition.revision,
+                        postcondition.name,
+                    )
+                    continue
+                if effect_is_present is not True:
+                    # A soft-failing migration promises "apply this if allowed
+                    # to", so an unmet post-condition on a deployment that was
+                    # never allowed is the documented outcome, not a defect.
+                    # Report it once at INFO rather than warning on every boot
+                    # forever: an unactionable warning that cannot be cleared is
+                    # how the genuine case gets lost. A probe that itself fails
+                    # says nothing either way, so the condition stays a warning.
+                    expected_here = False
+                    if postcondition.expected_when is not None:
+                        try:
+                            async with connection.begin_nested():
+                                expected_here = (
+                                    await connection.scalar(text(postcondition.expected_when))
+                                ) is True
+                        except Exception:
+                            logger.exception(
+                                "Post-condition expectation probe failed [%s/%s]; "
+                                "treating the condition as unexpected",
+                                postcondition.revision,
+                                postcondition.name,
+                            )
+                    if expected_here:
+                        logger.info(
+                            "Migration post-condition not met but expected here [%s/%s]; "
+                            "this deployment could not have applied it",
+                            postcondition.revision,
+                            postcondition.name,
+                        )
+                        continue
+                    logger.log(
+                        logging.ERROR if postcondition.severity == "error" else logging.WARNING,
+                        "Migration post-condition failed [%s/%s]: %s",
+                        postcondition.revision,
+                        postcondition.name,
+                        postcondition.message,
+                    )
+    except Exception:
+        logger.exception("Schema drift report failed; startup will continue")
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Application lifespan manager."""
+    logger.info(
+        "Starting core-storage-api",
+        extra={"core_storage_role": settings.core_storage_role},
+    )
+    if not settings.core_storage_shared_secret.get_secret_value():
+        logger.error(
+            "CORE_STORAGE_SHARED_SECRET is not configured; GET /readyz will return 503 "
+            "and storage data requests will reject authentication"
+        )
+    await init_database()
+    await report_schema_drift()
+    yield
+    logger.info("Shutting down core-storage-api")
+    # Don't spin up a writer engine just to tear it down — reader-role
+    # services never touch the primary DB URL, and the read-pool engine
+    # lives in postgres_service.py's own factory.
+    if settings.core_storage_role != "reader":
+        await get_engine().dispose()
+
+
+def create_app() -> FastAPI:
+    """Create and configure the FastAPI application."""
+    app = FastAPI(
+        title="Caura Core Storage API",
+        description=(
+            "PostgreSQL CRUD service for Caura core tables.\n\n"
+            "Provides typed CRUD operations for memories, entities, agents, "
+            "documents, fleet, audit logs, and reports.\n\n"
+            "**Base path:** `/api/v1/storage`"
+        ),
+        version="1.0.1",
+        lifespan=lifespan,
+        redirect_slashes=False,
+    )
+
+    @app.exception_handler(DuplicateContentHashError)
+    async def _duplicate_content_hash_handler(
+        request: Request, exc: DuplicateContentHashError
+    ) -> JSONResponse:
+        # C29. Both memory-insert routes used to catch this and re-raise it as
+        # ``HTTPException(409, detail=str(exc))``. That could only ever send one
+        # string, which is why the winning row's id travelled as English and
+        # core-api's MCP server ended up regex-parsing it back out.
+        #
+        # ``detail`` is byte-identical to what those routes sent, so an older
+        # core-api reading this response is unaffected; the structured fields
+        # sit BESIDE it for anyone who wants the id without a regular
+        # expression. Registered for the dedicated subclass only — a bare
+        # ``ValueError`` handler would relabel genuine server faults as client
+        # errors, which is exactly what the routes were careful to avoid.
+        return JSONResponse(
+            status_code=409,
+            content={"detail": str(exc), **exc.fields},
+        )
+
+    @app.exception_handler(BulkRowShapeError)
+    async def _bulk_row_shape_handler(request: Request, exc: BulkRowShapeError) -> JSONResponse:
+        # App-wide for the same reason ``_duplicate_content_hash_handler`` above
+        # is: a route-local ``except`` can only serve the one route that writes
+        # it, and the answer here has to hold for every caller of the bulk
+        # insert. The first draft of this fix DID catch it in the route, and
+        # that is a trap — a second entry point (or an in-process caller) would
+        # have raised an unmarked 500, and core-api answers an unmarked
+        # upstream 5xx with "503, retry" from ``upstream_http_error_handler``.
+        # The advice would have been exactly inverted on the path nobody tested.
+        #
+        # ``retryable: false`` is the whole payload of this branch. 500 is
+        # honest — the caller's items were checked uniform before this raised,
+        # so the divergence is ours — but a bare 500 is indistinguishable from
+        # a transient one, and this failure reproduces byte-for-byte forever.
+        #
+        # Logged here because nothing else will say which column diverged: the
+        # response names it as data, but only an operator reading storage's own
+        # logs gets it attached to the request that produced it.
+        logger.error("Bulk insert rejected on mapped row shape: %s %s", exc, exc.fields)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": permanent_failure.permanent_detail(
+                    cause=permanent_failure.CAUSE_BULK_ROW_SHAPE,
+                    message=str(exc),
+                    **exc.fields,
+                )
+            },
+        )
+
+    @app.exception_handler(PointerNotInTenantError)
+    async def _pointer_not_in_tenant_handler(request: Request, exc: PointerNotInTenantError) -> JSONResponse:
+        # App-wide for the reason the two handlers above are: every memory
+        # writer and the relation upsert raise it, and the answer must be the
+        # same on all of them. 422 — the caller named the row, so the caller
+        # can fix it — and marked not retryable, because it fails identically
+        # on every attempt. One answer for "no such row" and "another tenant's
+        # row": only ``field`` says which pointer, never why.
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": permanent_failure.permanent_detail(
+                    cause=permanent_failure.CAUSE_POINTER_NOT_IN_TENANT,
+                    message=str(exc),
+                    **exc.fields,
+                )
+            },
+        )
+
+    @app.exception_handler(json.JSONDecodeError)
+    async def _malformed_json_handler(request: Request, exc: json.JSONDecodeError) -> JSONResponse:
+        # Every router parses the body with a bare ``await request.json()``;
+        # malformed JSON would otherwise surface as an unhandled 500. Convert it
+        # to a fail-closed 422 app-wide so the body-validation contract holds at
+        # the transport layer too (rather than guarding 100+ call sites).
+        return JSONResponse(status_code=422, content={"detail": "request body must be valid JSON"})
+
+    # Order matters: Starlette executes middlewares in reverse registration
+    # order (last added = outermost). Register the reader filter first, then the
+    # credential boundary, and CORS last. CORS can then answer browser preflight
+    # requests and decorate both authentication 401s and reader-role 405s;
+    # every actual data request still reaches authentication before a handler.
+    if settings.core_storage_role == "reader":
+        app.add_middleware(RejectWritesOnReaderMiddleware)
+
+    app.add_middleware(
+        RequireStorageSharedSecretMiddleware,
+        shared_secret=settings.core_storage_shared_secret.get_secret_value(),
+    )
+
+    # Internal service — restrict CORS to known callers only. On the
+    # reader role, narrow allow_methods so CORS preflights don't
+    # advertise verbs the write-reject middleware will 405 anyway.
+    allowed_origins = (
+        [o.strip() for o in settings.cors_origins.split(",") if o.strip()] if settings.cors_origins else []
+    )
+    _cors_methods = (
+        ["GET", "POST"]
+        if settings.core_storage_role == "reader"
+        else ["GET", "POST", "PUT", "PATCH", "DELETE"]
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=False,
+        allow_methods=_cors_methods,
+        allow_headers=["*"],
+    )
+
+    # Health at root level for load balancer checks
+    app.include_router(health_router)
+
+    prefix = "/api/v1/storage"
+
+    # Health also under the API prefix
+    app.include_router(health_router, prefix=prefix)
+    app.include_router(memories_router, prefix=prefix)
+    app.include_router(entities_router, prefix=prefix)
+    app.include_router(agents_router, prefix=prefix)
+    app.include_router(documents_router, prefix=prefix)
+    app.include_router(keystones_router, prefix=prefix)
+    app.include_router(fleet_router, prefix=prefix)
+    app.include_router(audit_router, prefix=prefix)
+    app.include_router(reports_router, prefix=prefix)
+    # Fix 2 Ph5a: skill-factory pipeline reads/writes (forge poison,
+    # session traces, outcome-signal analytic reads) moved off core-api's
+    # direct DB pool. core-api calls these via its storage_client.
+    app.include_router(skill_factory_router, prefix=prefix)
+    # Fix 2 Ph5b: insights analytic memory reads + supersede/restore writes +
+    # the lifecycle activity gate, moved off core-api's direct DB pool. core-api
+    # calls these via its storage_client; the LLM analysis + numpy k-means stay
+    # client-side.
+    app.include_router(insights_router, prefix=prefix)
+    # Fix 2 Ph5b (PR2): evolve scope-filter read + the atomic weight-adjust/
+    # backfill write, moved off core-api's direct DB pool. core-api calls these
+    # via its storage_client; the rule-generation LLM round-trip stays
+    # client-side.
+    app.include_router(evolve_router, prefix=prefix)
+    app.include_router(tasks_router, prefix=prefix)
+    app.include_router(idempotency_router, prefix=prefix)
+    app.include_router(lifecycle_audit_router, prefix=prefix)
+    # Fix 2 Phase 0: per-org settings read/write, moved off core-api's
+    # direct DB pool. core-api calls these via its storage_client and keeps
+    # the TTL cache / SETTINGS_CHANGED publish / validators client-side.
+    app.include_router(organization_settings_router, prefix=prefix)
+    # Fix 2 Phase 1: tenant-discovery lists for the lifecycle fanout, moved off
+    # core-api's direct DB pool (active / purgeable / skills-factory-enabled).
+    app.include_router(tenants_router, prefix=prefix)
+    app.include_router(purge_router, prefix=prefix)
+    # CAURA-696: per-tenant row counts for the deletion-preview panel.
+    # The app-wide storage-secret middleware authenticates the caller;
+    # core-api applies the route's admin authorization check.
+    app.include_router(preview_router, prefix=prefix)
+    # CAURA-694: tenant-suppression mirror. POST upsert for the OSS
+    # suppression consumer (core-worker); GET is the boundary-guard
+    # read used by core-api on every authenticated request.
+    app.include_router(tenant_suppression_router, prefix=prefix)
+    # CAURA-686: ``GET /api/v1/storage/_debug/pg_locks`` for live
+    # pg_locks / pg_stat_activity snapshots during contention triage.
+    # Answers 404 unless CORE_STORAGE_DEBUG_ENDPOINTS is on (L-75), and
+    # needs the storage shared secret like every route here; not exposed
+    # via the gateway.
+    app.include_router(debug_router, prefix=prefix)
+    # Fix 2 final-cleanup (PR1): adoption-counter flush, moved off core-api's
+    # direct DB pool. Intentionally cross-tenant / RLS-free (migration 023) —
+    # one flush batch carries many tenants' counters. core-api's in-process
+    # aggregator POSTs here on its flush interval via the storage_client.
+    app.include_router(capability_usage_router, prefix=prefix)
+    app.include_router(tenant_usage_router, prefix=prefix)
+
+    return app
+
+
+app = create_app()

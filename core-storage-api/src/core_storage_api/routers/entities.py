@@ -1,0 +1,852 @@
+"""Entity CRUD, graph, relation, and memory-link endpoints."""
+
+from __future__ import annotations
+
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, Query, Request
+
+from common.constants import VECTOR_DIM
+from core_storage_api.routers._validation import _require, _require_number
+from core_storage_api.schemas import (
+    ENTITY_FIELDS,
+    MEMORY_ENTITY_LINK_FIELDS,
+    MEMORY_FIELDS,
+    RELATION_FIELDS,
+    orm_to_dict,
+)
+from core_storage_api.services.postgres_service import PostgresService
+
+router = APIRouter(prefix="/entities", tags=["Entities"])
+_svc = PostgresService()
+
+
+def _validate_input_idxs(items: list[dict]) -> None:
+    """Ensure each bulk-endpoint item has a unique, in-range ``input_idx``.
+
+    The two bulk endpoints (``/bulk-upsert``, ``/bulk-resolve``) place
+    their response into ``results[item["input_idx"]]``. An out-of-range
+    ``input_idx`` would crash with IndexError → 500; a duplicate would
+    overwrite an earlier slot and return a list shorter than the input.
+    Validate both up-front so the failure mode is a clear 422 rather
+    than a stack trace.
+    """
+    idxs: set[int] = set()
+    for i, item in enumerate(items):
+        raw = item.get("input_idx")
+        if not isinstance(raw, int) or raw < 0 or raw >= len(items):
+            raise HTTPException(
+                status_code=422,
+                detail=f"item {i}: input_idx must be int in [0, {len(items)})",
+            )
+        if raw in idxs:
+            raise HTTPException(
+                status_code=422,
+                detail=f"item {i}: duplicate input_idx {raw}",
+            )
+        idxs.add(raw)
+
+
+# ------------------------------------------------------------------
+# Entity CRUD (collection-level)
+# ------------------------------------------------------------------
+
+
+@router.post("")
+async def create_entity(request: Request) -> dict:
+    body: dict = await request.json()
+    try:
+        entity = await _svc.entity_add(body)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return orm_to_dict(entity, ENTITY_FIELDS)
+
+
+def _reader_fleets(fleet_ids: list[str] | None, bound: bool) -> list[str] | None:
+    """The agent reader's readable fleets for the entity summaries below.
+
+    ``None`` means "may cross fleets". A query string cannot carry an empty
+    list, so a reader bound to no fleet at all (only fleet-less and org rows)
+    arrives as ``caller_fleet_bound=true`` with no ``caller_fleet_ids``.
+    """
+    if not bound:
+        return None
+    return list(fleet_ids or [])
+
+
+@router.get("")
+async def list_entities(
+    tenant_id: str,
+    fleet_id: str | None = None,
+    entity_type: str | None = None,
+    search: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    caller_agent_id: str | None = None,
+    caller_tenant_id: str | None = None,
+    caller_fleet_ids: list[str] | None = Query(default=None),
+    caller_fleet_bound: bool = False,
+) -> list[dict]:
+    # C22 — accept and forward the filters entity_list has always supported;
+    # core-api declared them publicly but this hop dropped them.
+    entities = await _svc.entity_list(
+        tenant_id,
+        fleet_id=fleet_id,
+        entity_type=entity_type,
+        search=search,
+        limit=limit,
+        offset=offset,
+        caller_agent_id=caller_agent_id,
+        caller_tenant_id=caller_tenant_id,
+        caller_fleet_ids=_reader_fleets(caller_fleet_ids, caller_fleet_bound),
+    )
+    return [orm_to_dict(e, ENTITY_FIELDS) for e in entities]
+
+
+@router.post("/by-ids")
+async def get_entities_by_ids(request: Request) -> dict:
+    """Fetch many entities by id in one round-trip, scoped to one tenant.
+
+    POST rather than GET because the id list is unbounded in principle and a
+    query string is not where a caller should be discovering a URL-length
+    limit; the body is the same shape ``/memory-ids-by-entity-ids`` and
+    ``/count-memories`` already take.
+
+    Ids outside ``tenant_id`` are absent from the response rather than an
+    error — see ``entity_get_by_ids`` for why a batch read must filter where
+    the per-id route 404s. ``tenant_id`` is required (422 without it), so this
+    route can never degrade into the bare primary-key lookup #1174 removed
+    from ``GET /entities/{entity_id}``.
+
+    Declared above the parameterised ``/{entity_id}`` routes only for the
+    file's ordering convention — being a POST, it could not be shadowed by
+    the GET anyway.
+    """
+    body: dict = await request.json()
+    tenant_id = _require(body, "tenant_id")
+    raw_ids = body.get("entity_ids") or []
+    if not isinstance(raw_ids, list):
+        raise HTTPException(status_code=422, detail="entity_ids must be a list")
+    try:
+        entity_ids = [UUID(eid) for eid in raw_ids]
+    except (ValueError, AttributeError, TypeError) as exc:
+        # A malformed id in the list is the caller's bug, not a 500. The
+        # per-id route gets this for free from FastAPI's ``entity_id: UUID``
+        # path coercion; a body-carried list has to say it itself.
+        raise HTTPException(status_code=422, detail=f"invalid entity_id UUID: {exc}") from exc
+    entities = await _svc.entity_get_by_ids(entity_ids, tenant_id)
+    return {str(eid): orm_to_dict(e, ENTITY_FIELDS) for eid, e in entities.items()}
+
+
+@router.get("/exact")
+async def find_exact_entity(
+    tenant_id: str,
+    name: str,
+    entity_type: str | None = None,
+    fleet_id: str | None = None,
+) -> dict:
+    """Exact match on the natural key; an omitted ``entity_type`` matches any.
+
+    Untyped, one name can belong to several entities, so more than one match
+    is a 409 rather than an arbitrary pick (M-25). It used to default to type
+    ``"default"``, which nothing writes, so an untyped lookup never matched.
+    """
+    if entity_type is not None:
+        entity = await _svc.entity_find_exact(tenant_id, entity_type, name, fleet_id)
+        matches = [entity] if entity is not None else []
+    else:
+        matches = await _svc.entity_find_exact_any_type(tenant_id, name, fleet_id)
+    if not matches:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409, detail="ambiguous: entities of more than one type share this name"
+        )
+    return orm_to_dict(matches[0], ENTITY_FIELDS)
+
+
+# ------------------------------------------------------------------
+# FTS
+# ------------------------------------------------------------------
+
+
+@router.post("/fts-search")
+async def fts_search_entities(request: Request) -> list[str]:
+    body: dict = await request.json()
+    ids = await _svc.entity_fts_search(
+        tokens=body["tokens"],
+        tenant_id=body["tenant_id"],
+        fleet_ids=body.get("fleet_ids"),
+        strict_fleet_scoping=body.get("strict_fleet_scoping", False),
+    )
+    return [str(eid) for eid in ids]
+
+
+# ------------------------------------------------------------------
+# Embedding similarity (entity resolution)
+# ------------------------------------------------------------------
+
+
+@router.post("/embedding-similarity")
+async def resolve_entity_candidates(request: Request) -> list[dict]:
+    body: dict = await request.json()
+    results = await _svc.entity_find_by_embedding_similarity(
+        tenant_id=body["tenant_id"],
+        entity_type=body["entity_type"],
+        name_embedding=body["name_embedding"],
+        fleet_id=body.get("fleet_id"),
+        limit=body.get("limit", 5),
+    )
+    out = []
+    for entity, sim in results:
+        row = orm_to_dict(entity, ENTITY_FIELDS)
+        row["similarity"] = float(sim)
+        out.append(row)
+    return out
+
+
+@router.post("/bulk-upsert")
+async def bulk_upsert_entities(request: Request) -> list[dict]:
+    """Apply many entity create/update operations in one round-trip.
+
+    Companion to ``/entities/bulk-resolve`` — caller takes the resolve
+    output, runs the client-side merge (first-seen-wins canonical,
+    accumulate aliases), then sends the resulting create/update plan
+    here.
+
+    Per-item shape: ``{"input_idx", "action": "create"|"update",
+    "entity_id"?, "tenant_id", "fleet_id", "entity_type",
+    "canonical_name", "attributes", "name_embedding"?}``.
+
+    Response is aligned to input order. ``action`` in the response
+    reflects what actually happened:
+
+    - ``"created"``: INSERT succeeded
+    - ``"updated"``: UPDATE matched
+    - ``"merged"``: INSERT lost a race; the row that won was updated
+      with this caller's attributes (mirrors ``entity_add``'s recovery)
+    - ``"missing"``: UPDATE didn't match (entity_id deleted between
+      resolve and upsert)
+
+    Cap: 500 items per request.
+    """
+    body: dict = await request.json()
+    items = body.get("items", [])
+    if not isinstance(items, list):
+        raise HTTPException(status_code=422, detail="'items' must be a list")
+    if len(items) > 500:
+        raise HTTPException(
+            status_code=422,
+            detail=f"bulk-upsert capped at 500 items (got {len(items)})",
+        )
+    # Validate required per-item fields up-front so a missing key
+    # surfaces as a 422 instead of an uncaught KeyError → 500 inside
+    # the service. ``action`` is checked separately below.
+    _REQUIRED_BASE = {"tenant_id", "entity_type", "canonical_name", "attributes"}
+    for item in items:
+        missing = _REQUIRED_BASE - item.keys()
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=(f"item at input_idx {item.get('input_idx')!r} missing fields: {sorted(missing)}"),
+            )
+    _validate_input_idxs(items)
+    # Validate per-item action + update preconditions up-front. The
+    # service partitions on action ∈ {"create", "update"}; unknown
+    # values would otherwise be silently dropped (response shorter
+    # than input), and a missing entity_id on action="update" would
+    # crash inside the service with a KeyError → 500.
+    for item in items:
+        if item.get("action") not in {"create", "update"}:
+            raise HTTPException(
+                status_code=422,
+                detail=(f"invalid action {item.get('action')!r} at input_idx {item.get('input_idx')!r}"),
+            )
+        if item.get("action") == "update":
+            eid_raw = item.get("entity_id")
+            if not eid_raw:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"action='update' requires 'entity_id' at input_idx {item.get('input_idx')!r}",
+                )
+            # Validate UUID shape at the router boundary — without this
+            # a non-UUID ``entity_id`` would crash inside the service
+            # (``UUID(eid)``) and surface via the generic 500 fallback.
+            try:
+                UUID(eid_raw)
+            except (ValueError, AttributeError):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"invalid entity_id UUID at input_idx {item.get('input_idx')!r}",
+                )
+    try:
+        return await _svc.entity_bulk_upsert(items)
+    except (ValueError, KeyError):
+        # The service no longer raises ValueError for the TOCTOU race
+        # (it reports ``action="missing"`` instead). Any ValueError /
+        # KeyError reaching here is an internal inconsistency, not a
+        # client-resolvable conflict — 500 is the honest status. Use a
+        # generic detail so internals (raw item dicts, traceback bits)
+        # don't leak across the API boundary; the real cause is in the
+        # server logs.
+        raise HTTPException(status_code=500, detail="internal entity upsert error")
+
+
+@router.post("/bulk-resolve")
+async def bulk_resolve_entities(request: Request) -> list[dict | None]:
+    """Resolve many entities in one round-trip, in three phases of
+    decreasing certainty: Phase 1 exact match on
+    ``(canonical_name, entity_type, fleet_id)``; Phase 1.5 the
+    conservative normalised match (case/whitespace plus a small fixed
+    leading-qualifier strip — see ``common.entity_naming``), which is
+    deterministic and so outranks embeddings; Phase 2 cosine similarity
+    over ``name_embedding`` at or above ``threshold``.
+
+    Body shape::
+
+        {
+          "tenant_id": "...",
+          "threshold": 0.85,                 # required, no server-side default
+          "items": [
+            {"input_idx": 0, "fleet_id": null, "canonical_name": "...",
+             "entity_type": "...", "name_embedding": [...] | null},
+            ...
+          ]
+        }
+
+    Response is a list aligned to ``input_idx``: each element is either
+    ``null`` (no match) or ``{"entity_id", "canonical_name", "attributes",
+    "matched_by": "exact" | "normalized" | "similarity",
+    "similarity": float}``. Callers
+    use the ``matched_by`` field to decide whether to take the update path
+    (with client-side attribute merge) or the create path in a follow-up
+    ``/entities/bulk-upsert`` call.
+
+    Cap: 500 items per request. Bigger batches risk pushing the Phase 1
+    OR-of-ANDs plan into a seq scan; chunk client-side if you need more.
+    """
+    body: dict = await request.json()
+    items = body.get("items", [])
+    if not isinstance(items, list):
+        raise HTTPException(status_code=422, detail="'items' must be a list")
+    if len(items) > 500:
+        raise HTTPException(
+            status_code=422,
+            detail=f"bulk-resolve capped at 500 items (got {len(items)})",
+        )
+    if "tenant_id" not in body:
+        raise HTTPException(status_code=422, detail="'tenant_id' is required")
+    if "threshold" not in body:
+        raise HTTPException(status_code=422, detail="'threshold' is required")
+    # Validate required per-item fields up-front so a missing key
+    # surfaces as a 422 instead of an uncaught KeyError inside the
+    # service. ``name_embedding`` is optional (skips Phase 2).
+    _REQUIRED_RESOLVE = {"canonical_name", "entity_type"}
+    for item in items:
+        missing = _REQUIRED_RESOLVE - item.keys()
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=(f"item at input_idx {item.get('input_idx')!r} missing fields: {sorted(missing)}"),
+            )
+    _validate_input_idxs(items)
+
+    # Numeric coercion before the service call so a non-numeric value
+    # from the client surfaces as a 422 rather than an uncaught
+    # ValueError/TypeError → 500.
+    try:
+        threshold = float(body["threshold"])
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail=f"'threshold' must be numeric (got {body['threshold']!r})",
+        )
+    try:
+        candidate_limit = int(body.get("candidate_limit", 3))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail=f"'candidate_limit' must be int (got {body.get('candidate_limit')!r})",
+        )
+
+    return await _svc.entity_bulk_resolve(
+        tenant_id=body["tenant_id"],
+        items=items,
+        threshold=threshold,
+        candidate_limit=candidate_limit,
+    )
+
+
+# ------------------------------------------------------------------
+# Graph
+# ------------------------------------------------------------------
+
+
+@router.post("/expand-graph")
+async def expand_graph(request: Request) -> dict:
+    body: dict = await request.json()
+    result = await _svc.entity_expand_graph(
+        seed_entity_ids=[UUID(eid) for eid in body["seed_entity_ids"]],
+        tenant_id=body["tenant_id"],
+        fleet_id=body.get("fleet_id"),
+        max_hops=body.get("max_hops", 2),
+        use_union=body.get("use_union", False),
+    )
+    return {str(eid): {"hop": hop, "weight": weight} for eid, (hop, weight) in result.items()}
+
+
+@router.get("/full-graph")
+async def get_full_graph(
+    tenant_id: str,
+    fleet_id: str | None = None,
+    caller_agent_id: str | None = None,
+    caller_tenant_id: str | None = None,
+    caller_fleet_ids: list[str] | None = Query(default=None),
+    caller_fleet_bound: bool = False,
+) -> dict:
+    entities, relations = await _svc.entity_get_full_graph(
+        tenant_id,
+        fleet_id,
+        caller_agent_id=caller_agent_id,
+        caller_tenant_id=caller_tenant_id,
+        caller_fleet_ids=_reader_fleets(caller_fleet_ids, caller_fleet_bound),
+    )
+    return {
+        "entities": [orm_to_dict(e, ENTITY_FIELDS) for e in entities],
+        "relations": [orm_to_dict(r, RELATION_FIELDS) for r in relations],
+    }
+
+
+# ------------------------------------------------------------------
+# Relations
+# ------------------------------------------------------------------
+
+
+@router.post("/relations")
+async def create_relation(request: Request) -> dict:
+    body: dict = await request.json()
+    try:
+        relation = await _svc.relation_add(body)
+    except ValueError as e:
+        # M-64. Without this the service's endpoint-ownership refusal would
+        # surface as a 500 — indistinguishable from storage being broken, which
+        # is the same conflation ``entity_add`` and ``create_memory_entity_link``
+        # already resolved as 409. A caller naming an entity it does not own is
+        # a client error.
+        raise HTTPException(status_code=409, detail=str(e))
+    except PermissionError as e:
+        # M-84: an agent's relation reaching outside its fleet. Nothing else
+        # here answers 403, so core-api can tell it from the 409 above.
+        raise HTTPException(status_code=403, detail=str(e))
+    return orm_to_dict(relation, RELATION_FIELDS)
+
+
+# ------------------------------------------------------------------
+# Memory-entity links
+# ------------------------------------------------------------------
+
+
+@router.post("/links")
+async def create_memory_entity_link(request: Request) -> dict:
+    body: dict = await request.json()
+    # Tenant guard, same shape as ``PATCH /entities/{entity_id}``: the body
+    # supplied only bare ``memory_id`` / ``entity_id`` / ``role``, so knowing two
+    # UUIDs was enough to create a graph edge across a tenant boundary (#1124).
+    # Removed from the body as well as read, because ``MemoryEntityLink`` has no
+    # ``tenant_id`` column — the join table is tenantless, which is the whole
+    # difficulty — and ``MemoryEntityLink(**data)`` would raise TypeError on it.
+    tenant_id = _require(body, "tenant_id")
+    del body["tenant_id"]
+    try:
+        link = await _svc.entity_add_entity_link(tenant_id, body)
+    except ValueError as e:
+        # H-05 follow-up: a caller-supplied memory_id/entity_id that does not
+        # exist, or a pair already linked, is a client error. It used to escape as
+        # an IntegrityError → 500, which core-api could not tell apart from
+        # storage being unreachable — so a bad id and an outage degraded
+        # identically. Same 409 mapping ``create_entity`` above already uses.
+        raise HTTPException(status_code=409, detail=str(e))
+    return orm_to_dict(link, MEMORY_ENTITY_LINK_FIELDS)
+
+
+@router.post("/links/bulk")
+async def bulk_upsert_memory_entity_links(request: Request) -> list[dict]:
+    """Idempotently create many memory→entity links in one round-trip.
+
+    Body: ``{"items": [{"input_idx", "memory_id", "entity_id", "role"}, ...]}``.
+    Response is aligned to input order with ``{"input_idx", "memory_id",
+    "entity_id", "role", "created": bool}`` — ``created=False`` means a
+    row with the same ``(memory_id, entity_id)`` PK already existed and
+    its prior ``role`` is preserved (matches today's find-then-create
+    flow which never overwrites role).
+
+    Cap: 500 items per request.
+
+    ``tenant_id`` is required and binds every item, on both ends. One tenant for
+    the request rather than one per item: a per-item tenant would let a single
+    batch span namespaces, which is what #1124 is about.
+    """
+    body: dict = await request.json()
+    tenant_id = _require(body, "tenant_id")
+    items = body.get("items", [])
+    if not isinstance(items, list):
+        raise HTTPException(status_code=422, detail="'items' must be a list")
+    if len(items) > 500:
+        raise HTTPException(
+            status_code=422,
+            detail=f"bulk-links capped at 500 items (got {len(items)})",
+        )
+    # Validate required per-item fields up-front so a missing key
+    # surfaces as a 422 instead of an uncaught KeyError inside the
+    # service.
+    _REQUIRED_LINK = {"memory_id", "entity_id", "role"}
+    for item in items:
+        missing = _REQUIRED_LINK - item.keys()
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=(f"item at input_idx {item.get('input_idx')!r} missing fields: {sorted(missing)}"),
+            )
+    # UUID shape validation at the router boundary — without this a
+    # malformed ``memory_id`` / ``entity_id`` would crash inside the
+    # service's ``UUID(...)`` call and surface as an uncaught 500.
+    for item in items:
+        for field in ("memory_id", "entity_id"):
+            try:
+                UUID(item[field])
+            except (ValueError, AttributeError):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"invalid {field} UUID at input_idx {item.get('input_idx')!r}",
+                )
+    _validate_input_idxs(items)
+    return await _svc.entity_bulk_upsert_links(tenant_id, items)
+
+
+@router.post("/memory-ids-by-entity-ids")
+async def get_memory_ids_by_entity_ids(request: Request) -> list[dict]:
+    body: dict = await request.json()
+    # This route's payload IS memory ids, and its caller looks them up next, so
+    # unscoped it handed out ids of other tenants' memories to fetch.
+    tenant_id = _require(body, "tenant_id")
+    entity_ids = [UUID(eid) for eid in body["entity_ids"]]
+    links = await _svc.entity_get_memory_ids_by_entity_ids(entity_ids, tenant_id)
+    return [{"memory_id": str(mid), "entity_id": str(eid), "role": role} for mid, eid, role in links]
+
+
+@router.post("/count-memories")
+async def count_memories_per_entity(request: Request) -> dict:
+    body: dict = await request.json()
+    # ``core-api``'s client has always sent ``tenant_id`` in this body; the route
+    # read only ``entity_ids`` and dropped it on the floor, so the count spanned
+    # every tenant sharing the entity. Nothing changes on the caller's side —
+    # this reads the field it was already being sent.
+    tenant_id = _require(body, "tenant_id")
+    entity_ids = [UUID(eid) for eid in body["entity_ids"]]
+    fleets = body.get("caller_fleet_ids")
+    counts = await _svc.entity_count_memories_per_entity(
+        entity_ids,
+        tenant_id,
+        caller_agent_id=body.get("caller_agent_id"),
+        caller_tenant_id=body.get("caller_tenant_id"),
+        caller_fleet_ids=_reader_fleets(fleets, fleets is not None),
+    )
+    return {str(eid): count for eid, count in counts.items()}
+
+
+# ------------------------------------------------------------------
+# Crystallizer / health helpers
+# ------------------------------------------------------------------
+
+
+@router.get("/orphaned")
+async def find_orphaned_entities(tenant_id: str, fleet_id: str | None = None) -> list[dict]:
+    # ``fleet_id`` was hardcoded None here while the service below has always
+    # taken it, so a fleet-scoped crystallizer report carried TENANT-WIDE
+    # counts. Optional with a None default, so a storage instance deployed
+    # ahead of core-api keeps serving callers that don't send it.
+    rows = await _svc.entity_find_orphaned(tenant_id, fleet_id=fleet_id)
+    return [{"id": str(row[0]), "canonical_name": row[1]} for row in rows]
+
+
+@router.get("/broken-links")
+async def find_broken_entity_links(tenant_id: str, fleet_id: str | None = None) -> list[dict]:
+    rows = await _svc.entity_find_broken_links(tenant_id, fleet_id=fleet_id)
+    return [{"memory_id": str(row[0]), "entity_id": str(row[1])} for row in rows]
+
+
+# ------------------------------------------------------------------
+# Entity-linking pipeline (Fix 2 Ph6) — coarse run-op endpoints that
+# fold the four core-api entity-linking steps' direct DB access behind
+# HTTP. Each validates its OWN contract (don't trust core-api): 422 on
+# missing tenant_id / non-numeric tuning params / non-list inputs. All
+# tuning constants travel in the body (storage must not import core_api).
+# Placed ABOVE the parameterised ``/{entity_id}`` routes so the literal
+# paths win the match.
+# ------------------------------------------------------------------
+
+
+@router.post("/resolve")
+async def resolve_entities(request: Request) -> dict:
+    """Merge duplicate entities (the full ``resolve_entities`` step) in ONE
+    atomic txn with a SAVEPOINT per duplicate.
+
+    Body ``{tenant_id, fleet_id?, batch_size, threshold, candidate_limit}``.
+    Returns ``{merge_count, clusters, cluster_errors, merged_entity_ids}``."""
+    body: dict = await request.json()
+    tenant_id = _require(body, "tenant_id")
+    batch_size = int(_require_number(body, "batch_size"))
+    threshold = _require_number(body, "threshold")
+    candidate_limit = int(_require_number(body, "candidate_limit"))
+    return await _svc.entity_resolve_duplicates(
+        tenant_id=tenant_id,
+        fleet_id=body.get("fleet_id"),
+        batch_size=batch_size,
+        threshold=threshold,
+        candidate_limit=candidate_limit,
+    )
+
+
+@router.post("/discover-cross-links")
+async def discover_cross_links(request: Request) -> dict:
+    """Link under-connected memories to similar entities (targeted + batch),
+    ONE atomic txn.
+
+    Body ``{tenant_id, fleet_id?, batch_size, threshold, text_verify,
+    target_memory_ids?}``. A non-empty ``target_memory_ids`` selects targeted
+    mode. Returns ``{links_created}``. 422 on a malformed UUID in
+    ``target_memory_ids`` (surfaced as a clean error instead of a 500 from the
+    ``ANY(CAST(... AS uuid[]))`` cast)."""
+    body: dict = await request.json()
+    tenant_id = _require(body, "tenant_id")
+    batch_size = int(_require_number(body, "batch_size"))
+    threshold = _require_number(body, "threshold")
+    target_memory_ids = body.get("target_memory_ids")
+    if target_memory_ids is not None:
+        if not isinstance(target_memory_ids, list):
+            raise HTTPException(status_code=422, detail="target_memory_ids (list) is required")
+        try:
+            for mid in target_memory_ids:
+                UUID(str(mid))
+        except (ValueError, AttributeError) as exc:
+            raise HTTPException(status_code=422, detail=f"invalid target_memory_ids: {exc}") from exc
+    return await _svc.entity_discover_cross_links(
+        tenant_id=tenant_id,
+        fleet_id=body.get("fleet_id"),
+        batch_size=batch_size,
+        threshold=threshold,
+        text_verify=bool(body.get("text_verify", True)),
+        target_memory_ids=target_memory_ids,
+    )
+
+
+@router.post("/infer-relations")
+async def infer_relations(request: Request) -> dict:
+    """Infer 'related_to' relations from co-occurrence (the
+    ``infer_relations`` step), ONE atomic txn.
+
+    Body ``{tenant_id, fleet_id?, batch_size, min_cooccurrence,
+    reinforce_delta, max_relation_weight}``. Returns
+    ``{relations_created, relations_reinforced}``."""
+    body: dict = await request.json()
+    tenant_id = _require(body, "tenant_id")
+    batch_size = int(_require_number(body, "batch_size"))
+    min_cooccurrence = int(_require_number(body, "min_cooccurrence"))
+    reinforce_delta = _require_number(body, "reinforce_delta")
+    max_relation_weight = _require_number(body, "max_relation_weight")
+    return await _svc.entity_infer_relations(
+        tenant_id=tenant_id,
+        fleet_id=body.get("fleet_id"),
+        batch_size=batch_size,
+        min_cooccurrence=min_cooccurrence,
+        reinforce_delta=reinforce_delta,
+        max_relation_weight=max_relation_weight,
+    )
+
+
+@router.post("/list-null-embeddings")
+async def list_null_embeddings(request: Request) -> dict:
+    """Entities needing a name embedding (read half of backfill).
+
+    Body ``{tenant_id, fleet_id?, batch_size, after_id?}``. Returns
+    ``{rows:[{id, canonical_name}, ...]}`` ordered by id, after ``after_id``
+    when given (L-174)."""
+    body: dict = await request.json()
+    tenant_id = _require(body, "tenant_id")
+    batch_size = int(_require_number(body, "batch_size"))
+    after_id = body.get("after_id")
+    if after_id is not None:
+        try:
+            after_id = str(UUID(str(after_id)))
+        except ValueError:
+            raise HTTPException(status_code=422, detail="'after_id' must be a UUID")
+    rows = await _svc.entity_list_null_embeddings(
+        tenant_id=tenant_id,
+        fleet_id=body.get("fleet_id"),
+        batch_size=batch_size,
+        after_id=after_id,
+    )
+    return {"rows": rows}
+
+
+@router.post("/set-embeddings")
+async def set_embeddings(request: Request) -> dict:
+    """Write back computed name embeddings (write half of backfill), ONE
+    atomic txn.
+
+    Body ``{tenant_id, updates:[{id, embedding:[float,...]}, ...]}``. Returns
+    ``{backfill_count}``. 422 on a malformed ``id`` UUID, or an ``embedding``
+    that isn't a list of exactly ``VECTOR_DIM`` numbers, in ``updates``."""
+    body: dict = await request.json()
+    tenant_id = _require(body, "tenant_id")
+    updates = body.get("updates")
+    if not isinstance(updates, list):
+        raise HTTPException(status_code=422, detail="updates (list) is required")
+    try:
+        for u in updates:
+            UUID(str(u["id"]))
+            # Validate ``embedding`` fully: the service does ``u["embedding"]``
+            # (KeyError) and binds it straight to the ``vector(VECTOR_DIM)``
+            # column, so anything malformed reaches the asyncpg/pgvector codec
+            # and 500s otherwise. Reject: missing key, non-list, wrong length
+            # (incl. empty), non-numeric elements, and bools (``bool`` is an
+            # ``int`` subclass that serialises wrong / silently stores 0|1 —
+            # same carve-out as ``_require_number``).
+            emb = u["embedding"]
+            if (
+                not isinstance(emb, list)
+                or len(emb) != VECTOR_DIM
+                or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in emb)
+            ):
+                raise ValueError(f"embedding must be a list of {VECTOR_DIM} numbers")
+    except (ValueError, AttributeError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=f"invalid updates: {exc}") from exc
+    backfill_count = await _svc.entity_set_embeddings(tenant_id=tenant_id, updates=updates)
+    return {"backfill_count": backfill_count}
+
+
+# ------------------------------------------------------------------
+# Parameterised /{entity_id} routes — MUST stay at the bottom
+# ------------------------------------------------------------------
+
+
+@router.get("/{entity_id}")
+async def get_entity(
+    entity_id: UUID,
+    tenant_id: str,
+    caller_agent_id: str | None = None,
+    caller_tenant_id: str | None = None,
+    caller_fleet_ids: list[str] | None = Query(default=None),
+    caller_fleet_bound: bool = False,
+) -> dict:
+    # Read guard, the mirror of ``PATCH /entities/{entity_id}`` above: the route
+    # took a bare UUID and returned the whole row, so knowing an id was enough to
+    # read another tenant's entity. ``tenant_id`` is a required query parameter —
+    # omitting it is a 422, not a fetch by primary key. An agent reader also gets
+    # the 404 for an entity the list hides from it (M-83).
+    entity = await _svc.entity_get_by_id(
+        entity_id,
+        tenant_id,
+        caller_agent_id=caller_agent_id,
+        caller_tenant_id=caller_tenant_id,
+        caller_fleet_ids=_reader_fleets(caller_fleet_ids, caller_fleet_bound),
+    )
+    if entity is None:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    return orm_to_dict(entity, ENTITY_FIELDS)
+
+
+@router.patch("/{entity_id}")
+async def update_entity(entity_id: UUID, request: Request) -> dict:
+    body: dict = await request.json()
+    # Tenant guard, same shape as ``PATCH /memories/{memory_id}``: ``tenant_id``
+    # is the row's home tenant, removed from the body so it scopes the fetch
+    # rather than landing as a patched column (``Entity`` has a ``tenant_id``
+    # column). ``_ENTITY_UPDATABLE_FIELDS`` would drop it anyway; both are kept
+    # because either alone closes the hop and they fail independently.
+    tenant_id = _require(body, "tenant_id")
+    del body["tenant_id"]
+    entity = await _svc.entity_update(entity_id, tenant_id, body)
+    if entity is None:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    return orm_to_dict(entity, ENTITY_FIELDS)
+
+
+@router.post("/{entity_id}/merge")
+async def merge_entity(entity_id: UUID, request: Request) -> dict:
+    """An upsert's write into an existing entity (L-46): merge, never replace.
+
+    ``attributes`` are what the upsert adds: a key it names takes its value,
+    every other stored key stays, and ``_aliases`` is the union. An optional
+    ``name_embedding`` only fills a row that has none. ``PATCH`` above is the
+    replacing edit; this is what the REST upsert uses instead of PATCHing back
+    a snapshot it merged itself, which lost a concurrent writer's keys. Same
+    tenant guard and 404 as ``PATCH``. Returns the merged row.
+    """
+    body: dict = await request.json()
+    tenant_id = _require(body, "tenant_id")
+    attributes = body.get("attributes") or {}
+    if not isinstance(attributes, dict):
+        raise HTTPException(status_code=422, detail="'attributes' must be an object")
+    entity = await _svc.entity_merge(entity_id, tenant_id, attributes, body.get("name_embedding"))
+    if entity is None:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    return orm_to_dict(entity, ENTITY_FIELDS)
+
+
+@router.get("/{entity_id}/with-memories")
+async def get_entity_with_linked_memories(
+    entity_id: UUID,
+    tenant_id: str,
+    caller_agent_id: str | None = None,
+    caller_tenant_id: str | None = None,
+    caller_fleet_ids: list[str] | None = Query(default=None),
+    caller_fleet_bound: bool = False,
+) -> dict:
+    # ``tenant_id`` was optional and fell back to ``entity.tenant_id`` — the
+    # tenant of the row being addressed. That is not a check: it is satisfied by
+    # construction for any id, and an attacker closes it by simply omitting the
+    # parameter. The allowlist note calling it "self-authorizing" is retired
+    # with it. Required now; the downstream link read was already scoped.
+    # An agent reader gets the 404 for an entity the list hides from it (M-83).
+    entity = await _svc.entity_get_by_id(
+        entity_id,
+        tenant_id,
+        caller_agent_id=caller_agent_id,
+        caller_tenant_id=caller_tenant_id,
+        caller_fleet_ids=_reader_fleets(caller_fleet_ids, caller_fleet_bound),
+    )
+    if entity is None:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    rows = await _svc.entity_get_linked_memories(entity_id, tenant_id)
+    return {
+        "entity": orm_to_dict(entity, ENTITY_FIELDS),
+        "linked_memories": [
+            {
+                "link": orm_to_dict(link, MEMORY_ENTITY_LINK_FIELDS),
+                "memory": orm_to_dict(memory, MEMORY_FIELDS),
+            }
+            for link, memory in rows
+        ],
+    }
+
+
+@router.get("/{entity_id}/relations")
+async def get_outgoing_relations(
+    entity_id: UUID,
+    tenant_id: str,
+) -> list[dict]:
+    # Same retired fallback as ``/with-memories`` above, and the disclosure here
+    # is wider: the response carries each target entity in full, so an unscoped
+    # call walked one hop out into another tenant's graph.
+    entity = await _svc.entity_get_by_id(entity_id, tenant_id)
+    if entity is None:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    rows = await _svc.relation_get_outgoing(entity_id, tenant_id)
+    return [
+        {
+            "relation": orm_to_dict(rel, RELATION_FIELDS),
+            "target": orm_to_dict(target, ENTITY_FIELDS),
+        }
+        for rel, target in rows
+    ]

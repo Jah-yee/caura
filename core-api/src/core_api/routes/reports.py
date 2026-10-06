@@ -1,0 +1,786 @@
+"""Report API — ``GET /api/v1/reports``.
+
+Daily/weekly governed activity report — "what each agent did" — backing the
+report → product-page → agent-self-report flow (an agent fetches its own report
+and surfaces it in its 1:1 with its owner, or in its group). Caura returns the
+governed data; the agent's runtime does the messaging.
+
+Two-check governed read (order matters):
+
+1. **Authorization (authoritative, server-verified).** ``resolve_caller_and_gate``
+   resolves the caller (gateway-verified ``X-Agent-ID`` > query > default) and
+   gates on trust (scope=agent → trust ≥ 1). The data is then scoped to the
+   caller's own tenant + own fleet (team/org-visible) + own agent rows — exactly
+   what the caller can already recall. Cross-fleet / tenant-wide reporting is
+   deliberately NOT exposed here (would need trust ≥ 2; future admin surface).
+
+2. **Destination down-filter (client-asserted, NARROW-ONLY).** The agent declares
+   the delivery *audience class* it will surface into. This can only ever
+   *narrow* the result from check 1 — never widen it. Absent/unknown destination
+   ⇒ fail closed to the most restrictive class.
+
+The corpus is restricted to **durable, decision-bearing** memories: episodic
+activity-log types and the unattributed ``main`` firehose agent are excluded so
+the report reflects durable per-agent work rather than the raw activity stream.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from collections.abc import Awaitable
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+
+from core_api.agent_ids import canonical_service_agent_id
+from core_api.auth import AuthContext, get_auth_context
+from core_api.clients.storage_client import get_storage_client
+from core_api.errors import (
+    AUTH_CROSS_TENANT_REQUIRED,
+    coded_detail,
+)
+from core_api.services.agent_digest import run_agent_digest
+from core_api.services.agent_service import lookup_agent
+from core_api.services.audit_service import log_action
+from core_api.services.caller_identity import resolve_caller_and_gate
+from core_api.services.report_corpus import (
+    NON_COHESIVE_TITLE_REGEX,
+    NON_DURABLE_TYPES,
+    RESERVED_FIREHOSE_AGENTS,
+)
+from core_api.services.report_corpus import (
+    PERIOD_DAYS as _PERIOD_DAYS,
+)
+from core_api.services.report_corpus import (
+    is_cohesive as _cohesive,
+)
+
+router = APIRouter(tags=["Reports"])
+logger = logging.getLogger(__name__)
+
+# Corpus rules (NON_DURABLE_TYPES / RESERVED_FIREHOSE_AGENTS /
+# NON_COHESIVE_TITLE_REGEX / _cohesive) are shared with the digest generator —
+# see core_api.services.report_corpus.
+
+# Delivery audience classes — an abstraction over messaging platforms
+# (WhatsApp / Teams / Slack / Claude-Code map to one of these at the edge).
+AUDIENCE_OWNER_1TO1 = "owner_1to1"
+AUDIENCE_GROUP = "internal_group"
+AUDIENCE_PRIVATE = "private_session"
+AUDIENCE_EXTERNAL = "external"
+_KNOWN_DESTINATIONS = {AUDIENCE_OWNER_1TO1, AUDIENCE_GROUP, AUDIENCE_PRIVATE, AUDIENCE_EXTERNAL}
+# Audiences that may see per-agent detail + learning titles. ``external`` (and any
+# unknown value, which we coerce to ``external``) is fail-closed to summary only.
+_DETAIL_AUDIENCES = {AUDIENCE_OWNER_1TO1, AUDIENCE_GROUP, AUDIENCE_PRIVATE}
+# "self" audiences scope to the caller's OWN contributions (narrowest).
+_SELF_AUDIENCES = {AUDIENCE_OWNER_1TO1, AUDIENCE_PRIVATE}
+
+_LEARNING_LIMIT = 5
+_HIGHLIGHTS_LIMIT = 5
+_TOP_AGENTS_LIMIT = 25
+# PRE-FILTER fetch sizes, NOT final result sizes. The list API (see the warning
+# at _cohesive() below) cannot push exclude_memory_types/exclude_agent_ids/
+# exclude_title_regex server-side, so these rows are fetched raw and the noise
+# (episode/firehose/heartbeat) is dropped client-side by _cohesive(). Both must
+# stay large enough that the POST-_cohesive() pool still exceeds the downstream
+# limits (_LEARNING_LIMIT=5, _HIGHLIGHTS_LIMIT=5) even in noisy corpora — a
+# ~3-5x margin over the known exclusion rate.
+#
+# Recent in-window durable rows (created_at desc) feeding LEARNING (recent
+# insights) and the working-on LANES (keyword categorization).
+_DURABLE_FETCH_LIMIT = 600  # was 200
+# Separate recall-sorted fetch backing VALUE HIGHLIGHTS + the spotlight headline,
+# so "most-reused" is the true top-by-recall in the window — not merely the
+# most-reused among the most-recent rows.
+_HIGHLIGHTS_FETCH_LIMIT = 150  # was 40
+# Activity-over-time trend length (daily buckets), independent of the period toggle.
+_TREND_DAYS = 14
+# "What the org is working on" lanes — heuristic keyword match on title/content,
+# with a memory-type fallback so every durable memory lands in a lane.
+_LANE_KEYWORDS = {
+    "Governing": (
+        "rule",
+        "policy",
+        "keystone",
+        "governance",
+        "complian",
+        "trust",
+        "permission",
+        "access",
+        "audit",
+        "security",
+        "regulat",
+        "privacy",
+        "gdpr",
+        "pii",
+        "insider",
+    ),
+    "Building": (
+        "build",
+        "ship",
+        "feature",
+        "implement",
+        "deploy",
+        "product",
+        "integration",
+        "pipeline",
+        "engine",
+        "migration",
+        "release",
+        "launch",
+        "develop",
+        "signal",
+        "portfolio",
+    ),
+    "Operating": (
+        "monitor",
+        "incident",
+        "alert",
+        "outage",
+        "health",
+        "disk",
+        "dba",
+        "reliab",
+        "restart",
+        "latency",
+        "downtime",
+        "backup",
+        "on-call",
+        "stall",
+    ),
+}
+# Each lane's keywords, anchored at a word START (``\b``) but deliberately NOT at
+# a word end, so the prefixes above still match their inflections — "complian"
+# still matches compliance/compliant, "reliab" reliability, "build" building.
+#
+# The anchor is what is load-bearing. Bare substring matching fired on a keyword
+# buried inside an unrelated word, and the collisions are common English, not
+# exotica: "feedback" contains "dba" (Operating), "ownership" and "partnership"
+# contain "ship" (Building), "install" contains "stall" (Operating), "distrust"
+# contains "trust" (Governing). Each one silently outranked the memory-type
+# fallback, so a `decision` whose content merely said "customer feedback" was
+# filed under Operating rather than Governing.
+#
+# It also made classification depend on random data: the tests seed a
+# ``uuid4().hex`` id into content, and any hex id containing "dba" — ~0.15% of
+# them, since d/b/a are all hex digits — moved a memory to Operating. That is
+# the flake in test_report_internal_group_durable_filter (CI run 31636233722).
+#
+# Trade accepted: prefixed forms no longer match ("rebuild", "redeploy",
+# "unhealthy", "unreliable"). They fall through to the memory-type lane, which
+# is the intended default for text this heuristic cannot place, and that is a
+# better failure than matching inside arbitrary words.
+_LANE_PATTERNS = {
+    lane: re.compile(r"\b(?:" + "|".join(re.escape(k) for k in keywords) + r")")
+    for lane, keywords in _LANE_KEYWORDS.items()
+}
+_TYPE_LANE = {
+    "rule": "Governing",
+    "decision": "Governing",
+    "preference": "Governing",
+    "commitment": "Governing",
+    "insight": "Governing",
+    "plan": "Building",
+    "task": "Building",
+    "action": "Building",
+    "intention": "Building",
+    "semantic": "Building",
+    "fact": "Building",
+    "outcome": "Operating",
+    "episode": "Operating",
+    "cancellation": "Operating",
+}
+
+
+@router.get("/reports")
+async def get_report(
+    tenant_id: str = Query(..., description="Tenant scope (validated against the calling credential)."),
+    period: str = Query("week", description="Reporting window: 'day' or 'week'."),
+    destination: str = Query(
+        AUDIENCE_EXTERNAL,
+        description=(
+            "Delivery audience class the agent will surface this into: "
+            "'owner_1to1', 'internal_group', 'private_session', or 'external'. "
+            "Narrows the result; never widens it. Unknown/absent ⇒ most restrictive."
+        ),
+    ),
+    agent_id: str | None = Query(
+        None, description="Caller agent id (gateway-verified X-Agent-ID wins when present)."
+    ),
+    scope: str = Query(
+        "own",
+        description=(
+            "Data breadth: 'own' (home tenant, default) or 'org' (aggregate across "
+            "every tenant the credential may read — requires a cross-tenant read key)."
+        ),
+    ),
+    readable_tenant_ids: str | None = Query(
+        None,
+        description=(
+            "CSV of tenant ids to aggregate under scope='org'. Honored ONLY for the "
+            "internal admin credential (the org-report proxy); every other caller is "
+            "pinned to its own credential's readable set and this value is ignored."
+        ),
+    ),
+    auth: AuthContext = Depends(get_auth_context),
+) -> dict:
+    # Tenant scope is validated against the credential: agent creds can only
+    # report on their own tenant; admin keys may target any tenant.
+    auth.enforce_tenant(tenant_id)
+    if period not in _PERIOD_DAYS:
+        raise HTTPException(status_code=422, detail=f"Invalid period '{period}'. Use 'day' or 'week'.")
+    if scope not in ("own", "org"):
+        raise HTTPException(status_code=422, detail="Invalid scope. Use 'own' or 'org'.")
+
+    # ── Org breadth ("true org level" = a credential capability, not a
+    # memory scope). ``scope='org'`` aggregates across the caller's readable
+    # tenant set and REQUIRES a cross-tenant read credential — a home-only key
+    # cannot widen. Attribution still lives in each tenant's writes; the widened
+    # breakdown keeps Inv-Scope (no agent_id ⇒ excludes ``scope_agent``). ──
+    org_mode = scope == "org"
+    if org_mode and not (auth.is_admin or auth.is_cross_tenant_read):
+        raise HTTPException(
+            status_code=403,
+            detail=coded_detail(
+                AUTH_CROSS_TENANT_REQUIRED, "scope='org' requires a cross-tenant read credential."
+            ),
+        )
+    # The internal admin credential (the enterprise org-report proxy) may pass an
+    # explicit tenant set — the proxy has already org-admin-gated the caller and
+    # resolved the org's own tenants. Every other caller is pinned to its own
+    # credential's readable set; a client-supplied value is ignored so a
+    # cross-tenant agent cannot widen past its grant.
+    if org_mode and auth.is_admin and readable_tenant_ids:
+        readable: list[str] | None = [t.strip() for t in readable_tenant_ids.split(",") if t.strip()]
+    else:
+        readable = auth.readable_tenant_ids if org_mode else None
+
+    # ── Check 1: authorization. ──
+    # ``enforce_tenant`` (above) is the base authz: the caller is a member/admin
+    # of this tenant. An AGENT caller (gateway-verified ``X-Agent-ID`` or an
+    # explicit ``agent_id``) is additionally gated on trust ≥ 1 and resolved for
+    # the self view. A human/tenant dashboard caller has no agent identity — it
+    # gets the tenant GROUP view (never another agent's private rows; the
+    # breakdown's own visibility scoping excludes ``scope_agent`` when no agent
+    # is set). This avoids 403-ing a logged-in human on the unregistered default
+    # agent id.
+    asserted_agent = auth.effective_agent_id(agent_id)
+    caller_agent_id: str | None = None
+    if asserted_agent:
+        caller_agent_id = await resolve_caller_and_gate(
+            auth,
+            tenant_id=tenant_id,
+            body_agent_id=asserted_agent,
+            scope="agent",
+            action="reports",
+        )
+
+    # Caller's agent row → fleet (data scope) + belonging (audience target).
+    sc = get_storage_client()
+    caller = (await lookup_agent(tenant_id, caller_agent_id) or {}) if caller_agent_id else {}
+    caller_fleet = caller.get("fleet_id")
+    belonging_type = caller.get("belonging_type") or "service"
+    owner_ref = caller.get("owner_ref")
+
+    # ── Check 2: destination → data scope (NARROW-ONLY; unknown ⇒ external). ──
+    dest = destination if destination in _KNOWN_DESTINATIONS else AUDIENCE_EXTERNAL
+    now = datetime.now(UTC)
+    window_start = now - timedelta(days=_PERIOD_DAYS[period])
+
+    breakdown_query: dict = {
+        "tenant_id": tenant_id,
+        "created_after": window_start.isoformat(),
+        "exclude_memory_types": list(NON_DURABLE_TYPES),
+        "exclude_agent_ids": list(RESERVED_FIREHOSE_AGENTS),
+        "exclude_title_regex": NON_COHESIVE_TITLE_REGEX,
+        # Count agent-private (scope_agent) durable writes in the AGGREGATES
+        # (totals/by_type/by_agent/quality/trend). These are real, decision-
+        # bearing memories an agent kept private — excluding them made
+        # durable_memories_written measure "team-visible" rather than "written",
+        # and disproportionately undercounted privacy-heavy tenants. Ignored on
+        # the self path (agent_id set), which already scopes visibility to the
+        # caller.
+        #
+        # No memory title, content or memory id crosses into the response from
+        # here — the projection is (memory_type, agent_id, status[, tenant_id],
+        # COUNT(*)). Counts ARE bucketed by agent, so on this branch, where no
+        # ``agent_id`` is set, EVERY agent's private rows are counted, not just
+        # the caller's: an agent whose whole window is private still appears in
+        # by_agent with its true volume. That is the trade the paragraph above
+        # argues for, stated rather than glossed.
+        #
+        # Whether private CONTENT surfaces is a separate decision, made by
+        # ``is_self_scope`` below — see U42/M-31 there.
+        "include_scope_agent": True,
+    }
+    # The audience/data-scope decision, resolved ONCE. Both the breakdown below
+    # and the visibility identity on the detail path key off it, and M-31 was
+    # exactly those two drifting apart: this branch was right and ``list_query``
+    # re-derived the predicate by hand and got it wrong. Sharing the variable is
+    # what keeps them together; a comment claiming they match is not.
+    is_self_scope = False
+    if org_mode:
+        # Org-wide: aggregate across every tenant the credential may read.
+        # Team/org-visible only (no agent_id ⇒ excludes scope_agent); the
+        # breakdown returns a per-tenant ``by_tenant`` when the set spans >1.
+        breakdown_query["readable_tenant_ids"] = readable
+        scope_label = "org"
+    elif dest in _SELF_AUDIENCES and caller_agent_id:
+        # Narrowest: only the caller's own contributions.
+        breakdown_query["agent_id"] = caller_agent_id
+        scope_label = "self"
+        is_self_scope = True
+    else:
+        # internal_group / external: the caller's own fleet (team/org-visible).
+        # ``external`` shares the same query but its detail is stripped below.
+        if caller_fleet:
+            breakdown_query["fleet_id"] = caller_fleet
+        scope_label = "group"
+
+    breakdown = await sc.memory_stats_breakdown(breakdown_query)
+    by_agent = {
+        a: c for a, c in (breakdown.get("by_agent") or {}).items() if a not in RESERVED_FIREHOSE_AGENTS
+    }
+    by_type = breakdown.get("by_type") or {}
+    durable_total = int(breakdown.get("total", 0) or 0)
+    by_tenant = breakdown.get("by_tenant") or {}  # populated only in org scope (>1 tenant)
+
+    per_agent: list[dict] = []
+    learning: list[dict] = []
+    value_highlights: list[dict] = []
+    spotlight: dict | None = None
+    trend: list[dict] = []
+    working_on: dict = {}
+    quality: dict = {}
+    if dest in _DETAIL_AUDIENCES or org_mode:
+
+        def _title(m: dict) -> str:
+            return m.get("title") or (m.get("metadata") or {}).get("summary") or "(untitled)"
+
+        def _rank(m: dict) -> tuple:
+            return (m.get("recall_count") or 0, m.get("created_at") or "")
+
+        # ``_cohesive`` (imported from report_corpus) drops the noise the
+        # /memories/list API can't exclude server-side — AFTER the fetch limit is
+        # consumed, which is why _DURABLE_FETCH_LIMIT / _HIGHLIGHTS_FETCH_LIMIT
+        # over-fetch: the surviving pool must still exceed the downstream
+        # _LEARNING_LIMIT / _HIGHLIGHTS_LIMIT slices.
+
+        # U42/M-31. The VISIBILITY identity — self path only. Storage admits
+        # ``scope_agent`` rows authored by this agent when it is set and
+        # excludes all of them when it is not (``memory_list_by_filters``), so
+        # on a group/org report it puts the caller's OWN private titles into
+        # learning / value_highlights / working_on / the spotlight headline.
+        # It used to be passed unconditionally.
+        visibility_agent_id = caller_agent_id if is_self_scope else None
+
+        # Recent-ordered fetch → LEARNING (recent insights) + working-on LANES.
+        list_query: dict = {
+            "tenant_id": tenant_id,
+            "caller_agent_id": visibility_agent_id,
+            "created_after": window_start.isoformat(),
+            "sort": "created_at",
+            "order": "desc",
+            "limit": _DURABLE_FETCH_LIMIT,
+        }
+        # Self audiences scope to the caller's OWN authored rows, so the
+        # list-derived sections (learning, value_highlights, working_on) stay
+        # consistent with the breakdown-derived counts (durable_total, per_agent).
+        # NOTE: /memories/list filters authorship via ``written_by`` (``agent_id``
+        # is not read on that path). That is a DIFFERENT knob from the visibility
+        # identity above — a row can be visible without being authored by the
+        # caller, which is the whole group view.
+        if is_self_scope:
+            list_query["written_by"] = caller_agent_id
+        if org_mode:
+            list_query["readable_tenant_ids"] = readable
+        elif dest == AUDIENCE_GROUP and caller_fleet:
+            list_query["fleet_id"] = caller_fleet
+        # Recall-sorted fetch → VALUE HIGHLIGHTS + spotlight headline (true
+        # top-by-recall, not merely the most-reused among the most-recent rows).
+        # Derived from list_query AFTER the written_by/fleet/readable conditionals.
+        highlights_query = dict(list_query, sort="recall_count", limit=_HIGHLIGHTS_FETCH_LIMIT)
+
+        # ── Phase 1: independent storage reads, concurrently. The agent
+        # leaderboard (group only) and the trend fetch (group/org only) are
+        # conditional. ──
+        want_trend = dest == AUDIENCE_GROUP or org_mode
+        want_agents = dest == AUDIENCE_GROUP and not org_mode
+        phase1: dict[str, Awaitable[Any]] = {
+            "recent": sc.list_memories_by_filters(list_query),
+            "recall": sc.list_memories_by_filters(highlights_query),
+        }
+        if want_agents:
+            phase1["agents"] = sc.list_agents(tenant_id, caller_fleet)
+        if want_trend:
+            # Activity-over-time trend (group/org only). Built here — inside the
+            # guard — so trend_query is a concrete dict, not dict | None.
+            trend_query: dict = {
+                "tenant_id": tenant_id,
+                "since": (now - timedelta(days=_TREND_DAYS)).isoformat(),
+                "exclude_memory_types": list(NON_DURABLE_TYPES),
+                "exclude_agent_ids": list(RESERVED_FIREHOSE_AGENTS),
+                "exclude_title_regex": NON_COHESIVE_TITLE_REGEX,
+                # Match the breakdown: the trend must count private durable rows
+                # too, or the daily line won't sum to durable_memories_written.
+                "include_scope_agent": True,
+            }
+            if org_mode:
+                trend_query["readable_tenant_ids"] = readable
+            elif caller_fleet:
+                trend_query["fleet_id"] = caller_fleet
+            phase1["trend"] = sc.memory_daily_durable_counts(trend_query)
+        p1_keys = list(phase1)
+        p1_vals = await asyncio.gather(*(phase1[k] for k in p1_keys))
+        p1 = dict(zip(p1_keys, p1_vals))
+
+        durable = [m for m in (p1["recent"] or []) if _cohesive(m)]
+        top_durable = [m for m in (p1["recall"] or []) if _cohesive(m)]
+
+        # Per-agent leaderboard, joined with belonging metadata. Group = the whole
+        # fleet (list_agents); self = just the caller's own row (already fetched);
+        # org scope skips the join (list_agents is per-tenant, can't cover the
+        # readable set — cross-tenant agents get null).
+        belong_by_id: dict[str, dict] = {}
+        if not org_mode:
+            if dest == AUDIENCE_GROUP:
+                agent_rows = p1.get("agents") or []
+            elif is_self_scope:
+                agent_rows = [caller] if caller else []
+            else:
+                agent_rows = []
+            for row in agent_rows:
+                aid = row.get("agent_id")
+                if aid:
+                    belong_by_id[aid] = row
+        for aid, cnt in sorted(by_agent.items(), key=lambda kv: kv[1], reverse=True)[:_TOP_AGENTS_LIMIT]:
+            row = belong_by_id.get(aid, {})
+            per_agent.append(
+                {
+                    "agent_id": aid,
+                    "display_name": row.get("display_name"),
+                    "belonging_type": row.get("belonging_type"),
+                    "durable_writes": cnt,
+                }
+            )
+
+        # Learning: most recent distilled insights in the window.
+        learning = [
+            {"title": _title(m), "created_at": m.get("created_at")}
+            for m in durable
+            if m.get("memory_type") == "insight"
+        ][:_LEARNING_LIMIT]
+
+        # Value highlights: the most-reused (all-time) durable knowledge authored
+        # in-window. NOTE: recall_count is a lifetime counter — Caura has no
+        # per-period recall log — so this is not "reused *this* period".
+        value_highlights = [
+            {
+                "title": _title(m),
+                "type": m.get("memory_type"),
+                "recall_count": m.get("recall_count") or 0,
+                "agent_id": m.get("agent_id"),
+            }
+            for m in top_durable[:_HIGHLIGHTS_LIMIT]
+        ]
+
+        # Spotlight: the top contributor + their headline (highest-recall) memory.
+        if per_agent:
+            top = per_agent[0]
+            # Search a deduped union of both fetches so the headline is the top
+            # agent's highest-recall in-window memory, whether it surfaced via the
+            # recall-sorted or the recent-ordered fetch.
+            pool = list({m.get("id"): m for m in (*top_durable, *durable)}.values())
+            authored = sorted(
+                (m for m in pool if m.get("agent_id") == top["agent_id"]),
+                key=_rank,
+                reverse=True,
+            )
+            spotlight = {
+                "agent_id": top["agent_id"],
+                "durable_writes": top["durable_writes"],
+                "headline": (
+                    {"title": _title(authored[0]), "type": authored[0].get("memory_type")}
+                    if authored
+                    else None
+                ),
+            }
+
+        # Working-on lanes: heuristic categorization of the window's durable work
+        # (keyword match on title/content, else a memory-type fallback).
+        lanes: dict[str, dict] = {
+            name: {"count": 0, "items": []} for name in ("Governing", "Building", "Operating")
+        }
+        for m in durable:
+            text = (_title(m) + " " + (m.get("content") or "")).lower()
+            lane = next(
+                (name for name, pattern in _LANE_PATTERNS.items() if pattern.search(text)),
+                None,
+            )
+            if lane is None:
+                lane = _TYPE_LANE.get(m.get("memory_type") or "", "Building")
+            lanes[lane]["count"] += 1
+            if len(lanes[lane]["items"]) < 3:
+                lanes[lane]["items"].append(_title(m))
+        working_on = lanes
+
+        # Activity-over-time trend (group/org view): assembled from the Phase-1
+        # daily-durable-counts fetch, bucketed into the last _TREND_DAYS days.
+        if want_trend:
+            raw_counts = {r["day"]: r["count"] for r in (p1.get("trend") or [])}
+            trend = [
+                {
+                    "day": (now.date() - timedelta(days=d)).isoformat(),
+                    "count": raw_counts.get((now.date() - timedelta(days=d)).isoformat(), 0),
+                }
+                for d in reversed(range(_TREND_DAYS))
+            ]
+
+        # ── Quality: how good is the durable corpus (not just how much). ──
+        # reuse-rate by type, never-recalled %, recall concentration (top-6
+        # share), insight freshness, and the write→durable→reused funnel.
+        # Scope keys shared by the three (independent) quality calls below.
+        # ``include_scope_agent`` rides along so the funnel's "written" (full) and
+        # the insight-freshness corpus (ins) count private rows too — otherwise
+        # ``durable`` (which now includes them) could exceed ``written`` and break
+        # the write→durable→reused funnel invariant.
+        scope_keys = {
+            k: breakdown_query[k]
+            for k in ("tenant_id", "agent_id", "fleet_id", "readable_tenant_ids", "include_scope_agent")
+            if k in breakdown_query
+        }
+        # ── Phase 2: quality metrics + the two supporting breakdown calls run
+        # concurrently — all independent, and derived only from breakdown_query
+        # (already resolved), not from the main breakdown's results.
+        #   - memory_quality_metrics: reuse-rate/never/concentration over the corpus
+        #   - insight breakdown: lifetime insight corpus by status (freshness)
+        #   - funnel breakdown: full-corpus writes in the window (no excludes)
+        qm, ins, full = await asyncio.gather(
+            sc.memory_quality_metrics(breakdown_query),
+            sc.memory_stats_breakdown({**scope_keys, "memory_type": "insight"}),
+            sc.memory_stats_breakdown({**scope_keys, "created_after": window_start.isoformat()}),
+        )
+        q_total = int(qm.get("total", 0) or 0)
+        q_reused = int(qm.get("reused", 0) or 0)
+        q_recalls = int(qm.get("total_recalls", 0) or 0)
+        top6 = sum(qm.get("top_recalls") or [])
+        reuse_by_type = sorted(
+            (
+                {
+                    "type": t,
+                    "total": int(v.get("total", 0) or 0),
+                    "reused": int(v.get("reused", 0) or 0),
+                    "reuse_pct": round(100.0 * v["reused"] / v["total"], 1) if v.get("total") else 0.0,
+                }
+                for t, v in (qm.get("by_type") or {}).items()
+            ),
+            key=lambda r: r["reuse_pct"],
+            reverse=True,
+        )
+        # Insight freshness — "outdated"/"archived" = gone stale.
+        ins_status = ins.get("by_status") or {}
+        ins_total = int(ins.get("total", 0) or 0)
+        ins_stale = int(ins_status.get("outdated", 0) or 0) + int(ins_status.get("archived", 0) or 0)
+        written = int(full.get("total", 0) or 0)
+        quality = {
+            "never_recalled_pct": round(100.0 * (q_total - q_reused) / q_total, 1) if q_total else 0.0,
+            "recall_concentration_pct": round(100.0 * top6 / q_recalls, 1) if q_recalls else 0.0,
+            "recall_concentration_top6": top6,
+            "total_recalls": q_recalls,
+            "reuse_by_type": reuse_by_type,
+            "insight_freshness": {
+                "total": ins_total,
+                "stale": ins_stale,
+                "stale_pct": round(100.0 * ins_stale / ins_total, 1) if ins_total else 0.0,
+                "by_status": ins_status,
+            },
+            "funnel": {"written": written, "durable": q_total, "reused": q_reused},
+        }
+
+    # ── Audit the read + the declared destination (provenance / no-leakage trail). ──
+    await log_action(
+        tenant_id=tenant_id,
+        action="report_read",
+        resource_type="report",
+        detail={
+            "period": period,
+            "destination": dest,
+            "scope": scope_label,
+            "agent_id": caller_agent_id,
+        },
+    )
+
+    return {
+        "meta": {
+            "period": period,
+            "window_start": window_start.isoformat(),
+            "window_end": now.isoformat(),
+            "tenant_id": tenant_id,
+            "fleet_id": None if org_mode else caller_fleet,
+            "tenants": len(readable) if org_mode and readable else 1,
+            "destination": dest,
+            "scope": scope_label,
+            "corpus": (
+                "durable, decision-bearing memories (excl. episodic logs, the "
+                "'main' firehose, and heartbeat/health/status noise)"
+            ),
+            # Deliberately NOT ``is_self_scope``: this one omits the
+            # ``caller_agent_id`` conjunct, so a human-dashboard caller (no agent
+            # identity) asking for a self destination still gets the default
+            # belonging block even though its ``scope`` reads "group". Response
+            # shape, not visibility — swapping in the shared predicate here would
+            # silently start returning null.
+            "belonging": (
+                {"type": belonging_type, "owner_ref": owner_ref}
+                if dest in _SELF_AUDIENCES and not org_mode
+                else None
+            ),
+        },
+        "summary": {
+            "durable_memories_written": durable_total,
+            "active_agents": len(by_agent),
+            "by_type": by_type,
+            "by_tenant": by_tenant,
+        },
+        "per_agent": per_agent,
+        "value_highlights": value_highlights,
+        "spotlight": spotlight,
+        "trend": trend,
+        "working_on": working_on,
+        "learning": learning,
+        "quality": quality,
+    }
+
+
+@router.get("/reports/agent-activity")
+async def get_agent_activity_digest(
+    tenant_id: str | None = Query(
+        None,
+        description="Home tenant scope. Required and used for scope='own'; ignored for scope='org'.",
+    ),
+    period: str = Query("day", description="Digest window: 'day' or 'week'."),
+    scope: str = Query(
+        "own",
+        description=(
+            "Breadth: 'own' (just ``tenant_id``) or 'org' (every tenant the "
+            "credential may read). Both require a cross-tenant read credential."
+        ),
+    ),
+    agent_id: str | None = Query(None, description="Filter the digest to a single agent."),
+    as_of: str | None = Query(
+        None, description="ISO date/datetime to view a past snapshot; absent ⇒ latest."
+    ),
+    readable_tenant_ids: str | None = Query(
+        None,
+        description=(
+            "CSV of tenant ids for scope='org'. Honored ONLY for the internal "
+            "admin credential (the org-report proxy); ignored otherwise."
+        ),
+    ),
+    auth: AuthContext = Depends(get_auth_context),
+) -> dict:
+    """Cached, LLM-generated per-agent activity digest (read-only).
+
+    Precomputed on a schedule (default nightly; see core-operations) and served
+    from storage — never computed live. Gated on **cross-tenant read
+    privileges** (``enforce_cross_tenant_read``): single-tenant callers reach it
+    through the enterprise org-report proxy instead. Returns ``digests: []`` with
+    ``meta.generated_at: null`` when no run exists yet, not a 404.
+    """
+    auth.enforce_cross_tenant_read()
+    if agent_id is not None:
+        agent_id = canonical_service_agent_id(agent_id)
+    if period not in _PERIOD_DAYS:
+        raise HTTPException(status_code=422, detail=f"Invalid period '{period}'. Use 'day' or 'week'.")
+    if scope not in ("own", "org"):
+        raise HTTPException(status_code=422, detail="Invalid scope. Use 'own' or 'org'.")
+    if as_of is not None:
+        # Fail fast with a clean 422 before any storage round-trip (N calls under
+        # scope='org'); the storage router validates too, as a backstop.
+        try:
+            datetime.fromisoformat(as_of)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="'as_of' must be a valid ISO date/datetime.")
+
+    # Resolve the target tenant set. The internal admin proxy may pass an
+    # explicit set; every other caller is pinned to its own readable set so a
+    # cross-tenant agent cannot widen past its grant.
+    if scope == "org":
+        if auth.is_admin and readable_tenant_ids:
+            tenants = [t.strip() for t in readable_tenant_ids.split(",") if t.strip()]
+        else:
+            tenants = list(auth.readable_tenant_ids)
+    else:
+        if tenant_id is None:
+            raise HTTPException(status_code=422, detail="'tenant_id' is required for scope='own'.")
+        tenants = [tenant_id]
+    # Bound which tenants: every target must be in the credential's readable set.
+    for t in tenants:
+        auth.enforce_readable_tenant(t)
+
+    sc = get_storage_client()
+    # return_exceptions: one tenant's storage failure must not sink the whole
+    # org report — skip the failed tenant and return what did resolve.
+    per_tenant = await asyncio.gather(
+        *(sc.get_agent_activity_digest(t, period, agent_id=agent_id, as_of=as_of) for t in tenants),
+        return_exceptions=True,
+    )
+    digests: list[dict] = []
+    for t, rows in zip(tenants, per_tenant):
+        if isinstance(rows, BaseException):
+            logger.warning("agent_activity_digest: storage call failed for tenant %s: %r", t, rows)
+        else:
+            digests.extend(rows or [])
+
+    # Meta reflects the freshest run represented in the result set. Under
+    # scope='org' the digests can span tenants whose scheduled passes ran over
+    # different windows / with different models (per-tenant cadence + model
+    # config), so the scalar window_start/window_end/model are "from the freshest
+    # run" only — ``windows`` lists every distinct window actually present, so a
+    # caller can tell when the result set is not a single coherent window.
+    # Order on parsed datetimes, not raw ISO strings: lexical comparison is wrong
+    # when offsets are formatted differently across rows ("Z" vs "+00:00").
+    def _parse_dt(s: str) -> datetime:
+        return datetime.fromisoformat(s)
+
+    latest = max(digests, key=lambda d: _parse_dt(d["generated_at"])) if digests else None
+    windows = sorted(
+        {(d["window_start"], d["window_end"]) for d in digests},
+        key=lambda t: _parse_dt(t[0]),
+        reverse=True,
+    )
+    meta = {
+        "period": period,
+        "scope": scope,
+        "tenants": len(tenants),
+        "agents": len({d["agent_id"] for d in digests}),
+        "generated_at": latest["generated_at"] if latest else None,
+        # From the freshest run; see ``windows`` for the full set under scope='org'.
+        "window_start": latest["window_start"] if latest else None,
+        "window_end": latest["window_end"] if latest else None,
+        "model": latest["model"] if latest else None,
+        "windows": [{"window_start": s, "window_end": e} for s, e in windows],
+    }
+    return {"meta": meta, "digests": digests}
+
+
+@router.post("/admin/reports/agent-digest/run")
+async def run_agent_digest_endpoint(
+    period: str = Query("day", description="Digest window to generate: 'day' or 'week'."),
+    auth: AuthContext = Depends(get_auth_context),
+) -> dict:
+    """Generate agent-activity digests for all opted-in orgs (admin/cron only).
+
+    The core-operations nightly cron POSTs this. Enumerates orgs with
+    ``agent_digest.enabled`` and generates inline with bounded concurrency
+    (see ``services.agent_digest``); returns a bounded counts summary. This is
+    the WRITE/generation path — the read path (GET /reports/agent-activity)
+    never computes.
+    """
+    auth.enforce_admin()
+    if period not in _PERIOD_DAYS:
+        raise HTTPException(status_code=422, detail=f"Invalid period '{period}'. Use 'day' or 'week'.")
+    return await run_agent_digest(period)

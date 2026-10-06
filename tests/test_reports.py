@@ -1,0 +1,955 @@
+"""Integration tests for GET /api/v1/reports — the governed two-check read.
+
+Real FastAPI app + in-process storage (see conftest). Validates:
+- durable corpus filter (excludes the ``episode`` type and the ``main`` firehose),
+- destination narrowing (owner_1to1 = self, internal_group = fleet, external = fail-closed),
+- period validation.
+"""
+
+import json
+import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from core_api.app import app
+from core_api.auth import AuthContext, get_auth_context
+from core_api.clients.storage_client import get_storage_client
+from core_api.routes import reports as reports_route
+from tests.conftest import get_test_auth
+
+pytestmark = pytest.mark.asyncio
+
+
+def _uid() -> str:
+    """Decimal-only unique suffix — deliberately NOT ``conftest.uid()``.
+
+    Same job (a unique tail so seeded content can't 409 against an earlier
+    run), but digits instead of hex. This module seeds the suffix into memory
+    CONTENT, and the report's working-on lanes keyword-match content, so a
+    suffix that happens to spell a lane keyword silently moves a memory out of
+    the lane a test asserts on. ``conftest.uid()`` is ``uuid4().hex``, and d, b
+    and a are all hex digits, so ~0.15% of ids contain "dba" — an Operating
+    keyword. That is what made test_report_internal_group_durable_filter fail
+    on CI run 31636233722 with Governing 1 instead of 2.
+
+    Digits cannot spell any lane keyword, so classification in this module no
+    longer depends on random data. The word-start anchoring in reports.py fixes
+    the substring collision itself; this keeps the tests independent of it.
+    """
+    return f"{uuid.uuid4().int % 10**12:012d}"
+
+
+async def _register(tenant_id, fleet, *agents):
+    sc = get_storage_client()
+    for a in agents:
+        await sc.create_or_update_agent(
+            {"tenant_id": tenant_id, "agent_id": a, "fleet_id": fleet, "trust_level": 1}
+        )
+
+
+async def _seed(client, headers, tenant_id, fleet, agent, mtype, n=1):
+    for i in range(n):
+        r = await client.post(
+            "/api/v1/memories",
+            json={
+                "tenant_id": tenant_id,
+                "agent_id": agent,
+                "fleet_id": fleet,
+                "memory_type": mtype,
+                "visibility": "scope_team",
+                "content": f"{mtype} by {agent} #{i} {_uid()}",
+            },
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+
+
+async def test_report_internal_group_durable_filter(client):
+    tenant_id, headers = get_test_auth()
+    tag = _uid()
+    fleet, a1, a2 = f"rep-fleet-{tag}", f"rep-a1-{tag}", f"rep-a2-{tag}"
+    await _register(tenant_id, fleet, a1, a2)
+    await _seed(client, headers, tenant_id, fleet, a1, "decision", 2)
+    await _seed(client, headers, tenant_id, fleet, a2, "fact", 1)
+    await _seed(
+        client, headers, tenant_id, fleet, a1, "episode", 1
+    )  # excluded: episodic
+    await _seed(
+        client, headers, tenant_id, fleet, "main", "fact", 1
+    )  # excluded: firehose
+
+    resp = await client.get(
+        "/api/v1/reports",
+        params={
+            "tenant_id": tenant_id,
+            "period": "week",
+            "destination": "internal_group",
+            "agent_id": a1,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["summary"]["durable_memories_written"] == 3, body
+    assert body["summary"]["active_agents"] == 2, body
+    agents = {p["agent_id"]: p["durable_writes"] for p in body["per_agent"]}
+    assert agents == {a1: 2, a2: 1}, agents
+    assert "main" not in agents
+    assert "episode" not in body["summary"]["by_type"], body["summary"]["by_type"]
+    # weekly extras: value_highlights (top durable) + spotlight (top contributor)
+    assert len(body["value_highlights"]) == 3, body["value_highlights"]
+    assert all(
+        h["type"] != "episode" and h["agent_id"] != "main"
+        for h in body["value_highlights"]
+    )
+    assert body["spotlight"]["agent_id"] == a1, body["spotlight"]
+    assert body["spotlight"]["durable_writes"] == 2
+    assert body["spotlight"]["headline"] is not None
+    # activity-over-time trend (14 daily buckets) + working-on lanes
+    assert len(body["trend"]) == 14, body["trend"]
+    assert sum(pt["count"] for pt in body["trend"]) == 3, body["trend"]
+    assert set(body["working_on"]) == {"Governing", "Building", "Operating"}
+    assert body["working_on"]["Governing"]["count"] == 2, body[
+        "working_on"
+    ]  # 2 decisions
+    assert body["working_on"]["Building"]["count"] == 1, body["working_on"]  # 1 fact
+
+
+async def test_report_lane_keywords_do_not_match_inside_words(client):
+    """A lane keyword buried inside an unrelated word must not classify.
+
+    Lane matching runs BEFORE the memory-type fallback, so a substring hit
+    silently outranks the type. These three contents each contain a lane
+    keyword inside a longer token and nothing else a lane matches, so under
+    bare substring matching every one of them left Governing:
+
+      "feedback"  contains "dba"  -> Operating
+      "ownership" contains "ship" -> Building
+      "a1dba234"  contains "dba"  -> Operating  (a hex id, which is how this
+                                     reached CI as a ~0.6%-per-run flake in
+                                     test_report_internal_group_durable_filter)
+
+    All three are `decision`, so all three belong in Governing via _TYPE_LANE.
+    """
+    tenant_id, headers = get_test_auth()
+    tag = _uid()
+    fleet, a1 = f"rep-fleet-{tag}", f"rep-a1-{tag}"
+    await _register(tenant_id, fleet, a1)
+
+    for content in (
+        f"customer feedback reviewed {_uid()}",
+        f"ownership of the account {_uid()}",
+        f"correlation id a1dba234 noted {_uid()}",
+    ):
+        r = await client.post(
+            "/api/v1/memories",
+            json={
+                "tenant_id": tenant_id,
+                "agent_id": a1,
+                "fleet_id": fleet,
+                "memory_type": "decision",
+                "visibility": "scope_team",
+                "content": content,
+            },
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+
+    resp = await client.get(
+        "/api/v1/reports",
+        params={
+            "tenant_id": tenant_id,
+            "period": "week",
+            "destination": "internal_group",
+            "agent_id": a1,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    lanes = resp.json()["working_on"]
+    assert lanes["Governing"]["count"] == 3, lanes
+    assert lanes["Operating"]["count"] == 0, lanes
+    assert lanes["Building"]["count"] == 0, lanes
+
+
+async def test_report_owner_1to1_is_self(client):
+    tenant_id, headers = get_test_auth()
+    tag = _uid()
+    fleet, a1, a2 = f"rep-fleet-{tag}", f"rep-a1-{tag}", f"rep-a2-{tag}"
+    await _register(tenant_id, fleet, a1, a2)
+    await _seed(client, headers, tenant_id, fleet, a1, "decision", 2)
+    await _seed(client, headers, tenant_id, fleet, a2, "fact", 1)
+
+    resp = await client.get(
+        "/api/v1/reports",
+        params={
+            "tenant_id": tenant_id,
+            "period": "week",
+            "destination": "owner_1to1",
+            "agent_id": a1,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["meta"]["scope"] == "self", body["meta"]
+    assert body["summary"]["durable_memories_written"] == 2, body  # only a1's own
+    # List-derived sections are author-scoped to the caller too (self path),
+    # consistent with the breakdown counts — a2's team-visible fact must NOT leak.
+    assert all(h["agent_id"] == a1 for h in body["value_highlights"]), body[
+        "value_highlights"
+    ]
+    assert body["spotlight"] is None or body["spotlight"]["agent_id"] == a1, body[
+        "spotlight"
+    ]
+
+
+async def test_report_external_is_fail_closed(client):
+    tenant_id, headers = get_test_auth()
+    tag = _uid()
+    fleet, a1 = f"rep-fleet-{tag}", f"rep-a1-{tag}"
+    await _register(tenant_id, fleet, a1)
+    await _seed(client, headers, tenant_id, fleet, a1, "decision", 2)
+
+    resp = await client.get(
+        "/api/v1/reports",
+        params={
+            "tenant_id": tenant_id,
+            "period": "week",
+            "destination": "external",
+            "agent_id": a1,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["meta"]["destination"] == "external"
+    assert body["per_agent"] == [], body  # fail-closed: no per-agent detail
+    assert body["learning"] == [], body
+
+
+async def test_report_unknown_destination_and_invalid_period(client):
+    tenant_id, headers = get_test_auth()
+    a1 = f"rep-a1-{_uid()}"
+    # Unknown destination → coerced to most-restrictive ``external`` (still 200).
+    r1 = await client.get(
+        "/api/v1/reports",
+        params={
+            "tenant_id": tenant_id,
+            "period": "week",
+            "destination": "bogus",
+            "agent_id": a1,
+        },
+        headers=headers,
+    )
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["meta"]["destination"] == "external"
+    # Invalid period → 422.
+    r2 = await client.get(
+        "/api/v1/reports",
+        params={"tenant_id": tenant_id, "period": "month", "agent_id": a1},
+        headers=headers,
+    )
+    assert r2.status_code == 422, r2.text
+
+
+async def test_report_no_agent_caller_is_group_view(client):
+    """Human/tenant caller (no agent_id) → tenant group view, NOT a 403.
+
+    Regression guard for the auth fix: the trust gate only runs for agent
+    callers; a tenant member/admin with no agent identity is authorized for the
+    group view by enforce_tenant. Uses a dedicated tenant so the tenant-wide
+    (no-fleet) group view is isolated from other tests.
+    """
+    tag = _uid()
+    tenant_id, headers = get_test_auth(f"rep-tenant-{tag}")
+    fleet, a1, a2 = f"rep-fleet-{tag}", f"rep-a1-{tag}", f"rep-a2-{tag}"
+    await _register(tenant_id, fleet, a1, a2)
+    await _seed(client, headers, tenant_id, fleet, a1, "decision", 2)
+    await _seed(client, headers, tenant_id, fleet, a2, "fact", 1)
+    await _seed(client, headers, tenant_id, fleet, "main", "fact", 2)  # excluded
+
+    resp = await client.get(
+        "/api/v1/reports",
+        params={
+            "tenant_id": tenant_id,
+            "period": "week",
+            "destination": "internal_group",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text  # the fix: not 403
+    body = resp.json()
+    assert body["meta"]["scope"] == "group"
+    agents = {p["agent_id"]: p["durable_writes"] for p in body["per_agent"]}
+    assert agents == {a1: 2, a2: 1}, agents
+    assert body["summary"]["durable_memories_written"] == 3, body
+
+
+async def test_report_group_counts_private_writes_but_hides_content(client):
+    """Agent-private (``scope_agent``) durable writes are COUNTED in the group
+    aggregates — durable_memories_written / by_type / per_agent / trend — but
+    their CONTENT is never surfaced (value_highlights). Visibility is an audience
+    attribute, not a measure of whether a memory is knowledge produced.
+
+    The counting half is what this test really pins. Its caller is an admin
+    credential with no agent identity, so the content half holds here for a
+    reason unrelated to the route's audience logic and would have passed against
+    the M-31 leak — see
+    ``test_report_group_hides_private_content_from_an_agent_caller``.
+    """
+    tag = _uid()
+    tenant_id, headers = get_test_auth(f"rep-tenant-{tag}")
+    fleet, a1 = f"rep-fleet-{tag}", f"rep-a1-{tag}"
+    await _register(tenant_id, fleet, a1)
+    # 2 team-visible durable + 1 agent-private durable, all authored by a1.
+    await _seed(client, headers, tenant_id, fleet, a1, "decision", 2)
+    r = await client.post(
+        "/api/v1/memories",
+        json={
+            "tenant_id": tenant_id,
+            "agent_id": a1,
+            "fleet_id": fleet,
+            "memory_type": "fact",
+            "visibility": "scope_agent",
+            "content": f"private fact by {a1} {_uid()}",
+        },
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+
+    resp = await client.get(
+        "/api/v1/reports",
+        params={
+            "tenant_id": tenant_id,
+            "period": "week",
+            "destination": "internal_group",  # group view: no agent_id
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # COUNTS include the private durable write: 2 team decisions + 1 private fact.
+    assert body["summary"]["durable_memories_written"] == 3, body
+    assert body["summary"]["by_type"].get("fact") == 1, body["summary"]["by_type"]
+    agents = {p["agent_id"]: p["durable_writes"] for p in body["per_agent"]}
+    assert agents.get(a1) == 3, agents
+    # Trend line reconciles with the total (counts private too).
+    assert sum(pt["count"] for pt in body["trend"]) == 3, body["trend"]
+    # CONTENT stays audience-scoped: only the 2 team decisions surface; the
+    # private fact is counted above but never appears in value_highlights.
+    assert len(body["value_highlights"]) == 2, body["value_highlights"]
+    assert all(h["type"] == "decision" for h in body["value_highlights"]), body[
+        "value_highlights"
+    ]
+
+
+async def _seed_private_insight(client, headers, tenant_id, fleet, agent, title):
+    """A ``scope_agent`` ``insight`` with an exact title.
+
+    ``_seed_titled`` (below) is the ``scope_team`` equivalent; the whole point
+    here is the private one. Both PATCH the title for the same reason — so the
+    assertion does not depend on what enrichment chose to call the row.
+
+    ``insight`` is set the same way rather than on the write: it is in
+    ``SERVER_RESERVED_MEMORY_TYPES``, which the route refuses on a write, and
+    the report's ``learning`` section selects on exactly that type — so a row
+    of that type has to be made after the fact.
+    """
+    r = await client.post(
+        "/api/v1/memories",
+        json={
+            "tenant_id": tenant_id,
+            "agent_id": agent,
+            "fleet_id": fleet,
+            "visibility": "scope_agent",
+            "content": f"{title} {_uid()}",
+        },
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    await get_storage_client().update_memory(
+        r.json()["id"], tenant_id, {"title": title, "memory_type": "insight"}
+    )
+
+
+async def test_report_group_hides_private_content_from_an_agent_caller(client):
+    """M-31. The same invariant as the test above, asserted against a caller
+    that can actually violate it.
+
+    That test passes for a reason unrelated to the route's logic: it calls with
+    ``get_test_auth()``, an ADMIN credential with no agent identity, so
+    ``asserted_agent`` is None, ``caller_agent_id`` stays None, and the storage
+    predicate then drops every ``scope_agent`` row regardless of what the
+    route's audience handling decided. The invariant is real; that caller cannot
+    violate it, so it cannot test it either.
+
+    An AGENT caller can. ``list_query`` set ``caller_agent_id`` on every detail
+    path, and the predicate admits ``scope_agent`` rows authored by that agent —
+    so an agent asking for an ``internal_group`` report got its OWN private
+    titles back in the content sections, which is the audience-class narrowing
+    the two-check design exists to enforce. The agent then relays that verbatim
+    into a group channel.
+
+    The breakdown path already got this right (it sets ``agent_id`` only on the
+    self branch); only ``list_query`` did not.
+    """
+    tag = _uid()
+    tenant_id, headers = get_test_auth(f"rep-tenant-{tag}")
+    fleet, a1 = f"rep-fleet-{tag}", f"rep-a1-{tag}"
+    await _register(tenant_id, fleet, a1)
+
+    await _seed(client, headers, tenant_id, fleet, a1, "decision", 2)
+    private_title = f"private runway concern {tag}"
+    await _seed_private_insight(client, headers, tenant_id, fleet, a1, private_title)
+
+    resp = await client.get(
+        "/api/v1/reports",
+        params={
+            "tenant_id": tenant_id,
+            "period": "week",
+            "destination": "internal_group",
+            # The difference that matters: this makes the caller an AGENT, so
+            # ``caller_agent_id`` is set and the private row becomes visible to
+            # the storage predicate.
+            "agent_id": a1,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    # The caller really did resolve to an agent. Without this the test passes
+    # VACUOUSLY if identity resolution ever breaks — ``caller_agent_id`` would
+    # be None, the storage predicate would exclude private rows for that reason
+    # instead of this fix, and the assertions below would prove nothing. That is
+    # the exact failure mode of the test this one exists to supplement, so it
+    # gets an explicit witness. ``meta.fleet_id`` is ``caller.get("fleet_id")``
+    # and stays None unless an agent row was fetched.
+    assert body["meta"]["fleet_id"] == fleet, (
+        f"caller did not resolve to an agent; this test would prove nothing: {body['meta']}"
+    )
+
+    # Counted — unchanged, and the reason the leak is not visible in the totals.
+    assert body["summary"]["durable_memories_written"] == 3, body["summary"]
+
+    # Not surfaced, anywhere. Checked against the whole serialized body rather
+    # than section by section, because the title reaches learning,
+    # value_highlights, the working-on lanes and the spotlight headline by four
+    # separate routes and a per-section list would rot as sections are added.
+    assert private_title not in json.dumps(body), (
+        "an agent's own scope_agent title reached an internal_group report: "
+        f"{json.dumps(body)}"
+    )
+    # Independent of the check above: catches a private row surfacing under a
+    # DIFFERENT string, since ``_title()`` falls back to metadata.summary and
+    # then "(untitled)".
+    assert all(h["type"] == "decision" for h in body["value_highlights"]), body[
+        "value_highlights"
+    ]
+
+    # Over-refusal guard: the team-visible rows must still be there. Dropping
+    # ``caller_agent_id`` must narrow visibility, not empty the report.
+    assert len(body["value_highlights"]) == 2, body["value_highlights"]
+
+
+@pytest.mark.parametrize("destination", ["owner_1to1", "private_session"])
+async def test_report_self_view_still_shows_the_agent_its_own_private_rows(
+    client, destination
+):
+    """The other side of M-31: the self audiences are the caller's OWN view.
+
+    Narrowing the group path must not narrow these — an agent asking for its
+    self report is entitled to its private rows, and that is exactly what
+    ``caller_agent_id`` is for. Without this, "fix the leak" could be satisfied
+    by never passing the visibility identity at all, which is a fix in the sense
+    that a disconnected cable fixes a noisy line.
+
+    Both members of ``_SELF_AUDIENCES`` are covered, not just the common one.
+    """
+    tag = _uid()
+    tenant_id, headers = get_test_auth(f"rep-tenant-{tag}")
+    fleet, a1 = f"rep-fleet-{tag}", f"rep-a1-{tag}"
+    await _register(tenant_id, fleet, a1)
+
+    private_title = f"private runway concern {tag}"
+    await _seed_private_insight(client, headers, tenant_id, fleet, a1, private_title)
+
+    resp = await client.get(
+        "/api/v1/reports",
+        params={
+            "tenant_id": tenant_id,
+            "period": "week",
+            "destination": destination,
+            "agent_id": a1,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["meta"]["scope"] == "self", body["meta"]
+    assert any(item["title"] == private_title for item in body["learning"]), (
+        f"the self view lost the caller's own private row: {body['learning']}"
+    )
+
+
+async def test_report_org_scope_aggregates_across_tenants(client):
+    """scope=org with a cross-tenant read credential aggregates across the
+    readable tenant set and returns a per-tenant breakdown."""
+    tag = _uid()
+    t1, t2 = f"rep-org1-{tag}", f"rep-org2-{tag}"
+    _, headers = get_test_auth(
+        t1
+    )  # admin key — used only to SEED (before the override)
+    await _register(t1, f"f1-{tag}", f"a1-{tag}")
+    await _register(t2, f"f2-{tag}", f"a2-{tag}")
+    await _seed(client, headers, t1, f"f1-{tag}", f"a1-{tag}", "decision", 2)
+    await _seed(client, headers, t2, f"f2-{tag}", f"a2-{tag}", "fact", 3)
+
+    ctx = AuthContext(tenant_id=t1, readable_tenant_ids=[t1, t2])  # cross-tenant reader
+    app.dependency_overrides[get_auth_context] = lambda: ctx
+    try:
+        resp = await client.get(
+            "/api/v1/reports",
+            params={
+                "tenant_id": t1,
+                "period": "week",
+                "destination": "internal_group",
+                "scope": "org",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["meta"]["scope"] == "org"
+        assert body["summary"]["durable_memories_written"] == 5, body["summary"]
+        assert body["summary"]["by_tenant"] == {t1: 2, t2: 3}, body["summary"][
+            "by_tenant"
+        ]
+    finally:
+        app.dependency_overrides.pop(get_auth_context, None)
+
+
+async def test_report_org_scope_hides_private_content_from_an_agent_caller(client):
+    """M-31, org half. ``scope=org`` carried the same defect as internal_group.
+
+    Reachable because ``asserted_agent`` falls back to the ``agent_id`` QUERY
+    PARAM: a cross-tenant reader supplying it resolves a ``caller_agent_id``,
+    and that agent's private rows then flowed into a report aggregated across
+    every readable tenant — the widest audience the endpoint produces.
+    """
+    tag = _uid()
+    t1, t2 = f"rep-org1-{tag}", f"rep-org2-{tag}"
+    a1 = f"a1-{tag}"
+    _, headers = get_test_auth(t1)
+    await _register(t1, f"f1-{tag}", a1)
+    await _register(t2, f"f2-{tag}", f"a2-{tag}")
+    await _seed(client, headers, t1, f"f1-{tag}", a1, "decision", 2)
+
+    private_title = f"private runway concern {tag}"
+    await _seed_private_insight(client, headers, t1, f"f1-{tag}", a1, private_title)
+
+    ctx = AuthContext(tenant_id=t1, readable_tenant_ids=[t1, t2])
+    app.dependency_overrides[get_auth_context] = lambda: ctx
+    try:
+        resp = await client.get(
+            "/api/v1/reports",
+            params={
+                "tenant_id": t1,
+                "period": "week",
+                "destination": "internal_group",
+                "scope": "org",
+                "agent_id": a1,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["meta"]["scope"] == "org", body["meta"]
+        # Counted, as on every other path.
+        assert body["summary"]["durable_memories_written"] == 3, body["summary"]
+        assert private_title not in json.dumps(body), (
+            "an agent's own scope_agent title reached an ORG-scope report: "
+            f"{json.dumps(body)}"
+        )
+        # Over-refusal guard: the team-visible rows survive.
+        assert len(body["value_highlights"]) == 2, body["value_highlights"]
+    finally:
+        app.dependency_overrides.pop(get_auth_context, None)
+
+
+async def test_report_org_scope_admin_readable_param(client):
+    """The internal admin credential may pass an explicit ``readable_tenant_ids``
+    (the org-report proxy path). A non-admin caller's value is ignored — asserted
+    by the sibling override tests, which never pass the param.
+    """
+    tag = _uid()
+    t1, t2 = f"rep-adm1-{tag}", f"rep-adm2-{tag}"
+    _, headers = get_test_auth(t1)  # admin key (is_admin=True)
+    await _register(t1, f"f1-{tag}", f"a1-{tag}")
+    await _register(t2, f"f2-{tag}", f"a2-{tag}")
+    await _seed(client, headers, t1, f"f1-{tag}", f"a1-{tag}", "decision", 2)
+    await _seed(client, headers, t2, f"f2-{tag}", f"a2-{tag}", "fact", 3)
+
+    resp = await client.get(
+        "/api/v1/reports",
+        params={
+            "tenant_id": t1,
+            "period": "week",
+            "destination": "internal_group",
+            "scope": "org",
+            "readable_tenant_ids": f"{t1},{t2}",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["meta"]["scope"] == "org"
+    assert body["summary"]["durable_memories_written"] == 5, body["summary"]
+    assert body["summary"]["by_tenant"] == {t1: 2, t2: 3}, body["summary"]["by_tenant"]
+
+
+async def _seed_titled(client, headers, tenant_id, fleet, agent, mtype, title):
+    """Create a durable memory then set an exact title via the storage client.
+
+    Enrichment runs inline in tests and would auto-title, so we PATCH the title
+    directly to make the cohesive-filter assertions enrichment-independent.
+    Returns the memory id.
+    """
+    r = await client.post(
+        "/api/v1/memories",
+        json={
+            "tenant_id": tenant_id,
+            "agent_id": agent,
+            "fleet_id": fleet,
+            "memory_type": mtype,
+            "visibility": "scope_team",
+            "content": f"{title} {_uid()}",
+        },
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    mid = r.json()["id"]
+    await get_storage_client().update_memory(mid, tenant_id, {"title": title})
+    return mid
+
+
+async def test_report_excludes_noncohesive_titles(client):
+    """Non-episode heartbeat / health / status memories are excluded.
+
+    The durable filter (episode + ``main``) is not sufficient: monitoring pings
+    are written as NON-episode rows (a ``decision``/``outcome``/``action`` titled
+    "Heartbeat check…", "GPU health check…", "Gateway healthy…"). The cohesive
+    title filter drops them so the per-agent leaderboard and highlights reflect
+    real work, not pings.
+    """
+    tenant_id, headers = get_test_auth()
+    tag = _uid()
+    fleet, a1 = f"rep-fleet-{tag}", f"rep-a1-{tag}"
+    await _register(tenant_id, fleet, a1)
+
+    # Genuine durable work — kept. (Only decision/fact/semantic are writable
+    # directly; outcome/rule/insight are server-reserved. The noise the filter
+    # targets is in the TITLE, not the type, so non-episode types suffice.)
+    await _seed_titled(
+        client,
+        headers,
+        tenant_id,
+        fleet,
+        a1,
+        "decision",
+        "Chose Postgres over Mongo for the signal store",
+    )
+    await _seed_titled(
+        client,
+        headers,
+        tenant_id,
+        fleet,
+        a1,
+        "semantic",
+        "Verify a project URL via the proxy before sharing it",
+    )
+    # Non-episode monitoring noise — excluded by the cohesive title filter.
+    await _seed_titled(
+        client,
+        headers,
+        tenant_id,
+        fleet,
+        a1,
+        "decision",
+        "Heartbeat check for GoodDollar L2 builder status",
+    )
+    await _seed_titled(
+        client,
+        headers,
+        tenant_id,
+        fleet,
+        a1,
+        "fact",
+        "GPU health check recorded no_change",
+    )
+    await _seed_titled(
+        client,
+        headers,
+        tenant_id,
+        fleet,
+        a1,
+        "semantic",
+        "Gateway healthy: zero auth errors",
+    )
+
+    resp = await client.get(
+        "/api/v1/reports",
+        params={
+            "tenant_id": tenant_id,
+            "period": "week",
+            "destination": "internal_group",
+            "agent_id": a1,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # Only the 2 genuine memories survive the cohesive filter.
+    assert body["summary"]["durable_memories_written"] == 2, body["summary"]
+    assert {p["agent_id"]: p["durable_writes"] for p in body["per_agent"]} == {a1: 2}
+    titles = " ".join(h["title"].lower() for h in body["value_highlights"])
+    assert "heartbeat" not in titles and "health check" not in titles, body[
+        "value_highlights"
+    ]
+    assert "gateway healthy" not in titles, body["value_highlights"]
+    assert len(body["value_highlights"]) == 2, body["value_highlights"]
+    # Trend counts share the cohesive corpus (noise excluded there too).
+    assert sum(pt["count"] for pt in body["trend"]) == 2, body["trend"]
+
+
+async def test_report_value_highlights_ranked_by_recall(client):
+    """value_highlights is the true top-by-recall in the window (dedicated
+    recall-sorted fetch), not merely the most-reused among the most-recent rows —
+    it surfaces an older-but-heavily-reused memory above newer, unreused ones.
+    """
+    tenant_id, headers = get_test_auth()
+    tag = _uid()
+    fleet, a1 = f"rep-fleet-{tag}", f"rep-a1-{tag}"
+    await _register(tenant_id, fleet, a1)
+    sc = get_storage_client()
+
+    older = await _seed_titled(
+        client,
+        headers,
+        tenant_id,
+        fleet,
+        a1,
+        "decision",
+        "Older but heavily-reused architecture decision",
+    )
+    # Newer, unreused writes created AFTER the high-recall one.
+    for i in range(3):
+        await _seed_titled(
+            client, headers, tenant_id, fleet, a1, "fact", f"Newer reference fact {i}"
+        )
+    # Bump the older memory's lifetime recall so it is the top by recall.
+    for _ in range(3):
+        assert await sc.increment_recall([older], tenant_id=tenant_id) == 1
+
+    resp = await client.get(
+        "/api/v1/reports",
+        params={
+            "tenant_id": tenant_id,
+            "period": "week",
+            "destination": "internal_group",
+            "agent_id": a1,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["value_highlights"], body
+    top = body["value_highlights"][0]
+    assert top["title"] == "Older but heavily-reused architecture decision", body[
+        "value_highlights"
+    ]
+    assert top["recall_count"] == 3, top
+    # Spotlight headline is the top contributor's highest-recall memory.
+    assert body["spotlight"]["agent_id"] == a1
+    assert (
+        body["spotlight"]["headline"]["title"]
+        == "Older but heavily-reused architecture decision"
+    ), body["spotlight"]
+
+
+async def test_report_quality_metrics(client):
+    """Quality block: reuse-rate by type, never-recalled %, recall concentration,
+    the write→durable→reused funnel, and insight-freshness structure.
+
+    Seeds 4 durable memories (2 decisions, 2 facts) with one of each reused, plus
+    one episode (full-corpus only), so every quality figure is deterministic.
+    """
+    tenant_id, headers = get_test_auth()
+    tag = _uid()
+    fleet, a1 = f"rep-fleet-{tag}", f"rep-a1-{tag}"
+    await _register(tenant_id, fleet, a1)
+    sc = get_storage_client()
+
+    d1 = await _seed_titled(
+        client, headers, tenant_id, fleet, a1, "decision", f"Decision one {tag}"
+    )
+    await _seed_titled(
+        client, headers, tenant_id, fleet, a1, "decision", f"Decision two {tag}"
+    )
+    f1 = await _seed_titled(
+        client, headers, tenant_id, fleet, a1, "fact", f"Fact one {tag}"
+    )
+    await _seed_titled(client, headers, tenant_id, fleet, a1, "fact", f"Fact two {tag}")
+    # One episode — counts toward the funnel's "written" but not the durable corpus.
+    await _seed(client, headers, tenant_id, fleet, a1, "episode", 1)
+    # Reuse: d1 twice, f1 once → 2 of 4 durable memories ever reused; 3 total recalls.
+    for _ in range(2):
+        assert await sc.increment_recall([d1], tenant_id=tenant_id) == 1
+    assert await sc.increment_recall([f1], tenant_id=tenant_id) == 1
+
+    resp = await client.get(
+        "/api/v1/reports",
+        params={
+            "tenant_id": tenant_id,
+            "period": "week",
+            "destination": "internal_group",
+            "agent_id": a1,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    q = resp.json()["quality"]
+    # Funnel: 5 written (4 durable + 1 episode), 4 durable, 2 ever-reused.
+    assert q["funnel"] == {"written": 5, "durable": 4, "reused": 2}, q["funnel"]
+    # Never-recalled: 2 of 4 durable → 50%.
+    assert q["never_recalled_pct"] == 50.0, q
+    # Reuse rate by type: decision 1/2, fact 1/2 → 50% each.
+    rbt = {r["type"]: r["reuse_pct"] for r in q["reuse_by_type"]}
+    assert rbt.get("decision") == 50.0 and rbt.get("fact") == 50.0, q["reuse_by_type"]
+    # Concentration: total recalls 3 (=2+1); top-6 captures all → 100%.
+    assert q["total_recalls"] == 3, q
+    assert q["recall_concentration_pct"] == 100.0, q
+    # Insight freshness present and well-formed (no insights seeded here).
+    assert q["insight_freshness"]["total"] == 0, q["insight_freshness"]
+    assert q["insight_freshness"]["stale_pct"] == 0.0, q["insight_freshness"]
+
+
+async def test_report_org_scope_requires_cross_tenant_key(client):
+    """scope=org without a cross-tenant read credential → 403 (home-only key can't widen)."""
+    tag = _uid()
+    t1 = f"rep-org-solo-{tag}"
+    ctx = AuthContext(tenant_id=t1)  # single-tenant, non-admin
+    app.dependency_overrides[get_auth_context] = lambda: ctx
+    try:
+        resp = await client.get(
+            "/api/v1/reports",
+            params={"tenant_id": t1, "period": "week", "scope": "org"},
+        )
+        assert resp.status_code == 403, resp.text
+    finally:
+        app.dependency_overrides.pop(get_auth_context, None)
+
+
+# ── Agent-activity digest (CAURA-222): cached per-agent summaries ──
+# Phase 1 is the inert read slice — the generation worker lands in Phase 2, so
+# these cover the gate + the "no run yet" contract. Non-empty read coverage
+# arrives with the writer.
+
+
+async def test_agent_activity_requires_cross_tenant_read(client):
+    """A single-tenant (non-admin) credential is refused: the digest is a
+    cross-tenant admin-plane artifact (``enforce_cross_tenant_read``)."""
+    tag = _uid()
+    t1 = f"rep-dig-solo-{tag}"
+    ctx = AuthContext(tenant_id=t1)  # single-tenant, non-admin
+    app.dependency_overrides[get_auth_context] = lambda: ctx
+    try:
+        resp = await client.get(
+            "/api/v1/reports/agent-activity",
+            params={"tenant_id": t1, "period": "day"},
+        )
+        assert resp.status_code == 403, resp.text
+    finally:
+        app.dependency_overrides.pop(get_auth_context, None)
+
+
+async def test_agent_activity_cross_tenant_empty_until_generated(client):
+    """A cross-tenant reader is allowed; with no run yet the endpoint returns an
+    empty digest list + null ``generated_at`` (never a 404)."""
+    tag = _uid()
+    t1, t2 = f"rep-dig1-{tag}", f"rep-dig2-{tag}"
+    ctx = AuthContext(tenant_id=t1, readable_tenant_ids=[t1, t2])
+    app.dependency_overrides[get_auth_context] = lambda: ctx
+    try:
+        resp = await client.get(
+            "/api/v1/reports/agent-activity",
+            params={"tenant_id": t1, "period": "day", "scope": "org"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["digests"] == [], body
+        assert body["meta"]["generated_at"] is None, body["meta"]
+        assert body["meta"]["scope"] == "org"
+        assert body["meta"]["tenants"] == 2, body["meta"]
+    finally:
+        app.dependency_overrides.pop(get_auth_context, None)
+
+
+async def test_agent_activity_normalizes_retired_filter(client, monkeypatch):
+    tag = _uid()
+    tenant_id = f"rep-dig-alias-{tag}"
+    ctx = AuthContext(
+        tenant_id=tenant_id,
+        readable_tenant_ids=[tenant_id, f"other-{tag}"],
+    )
+    storage = SimpleNamespace(get_agent_activity_digest=AsyncMock(return_value=[]))
+    monkeypatch.setattr(reports_route, "get_storage_client", lambda: storage)
+    app.dependency_overrides[get_auth_context] = lambda: ctx
+    try:
+        resp = await client.get(
+            "/api/v1/reports/agent-activity",
+            params={
+                "tenant_id": tenant_id,
+                "period": "day",
+                "agent_id": "memclaw-insighter",  # legacy-name-ok: supported client input alias
+            },
+        )
+        assert resp.status_code == 200, resp.text
+    finally:
+        app.dependency_overrides.pop(get_auth_context, None)
+
+    assert (
+        storage.get_agent_activity_digest.await_args.kwargs["agent_id"]
+        == "caura-insighter"
+    )
+
+
+async def test_agent_activity_admin_allowed(client):
+    """The internal admin key bypasses the cross-tenant gate."""
+    tag = _uid()
+    t1 = f"rep-dig-adm-{tag}"
+    _, headers = get_test_auth(t1)  # admin key (is_admin=True)
+    resp = await client.get(
+        "/api/v1/reports/agent-activity",
+        params={"tenant_id": t1, "period": "day"},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["digests"] == []
+
+
+async def test_agent_activity_invalid_period(client):
+    """Period is validated to 'day'|'week' → 422 otherwise."""
+    tag = _uid()
+    t1, t2 = f"rep-dig-per1-{tag}", f"rep-dig-per2-{tag}"
+    ctx = AuthContext(tenant_id=t1, readable_tenant_ids=[t1, t2])
+    app.dependency_overrides[get_auth_context] = lambda: ctx
+    try:
+        resp = await client.get(
+            "/api/v1/reports/agent-activity",
+            params={"tenant_id": t1, "period": "month"},
+        )
+        assert resp.status_code == 422, resp.text
+    finally:
+        app.dependency_overrides.pop(get_auth_context, None)

@@ -1,0 +1,1481 @@
+"""Unit tests for ``caura_doc`` (op: write | read | query | delete).
+
+Covers:
+- Unknown op → ``INVALID_ARGUMENTS`` envelope.
+- Per-op required-parameter validation (doc_id, data).
+- Happy paths for all four ops (action/payload/count fields).
+- ``op=read`` not-found → "Not found:" text.
+- ``op=delete`` not-found → structured error envelope.
+
+Fix 2 Phase 4 routed ``caura_doc`` through the core-storage-api HTTP
+client (``get_storage_client()``), so these tests stub the storage client
+(``stub_storage_client``) and assert on the new dict-shaped payloads /
+single-positional-dict call args, rather than the old ``document_repo.*``
+ORM-row / tuple shapes.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock
+
+import pytest
+
+from core_api import mcp_server
+from core_api.constants import (
+    DEFAULT_DOC_SEARCH_TOP_K,
+    MAX_DOC_SEARCH_TOP_K,
+    VECTOR_DIM,
+)
+from tests._mcp_test_helpers import (
+    is_error_envelope,
+    parse_envelope,
+    strip_latency,
+    stub_storage_client,
+)
+
+pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
+
+
+def _doc(doc_id: str = "acme", collection: str = "customers", **extra) -> dict:
+    """A storage-client document dict (Fix 2 Phase 4 shape)."""
+    doc = {
+        "collection": collection,
+        "doc_id": doc_id,
+        "tenant_id": "test-tenant",
+        "data": {"plan": "business"},
+        "updated_at": datetime.now(UTC),
+    }
+    doc.update(extra)
+    return doc
+
+
+def _search_hit(
+    doc_id: str, similarity: float, collection: str = "customers", **extra
+) -> dict:
+    """A storage-client search result: a doc dict with an inline
+    ``similarity`` float (vs the repo's ``(Document, sim)`` tuples)."""
+    return _doc(doc_id, collection=collection, similarity=similarity, **extra)
+
+
+async def test_doc_invalid_op_errors(mcp_env):
+    out = await mcp_server.caura_doc(op="oops", collection="c")
+    payload = parse_envelope(out)
+    assert payload["error"]["code"] == "INVALID_ARGUMENTS"
+    assert payload["error"]["details"]["expected_ops"] == [
+        "delete",
+        "list_collections",
+        "query",
+        "read",
+        "search",
+        "write",
+    ]
+
+
+async def test_doc_write_missing_doc_id(mcp_env):
+    out = await mcp_server.caura_doc(op="write", collection="c", data={"k": 1})
+    assert "op=write requires 'doc_id'" in strip_latency(out)
+
+
+async def test_doc_write_missing_data(mcp_env):
+    out = await mcp_server.caura_doc(op="write", collection="c", doc_id="x")
+    assert "op=write requires 'data'" in strip_latency(out)
+
+
+async def test_doc_write_happy_path_new(mcp_env, monkeypatch):
+    """xmax=0 means a brand-new row was inserted."""
+    stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 0})
+    out = await mcp_server.caura_doc(
+        op="write", collection="customers", doc_id="acme", data={"plan": "enterprise"}
+    )
+    payload = parse_envelope(out)
+    assert payload["ok"] is True
+    assert payload["action"] == "created"
+    assert payload["collection"] == "customers"
+    assert payload["doc_id"] == "acme"
+    assert payload["indexed"] is False  # no data["summary"] → not indexed
+
+
+async def test_doc_write_happy_path_updated(mcp_env, monkeypatch):
+    """xmax!=0 means an existing row was updated."""
+    stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 42})
+    out = await mcp_server.caura_doc(
+        op="write", collection="customers", doc_id="acme", data={"plan": "pro"}
+    )
+    payload = parse_envelope(out)
+    assert payload["action"] == "updated"
+
+
+async def test_doc_read_missing_doc_id(mcp_env):
+    out = await mcp_server.caura_doc(op="read", collection="customers")
+    assert "op=read requires 'doc_id'" in strip_latency(out)
+
+
+async def test_doc_read_not_found(mcp_env, monkeypatch):
+    stub_storage_client(monkeypatch, get_document=None)
+    out = await mcp_server.caura_doc(op="read", collection="customers", doc_id="ghost")
+    # M-23: NOT_FOUND in the canonical envelope, with isError, as REST's 404.
+    # It was bare prose with a latency trailer, neither JSON nor an error.
+    assert is_error_envelope(out)
+    assert parse_envelope(out)["error"] == {
+        "code": "NOT_FOUND",
+        "message": "Not found: customers/ghost",
+    }
+
+
+async def test_doc_read_happy_path(mcp_env, monkeypatch):
+    stub_storage_client(monkeypatch, get_document=_doc("acme"))
+    out = await mcp_server.caura_doc(op="read", collection="customers", doc_id="acme")
+    payload = parse_envelope(out)
+    assert payload["doc_id"] == "acme"
+    assert payload["data"] == {"plan": "business"}
+
+
+async def test_doc_query_happy_path(mcp_env, monkeypatch):
+    rows = [_doc("acme"), _doc("initech")]
+    stub_storage_client(monkeypatch, query_documents=rows)
+    out = await mcp_server.caura_doc(
+        op="query", collection="customers", where={"plan": "business"}
+    )
+    payload = parse_envelope(out)
+    assert payload["count"] == 2
+    assert payload["collection"] == "customers"
+    assert [r["doc_id"] for r in payload["results"]] == ["acme", "initech"]
+
+
+async def test_doc_query_where_defaults_to_empty_dict(mcp_env, monkeypatch):
+    sc = stub_storage_client(monkeypatch, query_documents=[])
+    await mcp_server.caura_doc(op="query", collection="customers")
+    assert sc.query_documents.await_args.args[0]["where"] == {}
+
+
+async def test_doc_delete_missing_doc_id(mcp_env):
+    out = await mcp_server.caura_doc(op="delete", collection="customers")
+    assert "op=delete requires 'doc_id'" in strip_latency(out)
+
+
+async def test_doc_delete_not_found_envelope(mcp_env, monkeypatch):
+    """A storage delete that matched nothing returns False → the handler
+    answers NOT_FOUND in the canonical envelope, with isError (M-23). It sent
+    ``{"error": "<string>"}``, which reached clients as a successful call."""
+    sc = stub_storage_client(monkeypatch, delete_document=False)
+    out = await mcp_server.caura_doc(
+        op="delete", collection="customers", doc_id="ghost"
+    )
+    assert is_error_envelope(out)
+    error = parse_envelope(out)["error"]
+    assert error["code"] == "NOT_FOUND"
+    assert "ghost" in error["message"]
+    sc.delete_document.assert_awaited_once()
+
+
+async def test_doc_delete_happy_path(mcp_env, monkeypatch):
+    sc = stub_storage_client(monkeypatch, delete_document=True)
+    out = await mcp_server.caura_doc(op="delete", collection="customers", doc_id="acme")
+    payload = parse_envelope(out)
+    assert payload["ok"] is True
+    assert payload["deleted"] is True
+    assert payload["doc_id"] == "acme"
+    sc.delete_document.assert_awaited_once()
+
+
+async def test_doc_auth_failure_shortcircuits(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_check_auth", lambda: mcp_server._AUTH_ERROR)
+    out = await mcp_server.caura_doc(op="read", collection="c", doc_id="d")
+    assert out == mcp_server._AUTH_ERROR
+
+
+# ---------------------------------------------------------------------------
+# op=list_collections
+# ---------------------------------------------------------------------------
+
+
+async def test_doc_list_collections_happy_path(mcp_env, monkeypatch):
+    """Returns each collection with its document count."""
+    stub_storage_client(
+        monkeypatch,
+        list_document_collections={
+            "collections": [
+                {"name": "customers", "count": 3},
+                {"name": "onboarding_guides", "count": 1},
+                {"name": "proposals", "count": 2},
+            ]
+        },
+    )
+    out = await mcp_server.caura_doc(op="list_collections")
+    payload = parse_envelope(out)
+    assert payload["count"] == 3
+    assert payload["collections"] == [
+        {"name": "customers", "count": 3},
+        {"name": "onboarding_guides", "count": 1},
+        {"name": "proposals", "count": 2},
+    ]
+
+
+async def test_doc_list_collections_empty_tenant(mcp_env, monkeypatch):
+    """Empty tenant returns an empty list, not an error."""
+    stub_storage_client(monkeypatch, list_document_collections={"collections": []})
+    out = await mcp_server.caura_doc(op="list_collections")
+    payload = parse_envelope(out)
+    assert payload["collections"] == []
+    assert payload["count"] == 0
+
+
+async def test_doc_list_collections_does_not_require_collection(mcp_env, monkeypatch):
+    """Unlike every other op, list_collections has no required params — the
+    whole point is to discover collection names when you don't know them yet.
+    """
+    stub_storage_client(monkeypatch, list_document_collections={"collections": []})
+    out = await mcp_server.caura_doc(op="list_collections")
+    payload = parse_envelope(out)
+    assert "error" not in payload
+
+
+async def test_doc_list_collections_passes_fleet_id_filter(mcp_env, monkeypatch):
+    """fleet_id scopes the count; not a mandatory param."""
+    sc = stub_storage_client(
+        monkeypatch,
+        list_document_collections={"collections": [{"name": "customers", "count": 1}]},
+    )
+    await mcp_server.caura_doc(op="list_collections", fleet_id="caura-rnd-fleet")
+    assert (
+        sc.list_document_collections.await_args.kwargs["fleet_id"] == "caura-rnd-fleet"
+    )
+
+
+async def test_doc_write_requires_collection(mcp_env):
+    """With `collection` now optional in the signature (to accommodate
+    list_collections), the other ops must still enforce it explicitly."""
+    out = await mcp_server.caura_doc(op="write", doc_id="x", data={"k": 1})
+    assert "op=write requires 'collection'" in strip_latency(out)
+
+
+async def test_doc_read_requires_collection(mcp_env):
+    out = await mcp_server.caura_doc(op="read", doc_id="x")
+    assert "op=read requires 'collection'" in strip_latency(out)
+
+
+async def test_doc_query_requires_collection(mcp_env):
+    out = await mcp_server.caura_doc(op="query")
+    assert "op=query requires 'collection'" in strip_latency(out)
+
+
+# ---------------------------------------------------------------------------
+# op=write semantic indexing: only data["summary"] is ever embedded
+# ---------------------------------------------------------------------------
+
+
+async def test_doc_write_summary_embeds_and_forwards(mcp_env, monkeypatch):
+    """When data["summary"] is present, the server embeds that string and
+    forwards the vector to the storage client. Response reports indexed=True."""
+    captured: dict = {}
+
+    # ``**kwargs`` tolerates get_embedding's keyword-only ``background``:
+    # the doc write is synchronous, so it opts out of the deferred budget.
+    async def fake_embed(text, tenant_config=None, **_kwargs):
+        captured["embed_text"] = text
+        captured["embed_tenant_config"] = tenant_config
+        return [0.1] * VECTOR_DIM
+
+    sc = stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 0})
+    monkeypatch.setattr("common.embedding.get_embedding", fake_embed)
+
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="onboarding_guides",
+        doc_id="claude-code-setup",
+        data={
+            "summary": "Claude Code setup runbook",
+            "content": "Some 5KB markdown body that must NOT be embedded",
+        },
+    )
+    payload = parse_envelope(out)
+    assert payload["ok"] is True
+    assert payload["indexed"] is True
+    # Only the summary is embedded — the body is stored but not indexed.
+    assert captured["embed_text"] == "Claude Code setup runbook"
+    # The embedding is forwarded in the dict passed to upsert_document_xmax.
+    sent = sc.upsert_document_xmax.await_args.args[0]
+    assert len(sent["embedding"]) == VECTOR_DIM
+
+
+async def test_doc_write_no_summary_stores_unindexed(mcp_env, monkeypatch):
+    """Non-skills writes without data["summary"] persist without an
+    embedding — the "I don't need semantic search" path stays open."""
+    called = {"hit": False}
+
+    async def should_not_embed(text, **_kwargs):
+        called["hit"] = True
+        return [0.0] * VECTOR_DIM
+
+    stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 0})
+    monkeypatch.setattr("common.embedding.get_embedding", should_not_embed)
+
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="customers",
+        doc_id="acme",
+        data={"plan": "enterprise"},
+    )
+    payload = parse_envelope(out)
+    assert payload["ok"] is True
+    assert payload["indexed"] is False
+    assert called["hit"] is False
+
+
+async def test_doc_write_omitted_fleet_resolves_home_fleet(mcp_env, monkeypatch):
+    """op=write resolves an omitted fleet_id to the agent's home fleet, so a
+    published doc/skill row isn't stranded at fleet_id=NULL (mirrors
+    caura_write; this is the path the 'publish a skill' flow uses)."""
+    sc = stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 0})
+    enforce = mcp_env["service"]("enforce_fleet_write")
+    enforce.return_value = {"agent_id": "a1", "fleet_id": "home-f", "trust_level": 1}
+
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="customers",
+        doc_id="acme",
+        data={"plan": "enterprise"},  # no summary → no embedding needed
+        agent_id="a1",
+    )
+    payload = parse_envelope(out)
+    assert payload["ok"] is True
+    # Backfilled to the home fleet; the trust gate still saw the original None.
+    assert sc.upsert_document_xmax.await_args.args[0]["fleet_id"] == "home-f"
+    assert enforce.await_args.args[2] is None
+
+
+async def test_doc_write_explicit_fleet_id_not_overridden(mcp_env, monkeypatch):
+    """An explicit fleet_id on op=write is never replaced by the home fleet."""
+    sc = stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 0})
+    enforce = mcp_env["service"]("enforce_fleet_write")
+    enforce.return_value = {"agent_id": "a1", "fleet_id": "home-f", "trust_level": 3}
+
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="customers",
+        doc_id="acme",
+        data={"plan": "pro"},
+        agent_id="a1",
+        fleet_id="explicit-f",
+    )
+    payload = parse_envelope(out)
+    assert payload["ok"] is True
+    assert sc.upsert_document_xmax.await_args.args[0]["fleet_id"] == "explicit-f"
+
+
+async def test_doc_write_summary_empty_string_is_rejected(mcp_env, monkeypatch):
+    """When summary is provided but blank, embedding would be noise — reject."""
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.0] * VECTOR_DIM)
+    )
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="c",
+        doc_id="d",
+        data={"summary": "   "},
+    )
+    assert "non-empty string" in strip_latency(out)
+
+
+async def test_doc_write_embedding_provider_failure_aborts(mcp_env, monkeypatch):
+    """If the embedding provider returns None, the write is aborted —
+    better than silently persisting the doc without an index."""
+    monkeypatch.setattr("common.embedding.get_embedding", _async_return(None))
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="c",
+        doc_id="d",
+        data={"summary": "valid summary string"},
+    )
+    assert "embedding provider returned no vector" in strip_latency(out).lower()
+
+
+# ---------------------------------------------------------------------------
+# op=search
+# ---------------------------------------------------------------------------
+
+
+async def test_doc_search_without_collection_spans_all(mcp_env, monkeypatch):
+    """Collection is intentionally optional on search — omitting it triggers
+    the cross-collection strategy. Handler must pass collection=None to the
+    storage client, not reject the call."""
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    sc = stub_storage_client(monkeypatch, search_documents_vector=[])
+
+    out = await mcp_server.caura_doc(op="search", query="onboarding")
+    payload = parse_envelope(out)
+    # No 422 — broad search is a legitimate call
+    assert "error" not in payload
+    assert sc.search_documents_vector.await_args.args[0]["collection"] is None
+
+
+async def test_doc_search_broad_results_include_per_row_collection(
+    mcp_env, monkeypatch
+):
+    """Each result row must include its own `collection` so the caller can
+    follow up with op=read across mixed collections."""
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    hits = [
+        _search_hit("acme", 0.9, collection="customers"),
+        _search_hit("guide-1", 0.6, collection="onboarding_guides"),
+    ]
+    stub_storage_client(monkeypatch, search_documents_vector=hits)
+    out = await mcp_server.caura_doc(op="search", query="signup flow")
+    payload = parse_envelope(out)
+    assert payload["collection"] is None
+    assert payload["results"][0]["collection"] == "customers"
+    assert payload["results"][1]["collection"] == "onboarding_guides"
+
+
+async def test_doc_search_requires_query(mcp_env):
+    out = await mcp_server.caura_doc(op="search", collection="c")
+    assert "op=search requires a non-empty 'query'" in strip_latency(out)
+
+
+async def test_doc_search_empty_query_rejected(mcp_env):
+    """Whitespace-only query is as useless as no query."""
+    out = await mcp_server.caura_doc(op="search", collection="c", query="   ")
+    assert "op=search requires a non-empty 'query'" in strip_latency(out)
+
+
+async def test_doc_search_happy_path(mcp_env, monkeypatch):
+    """Happy path: embedding → storage search → results sorted by similarity."""
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    hits = [_search_hit("acme", 0.92), _search_hit("initech", 0.81)]
+    stub_storage_client(monkeypatch, search_documents_vector=hits)
+    out = await mcp_server.caura_doc(
+        op="search",
+        collection="customers",
+        query="payment plans",
+    )
+    payload = parse_envelope(out)
+    assert payload["count"] == 2
+    assert payload["collection"] == "customers"
+    assert payload["results"][0]["doc_id"] == "acme"
+    assert payload["results"][0]["similarity"] == 0.92
+    assert payload["results"][1]["doc_id"] == "initech"
+
+
+async def test_doc_search_empty_results(mcp_env, monkeypatch):
+    """No indexed docs / no matches → empty list, not error."""
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    stub_storage_client(monkeypatch, search_documents_vector=[])
+    out = await mcp_server.caura_doc(op="search", collection="c", query="anything")
+    payload = parse_envelope(out)
+    assert payload["count"] == 0
+    assert payload["results"] == []
+
+
+async def test_doc_search_top_k_capped_at_the_ceiling(mcp_env, monkeypatch):
+    """top_k above the ceiling is clamped server-side, not rejected.
+
+    MCP clamps where REST 422s (see ``test_doc_search_top_k_has_one_source_of
+    _truth``): a tool signature is read by a model that never sees the
+    validation error, so the useful behaviour is to serve the capped page.
+    """
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    sc = stub_storage_client(monkeypatch, search_documents_vector=[])
+
+    await mcp_server.caura_doc(op="search", collection="c", query="q", top_k=9999)
+    assert (
+        sc.search_documents_vector.await_args.args[0]["top_k"] == MAX_DOC_SEARCH_TOP_K
+    )
+
+
+def test_doc_search_top_k_has_one_source_of_truth():
+    """REST (``le=``), the MCP clamp and the MCP description read one constant.
+
+    The ceiling was a bare literal 50 in three places — the ``DocSearchRequest``
+    bound, the clamp in ``caura_doc``, and that tool's own parameter description,
+    which is also what ``plugin/tools.json`` publishes to callers. A cap the
+    description contradicts is worse than no description: the model plans around
+    the number it was told. This pins them together, and pins the published
+    string to the same constant so a change has to move all four at once.
+
+    ``MAX_DOC_SEARCH_TOP_K`` is deliberately NOT ``MAX_SEARCH_TOP_K``: document
+    rows are caller-supplied blobs ranked on one cosine distance, memory rows
+    carry enrichment and graph expansion. The two limits have never been equal.
+    """
+    import inspect
+
+    from core_api import constants as core_constants
+    from core_api.routes.documents import DocSearchRequest
+
+    le = [
+        m
+        for m in DocSearchRequest.model_fields["top_k"].metadata
+        if getattr(m, "le", None) is not None
+    ]
+    assert le and le[0].le == MAX_DOC_SEARCH_TOP_K
+    assert DocSearchRequest.model_fields["top_k"].default == DEFAULT_DOC_SEARCH_TOP_K
+
+    doc_top_k = inspect.get_annotations(mcp_server.caura_doc, eval_str=True)["top_k"]
+    desc = next(getattr(item, "description", "") for item in doc_top_k.__metadata__)
+    assert desc == f"op=search: max results (1-{MAX_DOC_SEARCH_TOP_K})."
+
+    assert core_constants.MAX_DOC_SEARCH_TOP_K == 50
+    assert core_constants.MAX_DOC_SEARCH_TOP_K != core_constants.MAX_SEARCH_TOP_K
+
+
+async def test_doc_search_embedding_provider_failure_aborts(mcp_env, monkeypatch):
+    """Provider failure → no search attempt, caller sees a clear error."""
+    monkeypatch.setattr("common.embedding.get_embedding", _async_return(None))
+    out = await mcp_server.caura_doc(op="search", collection="c", query="anything")
+    assert "embedding provider returned no vector" in strip_latency(out).lower()
+
+
+# ---------------------------------------------------------------------------
+# Read-op widening: ``_readable_tenant_ids_var`` reaches the storage call
+# (audit T1)
+# ---------------------------------------------------------------------------
+#
+# Cross-tenant credentials surface as a non-empty
+# ``_readable_tenant_ids_var``; the tool reads it via
+# ``_get_readable_tenants()`` and passes the list as ``readable_tenant_ids``
+# to whichever storage method backs the requested op:
+#
+#   list_collections → sc.list_document_collections   (kwarg)
+#   read             → sc.get_document                 (kwarg)
+#   query            → sc.query_documents              (dict key)
+#   search           → sc.search_documents_vector      (dict key)
+#
+# T1 locks in the wiring: a regression that silently drops the list on
+# any of those four paths would fail the corresponding test below.
+
+
+async def test_doc_list_collections_passes_readable_tenants(mcp_env, monkeypatch):
+    """``op=list_collections`` widens to the readable set when the
+    caller's credential is cross-tenant."""
+    monkeypatch.setattr(
+        mcp_server, "_get_readable_tenants", lambda: ["home", "sibling"]
+    )
+    sc = stub_storage_client(monkeypatch, list_document_collections={"collections": []})
+    await mcp_server.caura_doc(op="list_collections")
+    assert sc.list_document_collections.await_args.kwargs["readable_tenant_ids"] == [
+        "home",
+        "sibling",
+    ]
+
+
+async def test_doc_list_collections_single_tenant_passes_none(mcp_env, monkeypatch):
+    """Single-tenant credential: ``_get_readable_tenants()`` returns
+    ``[]`` → the tool collapses it to ``None`` before calling storage
+    (so the storage single-tenant fast path runs)."""
+    monkeypatch.setattr(mcp_server, "_get_readable_tenants", lambda: [])
+    sc = stub_storage_client(monkeypatch, list_document_collections={"collections": []})
+    await mcp_server.caura_doc(op="list_collections")
+    assert sc.list_document_collections.await_args.kwargs["readable_tenant_ids"] is None
+
+
+async def test_doc_read_passes_readable_tenants(mcp_env, monkeypatch):
+    """``op=read`` widens via ``readable_tenant_ids``. Storage can
+    then resolve a doc that lives in a sibling tenant when the caller
+    is authorized to read from it."""
+    monkeypatch.setattr(
+        mcp_server, "_get_readable_tenants", lambda: ["home", "sibling"]
+    )
+    sc = stub_storage_client(monkeypatch, get_document=_doc())
+    await mcp_server.caura_doc(op="read", collection="customers", doc_id="acme")
+    assert sc.get_document.await_args.kwargs["readable_tenant_ids"] == [
+        "home",
+        "sibling",
+    ]
+
+
+async def test_doc_query_passes_readable_tenants(mcp_env, monkeypatch):
+    """``op=query`` (filter-by-data) widens the same way."""
+    monkeypatch.setattr(
+        mcp_server, "_get_readable_tenants", lambda: ["home", "sibling"]
+    )
+    sc = stub_storage_client(monkeypatch, query_documents=[])
+    await mcp_server.caura_doc(op="query", collection="customers", where={"k": 1})
+    assert sc.query_documents.await_args.args[0]["readable_tenant_ids"] == [
+        "home",
+        "sibling",
+    ]
+
+
+async def test_doc_search_passes_readable_tenants(mcp_env, monkeypatch):
+    """``op=search`` (vector recall) widens the same way. The audit
+    emission has its own assertion in
+    ``tests/test_cross_tenant_audit_surfaces.py``; this test only
+    confirms the wiring from the context var to the storage arg."""
+    monkeypatch.setattr(
+        mcp_server, "_get_readable_tenants", lambda: ["home", "sibling"]
+    )
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    sc = stub_storage_client(monkeypatch, search_documents_vector=[])
+    await mcp_server.caura_doc(op="search", query="hello")
+    assert sc.search_documents_vector.await_args.args[0]["readable_tenant_ids"] == [
+        "home",
+        "sibling",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Active-only skill discovery (MCP-direct delivery)
+#
+# The agent-facing caura_doc surface must expose only ``status='active'``
+# skills to opted-in tenants — candidate / staged / quarantined skills are
+# in-flight or blocked and must not surface. Gated on
+# ``skills_factory.enabled``: a non-opted-in tenant's reads are unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _skill_doc(doc_id: str, status: str, tenant_id: str = "test-tenant") -> dict:
+    """A storage-client skills document dict."""
+    return {
+        "collection": "skills",
+        "doc_id": doc_id,
+        "tenant_id": tenant_id,
+        "data": {"slug": doc_id, "status": status, "summary": "a skill"},
+        "updated_at": datetime.now(UTC),
+    }
+
+
+def _skill_hit(
+    doc_id: str, status: str, similarity: float, tenant_id: str = "test-tenant"
+) -> dict:
+    """A storage-client skills search result (skill doc + inline similarity)."""
+    return {**_skill_doc(doc_id, status, tenant_id), "similarity": similarity}
+
+
+def _patch_flag(monkeypatch, enabled: bool):
+    """Force the opt-in check to a fixed bool. Patches BOTH the lenient
+    ``_skills_factory_enabled`` (read/query/search/delete gates) and the
+    strict ``_skills_factory_flag`` (query's explicit-status rejection
+    path), so a test's ``enabled`` is honored consistently across both."""
+    monkeypatch.setattr(mcp_server, "_skills_factory_enabled", _async_return(enabled))
+    monkeypatch.setattr(mcp_server, "_skills_factory_flag", _async_return(enabled))
+
+
+def _patch_sf_settings(monkeypatch, *, enabled: bool = True, **caps):
+    """Stub the merged-settings lookup the op=write path makes. The write
+    path now derives BOTH the opt-in flag and the byte caps from this one
+    ``get_settings_for_display`` call (no separate ``_skills_factory_enabled``
+    read), so tests set ``skills_factory.enabled`` here. Extra kwargs land
+    as ``skills_factory`` leaves (e.g. ``description_max_bytes=None``).
+
+    The handler calls the module-level ``mcp_server.get_settings_for_display``
+    name, so patch that alias (patching the original
+    ``core_api.services.organization_settings.get_settings_for_display`` would
+    not rebind the name the handler resolves)."""
+    sf: dict = {"enabled": enabled}
+    sf.update(caps)
+    monkeypatch.setattr(
+        mcp_server,
+        "get_settings_for_display",
+        _async_return({"skills_factory": sf}),
+    )
+
+
+def _valid_skill_data(**overrides):
+    """A minimal SF-002-valid agent-direct skills write payload.
+
+    Carries every REQUIRED_TOP_LEVEL_KEY plus a clean body so the
+    Sentinel pre-scan passes. Override individual fields per test."""
+    data = {
+        "name": "Forge X",
+        "slug": "forge-x",
+        "description": "what this skill does",
+        "domain": "ops",
+        "kind": "create",
+        "source": "agent",
+        "content": "# Forge X\n\nDo the thing safely.",
+        "summary": "Use when doing the thing in ops.",
+    }
+    data.update(overrides)
+    return data
+
+
+# ── op=read ────────────────────────────────────────────────────────
+
+
+async def test_skill_read_hides_non_active_when_flag_on(mcp_env, monkeypatch):
+    _patch_flag(monkeypatch, True)
+    stub_storage_client(
+        monkeypatch, get_document=_skill_doc("forge/x", status="staged")
+    )
+    out = await mcp_server.caura_doc(op="read", collection="skills", doc_id="forge/x")
+    # Non-active skill → same NOT_FOUND as a missing doc (no existence leak).
+    assert is_error_envelope(out)
+    assert parse_envelope(out)["error"] == {
+        "code": "NOT_FOUND",
+        "message": "Not found: skills/forge/x",
+    }
+
+
+async def test_skill_read_returns_active_when_flag_on(mcp_env, monkeypatch):
+    _patch_flag(monkeypatch, True)
+    stub_storage_client(
+        monkeypatch, get_document=_skill_doc("forge/x", status="active")
+    )
+    out = await mcp_server.caura_doc(op="read", collection="skills", doc_id="forge/x")
+    payload = parse_envelope(out)
+    assert payload["doc_id"] == "forge/x"
+    assert payload["data"]["status"] == "active"
+
+
+async def test_skill_read_no_filter_when_flag_off(mcp_env, monkeypatch):
+    # Non-opted-in tenant: byte-identical to pre-Skill-Factory — a
+    # staged (or status-less) skill is still readable.
+    _patch_flag(monkeypatch, False)
+    stub_storage_client(
+        monkeypatch, get_document=_skill_doc("forge/x", status="staged")
+    )
+    out = await mcp_server.caura_doc(op="read", collection="skills", doc_id="forge/x")
+    payload = parse_envelope(out)
+    assert payload["doc_id"] == "forge/x"
+
+
+# ── op=query ───────────────────────────────────────────────────────
+
+
+async def test_skill_query_rejects_explicit_non_active_status_when_flag_on(
+    mcp_env, monkeypatch
+):
+    # An explicit non-active status is REJECTED (not silently rewritten
+    # to active — that would mislead the caller into thinking they
+    # queried 'staged'). Points them to the Inbox API.
+    _patch_flag(monkeypatch, True)
+    sc = stub_storage_client(monkeypatch, query_documents=[])
+    out = await mcp_server.caura_doc(
+        op="query", collection="skills", where={"status": "staged"}
+    )
+    payload = parse_envelope(out)
+    assert payload["error"]["code"] == "INVALID_ARGUMENTS"
+    assert "skills-inbox" in payload["error"]["message"].lower()
+    sc.query_documents.assert_not_awaited()
+
+
+async def test_skill_query_scopes_to_active_when_no_status_when_flag_on(
+    mcp_env, monkeypatch
+):
+    # The common case — no status supplied — is transparently scoped to
+    # 'active' (no error), so an agent's plain skills query only ever
+    # sees live skills.
+    _patch_flag(monkeypatch, True)
+    sc = stub_storage_client(monkeypatch, query_documents=[])
+    await mcp_server.caura_doc(op="query", collection="skills", where={"domain": "ops"})
+    sent = sc.query_documents.await_args.args[0]
+    assert sent["where"]["status"] == "active"
+    assert sent["where"]["domain"] == "ops"
+
+
+async def test_skill_query_no_filter_when_flag_off(mcp_env, monkeypatch):
+    _patch_flag(monkeypatch, False)
+    sc = stub_storage_client(monkeypatch, query_documents=[])
+    await mcp_server.caura_doc(
+        op="query", collection="skills", where={"status": "staged"}
+    )
+    # Genuinely not opted in → caller's where passes through untouched
+    # (legacy), NOT the confusing Inbox-API rejection.
+    assert sc.query_documents.await_args.args[0]["where"] == {"status": "staged"}
+
+
+async def test_skill_query_explicit_status_fails_closed_on_settings_error(
+    mcp_env, monkeypatch
+):
+    # An explicit non-active status query is the security-sensitive
+    # rejection path: a settings outage must fail CLOSED (INTERNAL_ERROR),
+    # NOT emit the Inbox-API pointer to a tenant we can't confirm opted
+    # in. Uses the strict _skills_factory_flag.
+    async def _boom(*_a, **_k):
+        raise RuntimeError("settings store down")
+
+    monkeypatch.setattr(mcp_server, "_skills_factory_flag", _boom)
+    sc = stub_storage_client(monkeypatch, query_documents=[])
+    out = await mcp_server.caura_doc(
+        op="query", collection="skills", where={"status": "staged"}
+    )
+    payload = parse_envelope(out)
+    assert payload["error"]["code"] == "INTERNAL_ERROR"
+    sc.query_documents.assert_not_awaited()
+
+
+async def test_non_skills_query_unaffected_by_flag(mcp_env, monkeypatch):
+    # The active-only policy is skills-only — a customers query must not
+    # get a status filter injected even when the flag is on.
+    _patch_flag(monkeypatch, True)
+    sc = stub_storage_client(monkeypatch, query_documents=[])
+    await mcp_server.caura_doc(
+        op="query", collection="customers", where={"plan": "biz"}
+    )
+    assert "status" not in sc.query_documents.await_args.args[0]["where"]
+
+
+# ── op=search (scoped) ─────────────────────────────────────────────
+
+
+async def test_skill_search_scoped_passes_active_status_when_flag_on(
+    mcp_env, monkeypatch
+):
+    _patch_flag(monkeypatch, True)
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    sc = stub_storage_client(monkeypatch, search_documents_vector=[])
+    await mcp_server.caura_doc(op="search", collection="skills", query="deploy eu-west")
+    assert sc.search_documents_vector.await_args.args[0]["status"] == "active"
+
+
+async def test_skill_search_scoped_no_status_when_flag_off(mcp_env, monkeypatch):
+    _patch_flag(monkeypatch, False)
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    sc = stub_storage_client(monkeypatch, search_documents_vector=[])
+    await mcp_server.caura_doc(op="search", collection="skills", query="deploy eu-west")
+    assert sc.search_documents_vector.await_args.args[0]["status"] is None
+
+
+# ── op=search (broad / cross-collection) ───────────────────────────
+
+
+async def test_skill_search_broad_drops_non_active_when_flag_on(mcp_env, monkeypatch):
+    _patch_flag(monkeypatch, True)
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    hits = [
+        _search_hit("acme", 0.9, collection="customers"),  # non-skill: always kept
+        _skill_hit("forge/active", status="active", similarity=0.8),  # kept
+        _skill_hit("forge/staged", status="staged", similarity=0.7),  # DROPPED
+    ]
+    stub_storage_client(monkeypatch, search_documents_vector=hits)
+    out = await mcp_server.caura_doc(op="search", query="anything")
+    payload = parse_envelope(out)
+    returned = {(r["collection"], r["doc_id"]) for r in payload["results"]}
+    assert ("customers", "acme") in returned
+    assert ("skills", "forge/active") in returned
+    assert ("skills", "forge/staged") not in returned  # in-flight skill never leaks
+
+
+async def test_skill_search_broad_no_filter_when_flag_off(mcp_env, monkeypatch):
+    _patch_flag(monkeypatch, False)
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    hits = [_skill_hit("forge/staged", status="staged", similarity=0.7)]
+    stub_storage_client(monkeypatch, search_documents_vector=hits)
+    out = await mcp_server.caura_doc(op="search", query="anything")
+    payload = parse_envelope(out)
+    # Flag off → no broad post-filter; the staged skill surfaces as before.
+    assert payload["results"][0]["doc_id"] == "forge/staged"
+
+
+# ── op=write (self-promotion guard) ────────────────────────────────
+
+
+async def test_skill_write_rejects_caller_active_status_when_flag_on(
+    mcp_env, monkeypatch
+):
+    # The MCP write path now runs the SF-002 lifecycle validator. An
+    # agent-direct write carries is_admin=False, so a caller-supplied
+    # status='active' hits ADMIN_ONLY_STATUSES and 403s — this is what
+    # closes self-promotion past review.
+    _patch_flag(monkeypatch, True)
+    _patch_sf_settings(monkeypatch)
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    sc = stub_storage_client(
+        monkeypatch, upsert_document_xmax={"xmax": 0}, get_document=None
+    )
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="skills",
+        doc_id="forge-x",
+        data=_valid_skill_data(status="active"),
+    )
+    payload = parse_envelope(out)
+    # Validator raises HTTPException(403) → outer handler maps to FORBIDDEN.
+    assert payload["error"]["code"] == "FORBIDDEN"
+    assert "admin" in payload["error"]["message"].lower()
+    # The write must NOT have reached storage.
+    sc.upsert_document_xmax.assert_not_awaited()
+
+
+async def test_skill_write_rejects_forge_source_when_flag_on(mcp_env, monkeypatch):
+    # source='forge' is reserved for the internal lifecycle worker.
+    # An MCP caller is never is_internal_forge, so minting a forge-
+    # sourced skill 403s (INTERNAL_ONLY_SOURCES). Agents use
+    # source='agent'.
+    _patch_flag(monkeypatch, True)
+    _patch_sf_settings(monkeypatch)
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    sc = stub_storage_client(
+        monkeypatch, upsert_document_xmax={"xmax": 0}, get_document=None
+    )
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="skills",
+        doc_id="forge-x",
+        data=_valid_skill_data(source="forge"),
+    )
+    payload = parse_envelope(out)
+    assert payload["error"]["code"] == "FORBIDDEN"
+    sc.upsert_document_xmax.assert_not_awaited()
+
+
+async def test_skill_write_defaults_to_staged_when_flag_on(mcp_env, monkeypatch):
+    # An agent-direct write with no status defaults to 'staged' (per
+    # plan §4 / SF-002): it lands in the HITL inbox, NOT agent-visible,
+    # until approved to 'active'. We capture the upserted data to assert
+    # the validator normalized status → 'staged'.
+    _patch_flag(monkeypatch, True)
+    _patch_sf_settings(monkeypatch)
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    sc = stub_storage_client(
+        monkeypatch, upsert_document_xmax={"xmax": 0}, get_document=None
+    )
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="skills",
+        doc_id="forge-x",
+        data=_valid_skill_data(),  # no status
+    )
+    payload = parse_envelope(out)
+    assert payload["ok"] is True
+    # Validator-normalized data was passed through to the upsert.
+    sent_data = sc.upsert_document_xmax.await_args.args[0]["data"]
+    assert sent_data["status"] == "staged"
+    assert sent_data["source"] == "agent"
+    # content_hash is server-stamped, never trusted from the body.
+    assert sent_data["content_hash"].startswith("sha256:")
+
+
+async def test_skill_write_fails_closed_when_the_live_doc_fetch_errors(
+    mcp_env, monkeypatch
+):
+    """The CREATE-path counterpart to the update-path test below.
+
+    ``test_skill_update_write_fails_closed_on_live_doc_fetch_error`` already
+    pinned this for ``kind='update'``, which was the only kind that fetched.
+    This change makes ``kind='create'`` fetch too, so there is now a second
+    place to fail closed — and it is the security-relevant one: the fetch
+    feeds the stored-status overwrite gate, so falling through with
+    ``live_doc=None`` hands the validator exactly the ``None`` that made
+    ``kind='create'`` the way around that gate, turning a transient DB blip
+    into an open window on every active skill.
+    """
+    _patch_flag(monkeypatch, True)
+    _patch_sf_settings(monkeypatch)
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    sc = stub_storage_client(
+        monkeypatch, upsert_document_xmax={"xmax": 0}, get_document=None
+    )
+    sc.get_document = AsyncMock(side_effect=RuntimeError("storage unreachable"))
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="skills",
+        doc_id="forge-x",
+        data=_valid_skill_data(),
+    )
+    payload = parse_envelope(out)
+    assert payload["error"]["code"] == "INTERNAL_ERROR"
+    # The decisive assertion: nothing was written.
+    sc.upsert_document_xmax.assert_not_awaited()
+
+
+async def test_skill_write_gate_fetch_reads_the_primary(mcp_env, monkeypatch):
+    """The live-doc fetch must pin the PRIMARY, not the read replica.
+
+    ``get_document`` defaults to ``read=True``. That default is fine for an
+    ordinary read, but this fetch backs an authorization decision: on a
+    replica, a ``staged`` row an admin has just approved to ``active`` still
+    reads as ``staged``, the gate authorises the overwrite the transition was
+    meant to forbid, and the upsert that follows does no CAS on status, so
+    nothing downstream catches it. Pinning the kwarg here because the failure
+    is invisible in any test that stubs storage — the stub answers the same
+    either way.
+    """
+    _patch_flag(monkeypatch, True)
+    _patch_sf_settings(monkeypatch)
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    sc = stub_storage_client(
+        monkeypatch, upsert_document_xmax={"xmax": 0}, get_document=None
+    )
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="skills",
+        doc_id="forge-x",
+        data=_valid_skill_data(),
+    )
+    assert parse_envelope(out)["ok"] is True
+    assert sc.get_document.await_args.kwargs["read"] is False
+
+
+async def test_skill_write_tolerates_misconfigured_byte_caps(mcp_env, monkeypatch):
+    # A null / non-numeric per-tenant byte cap is a realistic admin
+    # misconfiguration. It must degrade to the documented default via
+    # _safe_int, not crash the write path with an opaque INTERNAL_ERROR.
+    _patch_flag(monkeypatch, True)
+    # enabled=True so the validator actually RUNS (and exercises
+    # _safe_int on the null / non-numeric caps).
+    _patch_sf_settings(
+        monkeypatch, enabled=True, description_max_bytes=None, body_max_bytes="auto"
+    )
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    stub_storage_client(
+        monkeypatch, upsert_document_xmax={"xmax": 0}, get_document=None
+    )
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="skills",
+        doc_id="forge-x",
+        data=_valid_skill_data(),
+    )
+    payload = parse_envelope(out)
+    assert payload["ok"] is True
+
+
+async def test_skill_write_fails_closed_on_settings_error(mcp_env, monkeypatch):
+    # The settings read gates whether the lifecycle validator runs. If it
+    # raises, the write must ABORT (INTERNAL_ERROR) — never fall through
+    # and upsert an unvalidated skill.
+    async def _boom(*_a, **_k):
+        raise RuntimeError("settings store down")
+
+    monkeypatch.setattr(mcp_server, "get_settings_for_display", _boom)
+    sc = stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 0})
+    out = await mcp_server.caura_doc(
+        op="write", collection="skills", doc_id="forge-x", data=_valid_skill_data()
+    )
+    payload = parse_envelope(out)
+    assert payload["error"]["code"] == "INTERNAL_ERROR"
+    sc.upsert_document_xmax.assert_not_awaited()
+
+
+async def test_skill_update_write_fails_closed_on_live_doc_fetch_error(
+    mcp_env, monkeypatch
+):
+    # A kind='update' write fetches the live skill for the validator's
+    # hash-binding check. A transient storage error there must ABORT with
+    # a curated INTERNAL_ERROR (not leak the raw exception), and never
+    # reach the upsert.
+    _patch_sf_settings(monkeypatch, enabled=True)
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+
+    async def _boom_get_document(**_kwargs):
+        raise RuntimeError("storage down")
+
+    # The live-doc fetch (get_document) raises; the upsert must never run.
+    sc = stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 0})
+    sc.get_document.side_effect = _boom_get_document
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="skills",
+        doc_id="forge-x",
+        data=_valid_skill_data(
+            kind="update", target={"target_content_hash": "sha256:abc"}
+        ),
+    )
+    payload = parse_envelope(out)
+    assert payload["error"]["code"] == "INTERNAL_ERROR"
+    sc.upsert_document_xmax.assert_not_awaited()
+
+
+async def test_skill_write_status_allowed_when_flag_off(mcp_env, monkeypatch):
+    # Non-opted-in tenant: validator is skipped entirely, legacy
+    # behavior — a minimal body with a caller-set status passes through
+    # unchanged (byte-identical to pre-Skill-Factory behavior).
+    _patch_flag(monkeypatch, False)
+    _patch_sf_settings(monkeypatch, enabled=False)
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    sc = stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 0})
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="skills",
+        doc_id="forge-x",
+        data={"slug": "forge-x", "summary": "s", "status": "active"},
+    )
+    payload = parse_envelope(out)
+    assert payload["ok"] is True
+    # Untouched: no validator ran, so status stays exactly as supplied.
+    assert sc.upsert_document_xmax.await_args.args[0]["data"]["status"] == "active"
+
+
+# ── op=delete (active-only existence gate) ─────────────────────────
+
+
+async def test_skill_delete_hides_non_active_when_flag_on(mcp_env, monkeypatch):
+    # The status guard is folded into the storage DELETE's WHERE
+    # (atomic, via ``require_status``). A staged skill matches zero rows →
+    # storage returns False → the SAME generic JSON not-found a MISSING
+    # doc returns, so a non-active skill is byte-for-byte indistinguishable
+    # from a missing one (no existence leak) and the response is valid JSON.
+    _patch_flag(monkeypatch, True)
+    stub_storage_client(
+        monkeypatch, delete_document=False
+    )  # status guard matched nothing
+    out = await mcp_server.caura_doc(op="delete", collection="skills", doc_id="forge/x")
+    assert is_error_envelope(out)
+    assert parse_envelope(out)["error"] == {
+        "code": "NOT_FOUND",
+        "message": "Document 'forge/x' not found in collection 'skills'.",
+    }
+
+
+async def test_skill_delete_allows_active_when_flag_on(mcp_env, monkeypatch):
+    # An active skill matches the require_status='active' guard → one row
+    # deleted, storage returns True.
+    _patch_flag(monkeypatch, True)
+    stub_storage_client(monkeypatch, delete_document=True)
+    out = await mcp_server.caura_doc(op="delete", collection="skills", doc_id="forge/x")
+    payload = parse_envelope(out)
+    assert payload["deleted"] is True
+
+
+async def test_skill_delete_fails_closed_on_settings_error(mcp_env, monkeypatch):
+    # The status guard is a security gate: a settings-lookup failure must
+    # ABORT the delete (INTERNAL_ERROR), not fall through to an
+    # unguarded DELETE (which would let an agent delete a non-active
+    # skill during an outage). Uses the strict _skills_factory_flag.
+    async def _boom(*_a, **_k):
+        raise RuntimeError("settings store down")
+
+    monkeypatch.setattr(mcp_server, "_skills_factory_flag", _boom)
+    sc = stub_storage_client(monkeypatch, delete_document=True)
+    out = await mcp_server.caura_doc(op="delete", collection="skills", doc_id="forge/x")
+    payload = parse_envelope(out)
+    assert payload["error"]["code"] == "INTERNAL_ERROR"
+    # The DELETE must never have run.
+    sc.delete_document.assert_not_awaited()
+
+
+# ── Cross-tenant leak: a sibling tenant's non-active skill must never
+# surface, even when the CALLER's own tenant has not opted in ──────────
+
+
+async def test_skill_read_hides_cross_tenant_non_active_even_when_caller_off(
+    mcp_env, monkeypatch
+):
+    # Caller tenant ('test-tenant') is NOT opted in, but reads a sibling
+    # tenant's staged skill via cross-tenant credentials. The owning
+    # tenant's in-flight skill must stay hidden regardless of the
+    # caller's flag.
+    _patch_flag(monkeypatch, False)
+    monkeypatch.setattr(
+        mcp_server, "_get_readable_tenants", lambda: ["test-tenant", "sibling"]
+    )
+    stub_storage_client(
+        monkeypatch,
+        get_document=_skill_doc("forge/x", status="staged", tenant_id="sibling"),
+    )
+    out = await mcp_server.caura_doc(op="read", collection="skills", doc_id="forge/x")
+    assert "Not found: skills/forge/x" in strip_latency(out)
+
+
+async def test_skill_query_drops_cross_tenant_non_active_when_caller_off(
+    mcp_env, monkeypatch
+):
+    _patch_flag(monkeypatch, False)
+    monkeypatch.setattr(
+        mcp_server, "_get_readable_tenants", lambda: ["test-tenant", "sibling"]
+    )
+    rows = [
+        _skill_doc("own/active", status="active", tenant_id="test-tenant"),
+        _skill_doc(
+            "own/staged", status="staged", tenant_id="test-tenant"
+        ),  # kept: caller off, same tenant
+        _skill_doc(
+            "sib/staged", status="staged", tenant_id="sibling"
+        ),  # dropped: cross-tenant non-active
+        _skill_doc("sib/active", status="active", tenant_id="sibling"),  # kept: active
+    ]
+    stub_storage_client(monkeypatch, query_documents=rows)
+    out = await mcp_server.caura_doc(op="query", collection="skills")
+    payload = parse_envelope(out)
+    ids = {r["doc_id"] for r in payload["results"]}
+    assert "sib/staged" not in ids  # cross-tenant non-active leaked → blocked
+    assert ids == {"own/active", "own/staged", "sib/active"}
+
+
+async def test_skill_search_drops_cross_tenant_non_active_when_caller_off(
+    mcp_env, monkeypatch
+):
+    _patch_flag(monkeypatch, False)
+    monkeypatch.setattr(
+        mcp_server, "_get_readable_tenants", lambda: ["test-tenant", "sibling"]
+    )
+    monkeypatch.setattr(
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
+    )
+    hits = [
+        _skill_hit("sib/staged", status="staged", similarity=0.9, tenant_id="sibling"),
+        _skill_hit("sib/active", status="active", similarity=0.8, tenant_id="sibling"),
+        _skill_hit(
+            "own/staged", status="staged", similarity=0.7, tenant_id="test-tenant"
+        ),
+    ]
+    stub_storage_client(monkeypatch, search_documents_vector=hits)
+    # Broad search (collection=None) over the readable set.
+    out = await mcp_server.caura_doc(op="search", query="deploy")
+    payload = parse_envelope(out)
+    ids = {r["doc_id"] for r in payload["results"]}
+    assert "sib/staged" not in ids  # cross-tenant non-active dropped
+    assert ids == {"sib/active", "own/staged"}  # own staged stays (caller off)
+
+
+# ── op=list_collections (active-only count for skills) ─────────────────
+
+
+async def test_list_collections_skill_count_active_only_when_flag_on(
+    mcp_env, monkeypatch
+):
+    _patch_flag(monkeypatch, True)
+    # The active-only recount issues one COUNT via the storage client.
+    stub_storage_client(
+        monkeypatch,
+        list_document_collections={
+            "collections": [
+                {"name": "customers", "count": 5},
+                {"name": "skills", "count": 9},
+            ]
+        },
+        document_count_in_collection=3,  # only 3 of the 9 skills are active
+    )
+    out = await mcp_server.caura_doc(op="list_collections")
+    payload = parse_envelope(out)
+    counts = {c["name"]: c["count"] for c in payload["collections"]}
+    assert counts["skills"] == 3  # corrected to active-only
+    assert counts["customers"] == 5  # non-skills untouched
+
+
+async def test_list_collections_skill_count_unchanged_when_flag_off(
+    mcp_env, monkeypatch
+):
+    _patch_flag(monkeypatch, False)
+    stub_storage_client(
+        monkeypatch,
+        list_document_collections={"collections": [{"name": "skills", "count": 9}]},
+    )
+    out = await mcp_server.caura_doc(op="list_collections")
+    payload = parse_envelope(out)
+    counts = {c["name"]: c["count"] for c in payload["collections"]}
+    assert counts["skills"] == 9  # legacy: full count, no recount
+
+
+# ── op=write (case-variant status key) ─────────────────────────────────
+
+
+async def test_skill_write_rejects_case_variant_status_key_when_flag_on(
+    mcp_env, monkeypatch
+):
+    # A 'STATUS' key can't self-promote (gates read lowercase
+    # data->>'status'), but it would persist as a confusing shadow
+    # field. Reject it outright.
+    _patch_flag(monkeypatch, True)
+    _patch_sf_settings(monkeypatch)
+    sc = stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 0})
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="skills",
+        doc_id="forge-x",
+        data=_valid_skill_data(STATUS="active"),
+    )
+    payload = parse_envelope(out)
+    assert payload["error"]["code"] == "INVALID_ARGUMENTS"
+    assert "status" in payload["error"]["message"].lower()
+    sc.upsert_document_xmax.assert_not_awaited()
+
+
+async def test_safe_int_degrades_bool_and_garbage_to_default():
+    # bool is an int subclass — int(True)==1 — so it must be rejected
+    # explicitly, alongside null / non-numeric strings.
+    assert mcp_server._safe_int(True, 160) == 160
+    assert mcp_server._safe_int(False, 160) == 160
+    assert mcp_server._safe_int(None, 160) == 160
+    assert mcp_server._safe_int("auto", 160) == 160
+    assert mcp_server._safe_int([], 160) == 160
+    # Valid values still pass through (ints and numeric strings).
+    assert mcp_server._safe_int(40_000, 160) == 40_000
+    assert mcp_server._safe_int("4096", 160) == 4096
+
+
+async def test_skills_factory_enabled_fails_closed_on_settings_error(
+    mcp_env, monkeypatch
+):
+    # The read-path helper must fail CLOSED: if the strict flag lookup
+    # raises, assume enabled (True) so the active-only filter is applied
+    # and non-active skills can't leak during a settings outage.
+    async def _boom(*_a, **_k):
+        raise RuntimeError("settings store down")
+
+    monkeypatch.setattr(mcp_server, "_skills_factory_flag", _boom)
+    result = await mcp_server._skills_factory_enabled("test-tenant")
+    assert result is True
+
+
+async def test_skill_read_hides_non_active_when_flag_lookup_errors(
+    mcp_env, monkeypatch
+):
+    # End-to-end: a settings outage during a skill read filters (hides
+    # the non-active skill), it does not 500 or leak.
+    async def _boom(*_a, **_k):
+        raise RuntimeError("settings store down")
+
+    monkeypatch.setattr(mcp_server, "_skills_factory_flag", _boom)
+    stub_storage_client(
+        monkeypatch, get_document=_skill_doc("forge/x", status="staged")
+    )
+    out = await mcp_server.caura_doc(op="read", collection="skills", doc_id="forge/x")
+    assert "Not found: skills/forge/x" in strip_latency(out)
+
+
+# ---------------------------------------------------------------------------
+# Doc-derived memory (CAURA-704)
+#
+# ``op=write`` mints a memory carrying the document BODY, because the two stores
+# aren't cross-searched: only ``data["summary"]`` is embedded on the doc row and
+# ``caura_recall`` never returns documents. These tests pin that the MCP
+# surface mints per the shared rule and — critically — that a minting failure
+# never fails the document write.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def spy_doc_memory(monkeypatch):
+    """Spy on ``safe_sync_doc_memory``.
+
+    The handler imports it lazily inside the ``op=write`` branch, so patching the
+    defining module is what takes effect at call time.
+    """
+    from unittest.mock import AsyncMock
+
+    spy = AsyncMock(return_value="mem-1")
+    monkeypatch.setattr("core_api.services.doc_memory.safe_sync_doc_memory", spy)
+    return spy
+
+
+async def test_doc_write_mints_memory_for_body_bearing_doc(
+    mcp_env, monkeypatch, spy_doc_memory
+):
+    stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 0})
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="runbooks",
+        doc_id="pg-tuning",
+        data={
+            "summary": "Postgres tuning runbook.",
+            "content": "# Vacuum\n\nRun nightly.",
+        },
+    )
+
+    assert parse_envelope(out)["ok"] is True
+    spy_doc_memory.assert_awaited_once()
+    spec = spy_doc_memory.call_args.args[0]
+    assert "# Vacuum\n\nRun nightly." in spec.content  # rendered, body intact
+    assert spec.source_uri == "caura-doc://runbooks/pg-tuning"
+
+
+async def test_doc_write_mints_on_update_too(mcp_env, monkeypatch, spy_doc_memory):
+    """Every write mints — there is no create-vs-update branch. Rewrite
+    semantics come from the write pipeline's exact/near dedup instead."""
+    stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 42})
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="runbooks",
+        doc_id="pg-tuning",
+        data={"content": "changed body"},
+    )
+
+    assert parse_envelope(out)["action"] == "updated"
+    spy_doc_memory.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("collection", "data"),
+    [
+        ("customers", {}),  # empty payload — nothing to render
+        ("notes", {"content": ""}),  # only empty values
+    ],
+)
+async def test_doc_write_skips_mint_per_shared_rule(
+    mcp_env, monkeypatch, spy_doc_memory, collection, data
+):
+    stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 0})
+    out = await mcp_server.caura_doc(
+        op="write", collection=collection, doc_id="x", data=data
+    )
+
+    assert parse_envelope(out)["ok"] is True
+    spy_doc_memory.assert_not_awaited()
+
+
+async def test_doc_write_survives_a_raising_mint(mcp_env, monkeypatch, spy_doc_memory):
+    """The document has already committed and is the source of truth.
+
+    ``safe_sync_doc_memory`` is contractually non-raising, so this exercises the
+    call site's belt-and-braces guard: even if that contract is broken by a future
+    refactor, the doc write must still succeed rather than returning an error
+    envelope to the caller.
+    """
+    spy_doc_memory.side_effect = RuntimeError("memory subsystem down")
+    stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 0})
+
+    out = await mcp_server.caura_doc(
+        op="write", collection="runbooks", doc_id="pg", data={"content": "body"}
+    )
+
+    spy_doc_memory.assert_awaited_once()
+    payload = parse_envelope(out)
+    assert payload["ok"] is True
+    assert payload["action"] == "created"
+
+
+async def test_doc_write_skips_mint_for_skills_collection(
+    mcp_env, monkeypatch, spy_doc_memory
+):
+    """Skills keep their staged -> active approval lifecycle: a recallable memory
+    would route around it."""
+    stub_storage_client(monkeypatch, upsert_document_xmax={"xmax": 0})
+    out = await mcp_server.caura_doc(
+        op="write",
+        collection="skills",
+        doc_id="my-skill",
+        data={"summary": "A skill.", "content": "# Steps"},
+    )
+
+    assert parse_envelope(out)["ok"] is True
+    spy_doc_memory.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _async_return(value):
+    async def _fn(*args, **kwargs):
+        return value
+
+    return _fn

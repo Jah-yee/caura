@@ -1,0 +1,55 @@
+"""ExtractTemporalHint — auto-detect time scope from query.
+
+Sets three context keys:
+- ``temporal_window``: soft freshness boost (timedelta or None)
+- ``date_range_filter``: hard WHERE filter (dict or None)
+- ``history_hint``: bool — the query asks about a past state / change /
+  duration, so the scored search must NOT demote superseded rows (A63)
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+
+from core_api.pipeline.context import PipelineContext
+from core_api.pipeline.step import StepResult
+from core_api.services.memory_service import (
+    _extract_history_hint,
+    _extract_temporal_date_range,
+    _extract_temporal_hint,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ExtractTemporalHint:
+    @property
+    def name(self) -> str:
+        return "extract_temporal_hint"
+
+    async def execute(self, ctx: PipelineContext) -> StepResult | None:
+        query = ctx.data["query"]
+        ctx.data["temporal_window"] = _extract_temporal_hint(query)
+
+        reference_dt = ctx.data.get("valid_at") or datetime.now(UTC)
+        ctx.data["date_range_filter"] = _extract_temporal_date_range(query, reference_dt)
+        # A63 — history questions need superseded values: the contradiction
+        # judge marks the older side of an update outdated/conflicted, and
+        # the scored search halves those rows' scores. Right for "what's
+        # true now", wrong for "what was true then" — this flag lifts the
+        # demotion for the latter.
+        ctx.data["history_hint"] = _extract_history_hint(query)
+        # DEBUG, not INFO: this fires once per search and echoes the raw query
+        # text — mild PII (customer query content), and it surfaces verbatim in
+        # prod logs whenever ops searches Caura with an error-alert signature
+        # (the "temporal_hint: query='<error text>'" echo). The extracted
+        # window/date_range are carried on ctx.data for any downstream logging.
+        logger.debug(
+            "temporal_hint: query=%r ref=%s window=%s date_range=%s",
+            query[:80],
+            reference_dt,
+            ctx.data["temporal_window"],
+            ctx.data["date_range_filter"],
+        )
+        return None

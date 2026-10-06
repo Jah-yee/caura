@@ -1,0 +1,75 @@
+"""LLM-provider Protocol — moved from ``core_api.protocols`` (CAURA-595).
+
+Async LLM provider interface for structured-JSON + free-text completions.
+The same Protocol is consumed by ``common.enrichment.service`` (via
+``get_llm_provider`` factory) and by core-api code paths that pre-date
+the extraction (which keep working via the re-export at
+``core_api.protocols.LLMProvider``).
+
+Mirrors the embedding-provider extraction (CAURA-594 Step B): keep the
+shared Protocol in ``common`` so both core-api and core-worker can import
+it without the worker pulling in core_api as a dependency.
+"""
+
+from __future__ import annotations
+
+from typing import Protocol, runtime_checkable
+
+
+@runtime_checkable
+class LLMProvider(Protocol):
+    """Async LLM provider for structured (JSON) and free-text completions."""
+
+    @property
+    def provider_name(self) -> str: ...
+
+    @property
+    def model(self) -> str: ...
+
+    async def complete_json(
+        self,
+        prompt: str,
+        *,
+        temperature: float = 0.0,
+        seed: int | None = None,
+        response_schema: dict | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict:
+        """Send a prompt and return a parsed JSON dict.
+
+        Implementations are responsible for enforcing JSON output using
+        whatever mechanism the underlying API supports (e.g., OpenAI
+        ``response_format``, Vertex ``response_mime_type``, or prompt
+        engineering for APIs without native JSON mode).
+
+        ``reasoning_effort`` (E3): reasoning-token budget hint for
+        reasoning-class models. Valid values are MODEL-SPECIFIC (e.g.
+        gpt-5.4 family: ``"none"`` / ``"low"`` / ``"medium"`` /
+        ``"high"`` / ``"xhigh"``); an unsupported value is a 400 on
+        every call. ``None`` means "do not send the parameter" —
+        required for non-reasoning models, which reject it. Providers
+        without an equivalent knob accept-and-ignore.
+
+        Parameters that are not supported by a provider (e.g.,
+        ``temperature``, ``seed``, ``response_schema``,
+        ``reasoning_effort``) MUST be accepted-and-ignored, never
+        rejected: a ``TypeError`` here is swallowed by the
+        ``call_with_fallback`` retry loop and surfaces as a silent
+        degradation to the fake/regex fallback (audit C1).
+        """
+        ...
+
+    async def complete_text(
+        self,
+        prompt: str,
+        *,
+        temperature: float = 0.3,
+        max_tokens: int = 1000,
+    ) -> str:
+        """Send a prompt and return raw text.
+
+        Parameters that are not supported by a provider (e.g.,
+        ``temperature``, ``max_tokens``) may be silently ignored by the
+        implementation.
+        """
+        ...

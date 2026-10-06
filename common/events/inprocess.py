@@ -1,0 +1,141 @@
+"""In-process event bus — asyncio-only, no external deps.
+
+Used in standalone mode and in tests. Dispatches to subscribers via
+`asyncio.create_task`, tracking each task so shutdown can await them.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections import defaultdict
+
+from common.events.base import (
+    CircularPublishChainError,
+    Event,
+    EventBus,
+    EventHandler,
+)
+from common.events.topics import publish_name, subscribe_names
+
+logger = logging.getLogger(__name__)
+
+
+class InProcessEventBus(EventBus):
+    """Dispatches events to handlers registered in the same process.
+
+    Exceptions raised by a handler are logged but do not propagate to the
+    publisher, so one failing subscriber cannot break its siblings or the
+    caller that published. The event is then GONE: this bus has no queue to
+    return it to and no dead-letter to divert it into, which makes it
+    at-most-once.
+
+    That is a real difference from the Pub/Sub backend rather than a match
+    for it, and this docstring used to claim the opposite — "matches
+    Pub/Sub-style fire-and-forget semantics", when Pub/Sub is not
+    fire-and-forget at all: it redelivers precisely the messages this bus
+    discards. Standalone and OSS deployments run on this backend, so a
+    handler doing work that must not be lost has to persist it itself.
+
+    A test helper (`drain`) is exposed for tests that need to assert handlers
+    ran to completion.
+    """
+
+    def __init__(self) -> None:
+        self._handlers: dict[str, list[EventHandler]] = defaultdict(list)
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    def subscribe(
+        self, topic: str, handler: EventHandler, *, broadcast: bool = False
+    ) -> None:
+        # ``broadcast`` is a no-op here: a single-process bus already
+        # dispatches every event to all local handlers (fan-out within the
+        # process). Cross-worker fan-out is a Pub/Sub-backend concern.
+        #
+        # Brand rename: bind both names ALWAYS, with no flag — the opposite
+        # default to the Pub/Sub backend, for the reason that makes the flag
+        # necessary there. On Pub/Sub a name is a provisioned subscription, so
+        # binding one that does not exist yet halts a pull loop; here a name is
+        # a dict key, costs nothing, and cannot fail. What it buys is that the
+        # publisher flip stays correct for standalone and on-prem deployments,
+        # which never run the Terraform that the flag is gated on. Leaving this
+        # backend single-name would mean a flipped family silently dispatches to
+        # nobody in exactly the deployments with no Pub/Sub console to notice it
+        # in.
+        for name in subscribe_names(topic, dual=True):
+            self._handlers[name].append(handler)
+
+    async def publish(self, topic: str, event: Event) -> None:
+        # One name, resolved the same way the Pub/Sub backend resolves it, so
+        # the two backends cannot disagree about which name a family publishes
+        # under. Dispatch stays exactly once: subscribers hold both names but
+        # only one of them is ever published to.
+        for handler in self._handlers.get(publish_name(topic), ()):
+            task = asyncio.create_task(self._safe_invoke(handler, event))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _safe_invoke(self, handler: EventHandler, event: Event) -> None:
+        try:
+            await handler(event)
+        except Exception:
+            # Don't let a single bad subscriber take down the bus. Say the
+            # event was DROPPED, not merely that a handler raised: on this
+            # backend those are the same fact, and only the first spelling
+            # tells a reader of the logs that the work will not be retried.
+            # ``dropped=True`` matches the alert hook the worker's own
+            # ack-drop paths use.
+            logger.exception(
+                "event handler raised — event dropped, no redelivery on this bus",
+                extra={
+                    "event_type": event.event_type,
+                    "event_id": str(event.event_id),
+                    "dropped": True,
+                },
+            )
+
+    async def drain(self, max_rounds: int = 100) -> None:
+        """Await every handler task currently in flight. For tests only —
+        production code should await `stop()` during shutdown, not this.
+
+        `max_rounds` guards against circular publish chains (A→B→A) that
+        would otherwise keep spawning tasks forever. On exhaustion, the
+        remaining tasks are cancelled + awaited before raising so the
+        bus doesn't leak live coroutines past this call.
+        """
+        for _ in range(max_rounds):
+            if not self._tasks:
+                return
+            # Snapshot because new tasks may spawn while we're awaiting.
+            pending = list(self._tasks)
+            await asyncio.gather(*pending, return_exceptions=True)
+        for _ in range(10):
+            if not self._tasks:
+                break
+            snapshot = list(self._tasks)
+            for t in snapshot:
+                t.cancel()
+            await asyncio.gather(*snapshot, return_exceptions=True)
+        self._tasks.clear()
+        raise CircularPublishChainError(
+            "drain() exceeded max_rounds — likely a circular event-publish chain"
+        )
+
+    async def stop(self) -> None:
+        # `drain()` raises `CircularPublishChainError` on a circular
+        # publish chain — catching the dedicated subclass keeps
+        # `stop()` safe to call from shutdown paths (lifespan `finally`,
+        # signal handlers, test teardown) without masking the real
+        # cause. Any other RuntimeError is an unexpected bug and will
+        # propagate up the call stack.
+        try:
+            # stop() wants a bounded cleanup — 3 rounds is enough to
+            # absorb ordinary cascades (publish → handler → publish)
+            # without turning a bad handler graph into a 100-round
+            # shutdown delay.
+            await self.drain(max_rounds=3)
+        except CircularPublishChainError:
+            logger.exception(
+                "drain() raised during stop(); handler tasks were cancelled "
+                "due to a circular publish chain"
+            )

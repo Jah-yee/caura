@@ -1,0 +1,3663 @@
+"""Detect and resolve contradictions between memories on write.
+
+P1 fixes:
+- Post-commit async detection (sees all committed data, no concurrency blind spot)
+- Correct supersession semantics (new_memory.supersedes_id -> old memory)
+- Broader candidate search (threshold 0.70, limit 8)
+
+Multi-provider support:
+- Vertex AI, OpenAI, Anthropic, OpenRouter via provider layer
+- Automatic fallback chain: configured provider -> fallback -> abstain
+  (heuristic only when the ``fake`` provider was explicitly asked for; see
+  ``common.llm.retry.deliberate_fake_provider``)
+"""
+
+import asyncio
+import hashlib
+import logging
+import re
+import time
+import traceback
+import uuid as _uuid
+from contextvars import ContextVar
+from datetime import datetime
+from typing import Any, NamedTuple
+from uuid import UUID
+
+from common.constants import predicate_cluster
+from common.provider_names import ProviderName
+from core_api.cache import cache_delete_if, cache_set_nx
+from core_api.clients.storage_client import get_storage_client
+from core_api.config import settings
+from core_api.constants import CONTRADICTED_STATUSES, SINGLE_VALUE_PREDICATES
+from core_api.providers._retry import call_with_fallback, deliberate_fake_provider
+from core_api.schemas import ContradictionInfo
+from core_api.services.subject_preflight import _subjects_differ_with_certainty
+from core_api.services.task_tracker import record_task_failure
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# A4 #14 — back-channel idempotency for back-to-back detection invocations.
+# ---------------------------------------------------------------------------
+
+# Lock TTL. Long enough for any detection to complete (worst case
+# ~10s per candidate; ~80s for a typical batch); short enough that
+# a process crash holding the lock doesn't permanently block
+# re-detection for the same memory.
+_DETECTION_LOCK_TTL_SECONDS = 3600
+
+
+def _content_fingerprint(content: str) -> str:
+    """Short stable digest of the text a detection run examined.
+
+    Part of the lock key (H-06). Keyed on ``memory_id`` alone, the lock also
+    deduped runs that were checking DIFFERENT text: ``update_memory`` clears
+    supersession state and re-fires detection on a content edit, but a memory
+    corrected within the TTL — the normal case for a quick fix — still held the
+    write-time lock, so the edited content was never checked and no later
+    trigger re-fired. Including the content makes an edit a different lock.
+
+    Hashed rather than embedded: memory content is unbounded and Redis keys are
+    values. Truncated because this only has to separate versions of ONE
+    memory's text, not resist collision across a corpus.
+    """
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:32]
+
+
+def _content_lock_key(memory_id, content: str) -> str:
+    return f"contradiction:path_a:{memory_id}:{_content_fingerprint(content)}"
+
+
+def _entity_lock_key(memory_id, content: str) -> str:
+    return f"contradiction:path_c:{memory_id}:{_content_fingerprint(content)}"
+
+
+def _lock_token() -> str:
+    """A fresh per-acquisition owner token — see ``_release_lock``."""
+    return _uuid.uuid4().hex
+
+
+async def _acquire_content_lock(memory_id, content: str, token: str) -> bool:
+    """Try to acquire the Path A (semantic + RDF) idempotency lock for
+    ``memory_id`` at this ``content``. Returns True iff this caller owns the
+    lock and should proceed; False if another caller already holds it and we
+    should skip.
+
+    Lock is keyed per-path so Path A and Path C run independently for
+    the same memory, and per-content so an edit is not deduped against the
+    run that checked the previous text. ``token`` identifies THIS acquisition
+    so the release can tell its own lock from a successor's.
+    """
+    return await cache_set_nx(_content_lock_key(memory_id, content), token, _DETECTION_LOCK_TTL_SECONDS)
+
+
+async def _acquire_entity_lock(memory_id, content: str, token: str) -> bool:
+    """Try to acquire the Path C (entity-overlap) idempotency lock for
+    ``memory_id`` at this ``content``. Returns True iff this caller owns the
+    lock; False means another caller already ran detection for this memory at
+    this content."""
+    return await cache_set_nx(_entity_lock_key(memory_id, content), token, _DETECTION_LOCK_TTL_SECONDS)
+
+
+async def _release_lock(key: str, token: str) -> None:
+    """Drop a detection lock so the next trigger can retry.
+
+    Released ONLY when a run did not reach a verdict — it threw, or it exited
+    before examining anything (a missing / soft-deleted row). A run that
+    concluded keeps its lock for the full TTL, INCLUDING the "no candidates"
+    and "preflight dropped them all" outcomes, which are results rather than
+    failures. Collapsing the back-to-back ENRICHED and EMBEDDED deliveries is
+    the entire point of the lock: releasing on success would let the second
+    delivery re-run every LLM judgement whenever it landed more than one
+    detection apart from the first.
+
+    Compare-and-delete on ``token``, never a bare DEL. A run whose work outran
+    the 3600s TTL no longer owns the key: by then the lock may have expired and
+    been re-taken by a NEW run, and an unconditional delete would take that
+    successor's lock away and hand it a duplicate detection — the exact
+    guarantee this lock exists to provide. Releasing by token makes a late
+    release a no-op instead.
+
+    ``cache_delete_if`` is total — it swallows both a missing Redis and a
+    failed EVAL — so this cannot break the never-raises contract that lets the
+    Pub/Sub consumers ack unconditionally.
+    """
+    await cache_delete_if(key, token)
+
+
+def _parse_dt(value) -> datetime | None:
+    """Best-effort parse of an ISO datetime string or pass-through datetime."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _pick_older(a: dict, b: dict) -> dict:
+    """Return whichever of ``a`` or ``b`` was created first.
+
+    Used at *attribution* time to keep the supersession chain pointing
+    newer→older regardless of which row carried the "new memory"
+    framing at detection time. CAURA-125 (audit gap A6) — prior to
+    this helper, the detector used a strict
+    ``candidate.created_at < new_memory.created_at`` filter to GATE
+    detection itself, causing the verdict to depend on which row
+    happened to be written first. That's now split: detection is
+    symmetric (both shapes get checked), and direction is decided
+    here after a conflict is confirmed.
+
+    Tiebreaker rules, in order:
+      1. Both ``created_at`` parseable and different → strictly older
+         timestamp wins.
+      2. Tied or unparseable timestamp → smaller-by-string UUID wins.
+         Deterministic across replays and across UUID versions (v4/v6/
+         v7); we don't depend on UUIDs being time-ordered.
+
+    The caller is responsible for using the returned identity to
+    decide which row to mark ``outdated`` / ``conflicted`` and where
+    to point the ``supersedes_id`` edge.
+    """
+    a_dt = _parse_dt(a.get("created_at"))
+    b_dt = _parse_dt(b.get("created_at"))
+    if a_dt is not None and b_dt is not None and a_dt != b_dt:
+        return a if a_dt < b_dt else b
+    # Tied or unparseable — fall back to UUID string ordering.
+    a_id = str(a.get("id") or "")
+    b_id = str(b.get("id") or "")
+    if a_id < b_id:
+        return a
+    if b_id < a_id:
+        return b
+    # Truly equal (same row twice, or both ids missing/None).
+    # Return ``a`` by convention; callers should not pass the same
+    # row on both sides in production, but tests do for invariants.
+    return a
+
+
+def _merge_status_update(acc: dict[str, dict], row: dict) -> None:
+    """Merge a per-row update into the accumulator keyed by ``memory_id``.
+
+    The contradiction-detection loops can append two writes for the same
+    ``memory_id`` in a mixed canonical/flipped run — one bare
+    ``{status: ...}`` from the top-of-loop "older → outdated" branch and
+    one ``{status: ..., supersedes_id: ...}`` from the inner attribution
+    branch. The old serial code relied on those two writes landing in
+    iteration order and the second one's ``supersedes_id`` taking
+    effect; the new batched code passes both rows in one
+    ``batch_update_status`` payload, where last-write-wins semantics
+    inside the endpoint are an implementation detail, not part of the
+    contract (a future ``UPDATE FROM VALUES`` optimisation would make
+    order undefined). Dedupe per ``memory_id`` here so the wire payload
+    carries one merged row per memory and the storage endpoint can be
+    optimised freely without changing the resulting DB state.
+
+    Later writes override earlier writes on a per-field basis (plain
+    ``dict.update``) — preserving today's last-write-wins semantics
+    on the fields the inner branch sets (``status``, ``supersedes_id``)
+    while keeping any earlier fields that the later write doesn't touch.
+    This matches the existing ``TestMixedDirectionStateGuard`` invariant
+    in ``test_contradiction_direction_invariance.py``: both the
+    canonical iteration's ``supersedes_id`` chain link AND the flipped
+    iteration's status update must land for the same ``memory_id``.
+    """
+    mid = row["memory_id"]
+    if mid in acc:
+        acc[mid].update(row)
+    else:
+        acc[mid] = dict(row)
+
+
+def _log_batch_status_result(result: dict | None, *, path: str, memory_id) -> None:
+    """Log the two ways ``batch_update_status`` can decline part of a flush.
+
+    ``skipped`` carries rows whose STATUS write the storage side dropped: an
+    ``expected_supersedes_id`` mismatch, or a row already deleted. Pre-batch,
+    the single-row PATCH route surfaced 404 as a hard error; the batch route
+    returns the list instead so one gone row doesn't abort the whole detection
+    cycle. No forward path passes ``expected_supersedes_id``, so a non-empty
+    list here means the target row was soft-deleted between detect-and-flush.
+
+    ``edge_skipped`` (09/22 M-01) is a different event: the status landed, but
+    the ``expect_supersedes_null`` CAS lost to a concurrent writer who wired
+    that edge first. Not an error — it is the guard doing its job — but worth
+    a line, because until M-01 that race silently re-pointed the row and
+    orphaned its previous target, and the storage CAS the comments around here
+    named as the backstop did not exist on this route.
+
+    One helper for all three flush sites: the three used to carry three copies
+    of the same explanation, and a claim maintained in triplicate is how the
+    phantom CAS survived this long.
+    """
+    result = result or {}
+    if result.get("skipped"):
+        logger.warning(
+            "batch_update_status (%s) skipped %d row(s) (trigger memory %s): %s",
+            path,
+            len(result["skipped"]),
+            memory_id,
+            result["skipped"],
+        )
+    if result.get("edge_skipped"):
+        logger.warning(
+            "batch_update_status (%s) lost the chain-edge CAS on %d row(s) "
+            "(trigger memory %s) — another writer owns those edges: %s",
+            path,
+            len(result["edge_skipped"]),
+            memory_id,
+            result["edge_skipped"],
+        )
+
+
+def _unlinked_pairs(
+    new_memory: dict, pairs: list[tuple[dict, str, float | None]], updates: dict[str, dict]
+) -> list[tuple[dict, str, float | None]]:
+    """The confirmed pairs whose loser no chain edge in ``updates`` points at (M-34).
+
+    ``supersedes_id`` is one column, so each loop wires ``new_memory`` to its first
+    canonical loser only, and to none when it already supersedes a row; a flipped
+    winner that already supersedes a row keeps that edge. Every such loser is
+    demoted all the same, and with nothing pointing at it ``find_successors``
+    cannot say what replaced it and retraction cannot reach it.
+    """
+    linked = {u["supersedes_id"] for u in updates.values() if u.get("supersedes_id")}
+    return [p for p in pairs if str(_pick_older(p[0], new_memory).get("id")) not in linked]
+
+
+async def _record_conflicts(
+    new_memory: dict,
+    pairs: list[tuple[dict, str, float | None]],
+    unlinked: list[tuple[dict, str, float | None]],
+    *,
+    tenant_id: str,
+    tenant_config,
+) -> None:
+    """Write the ``memory_conflicts`` records a detection loop owes, after its flush.
+
+    A55 1d records every confirmed pair when ``contradiction_write_conflict_record``
+    is on (off by default). An unlinked loser (M-34) is recorded whatever the flag:
+    its record is all that still names the memory that replaced it. ``unlinked`` is
+    drawn from ``pairs``, so no pair is written twice.
+    """
+    to_record = pairs if settings.contradiction_write_conflict_record else unlinked
+    if not to_record:
+        return
+    # Not a top-level import: the resolver's relationship module imports this one.
+    from core_api.services.contradiction.resolver import record_detected_conflicts
+
+    await record_detected_conflicts(
+        new_memory,
+        to_record,
+        tenant_id=tenant_id,
+        fleet_id=new_memory.get("fleet_id"),
+        tenant_config=tenant_config,
+    )
+
+
+# ---------------------------------------------------------------------------
+# A19 — process-wide admission gate for detection passes.
+# ---------------------------------------------------------------------------
+
+# Every trigger site schedules detection with ``track_task`` (a bare
+# ``asyncio.create_task``), so the per-tenant bulkheads bound how fast writes
+# are ADMITTED while nothing bounds how many detections then RUN at once: the
+# tasks outlive the requests that spawned them, and 8 concurrent 100-item
+# bulks leave ~1,600 detection coroutines racing the moment they commit. Each
+# pass holds up to ``_ENTITY_CTX_FANOUT_LIMIT`` (8) connections of the SAME
+# 200-connection / 5s-pool-budget storage pool the foreground request path
+# uses, plus one LLM judge call for seconds — a big enough burst surfaces as
+# foreground PoolTimeouts (the 2026-06-16 incident shape) and judge abstains
+# (#821), i.e. silently dropped detections. This gate turns that collapse
+# into bounded concurrency + FIFO queueing.
+#
+# Queue, never shed: detection is post-commit background work with no caller
+# waiting on it, and a shed pass is a contradiction nobody ever looks for.
+# Waiting coroutines cost ~KBs; the resources the cap protects (storage pool,
+# provider quota, event loop) are what actually collapse. ONE shared gate for
+# every entry point — mirroring ``interview_service.synthesis_sem`` — because
+# two independent Semaphore(N)s would allow 2N whenever Path A bursts overlap
+# Path C bursts, exactly the stampede the cap exists to prevent. Global
+# rather than per-tenant (unlike ``per_tenant_concurrency``) because the
+# protected resources are process-global; a hot tenant delaying another
+# tenant's BACKGROUND detection is acceptable in a way that pool exhaustion
+# for everyone is not.
+#
+# The semaphore is cached per running loop rather than created at import:
+# asyncio primitives bind to the first loop that awaits them, and the test
+# suite runs one loop per test — a module-level instance would poison every
+# later test with "bound to a different event loop" (same reason
+# ``_bounded_gather`` builds a fresh semaphore per call). Production has one
+# loop per process, so the cached instance is process-wide there.
+_DETECTION_GATE: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
+
+
+def _detection_gate() -> asyncio.Semaphore:
+    global _DETECTION_GATE
+    loop = asyncio.get_running_loop()
+    if _DETECTION_GATE is None or _DETECTION_GATE[0] is not loop:
+        _DETECTION_GATE = (loop, asyncio.Semaphore(settings.contradiction_detection_concurrency))
+    return _DETECTION_GATE[1]
+
+
+async def _acquire_detection_slot() -> tuple[asyncio.Semaphore, int]:
+    """Take one detection slot, returning ``(gate, queued_ms)``.
+
+    ``queued_ms`` is surfaced in the ``path_a/c_completed`` lines so gate
+    pressure is quantifiable from production logs alone (detection-proper
+    time = ``elapsed_ms - queued_ms``); the pre-acquire DEBUG mirrors
+    ``per_tenant_storage_slot``'s saturation log. Split from the entry
+    points so both share one queue and one instrumentation story.
+    """
+    gate = _detection_gate()
+    if gate.locked():
+        logger.debug(
+            "contradiction-detection gate saturated; queuing",
+            extra={"cap": settings.contradiction_detection_concurrency},
+        )
+    t0 = time.monotonic()
+    await gate.acquire()
+    return gate, round((time.monotonic() - t0) * 1000)
+
+
+# ---------------------------------------------------------------------------
+# Public API: async post-commit entry point (P1-1)
+# ---------------------------------------------------------------------------
+
+
+# ── A40 — the deterministic RDF pass, callable from both triggers ─────────
+#
+# Extracted verbatim from ``detect_contradictions_async`` so the SAME pass can
+# also run after entity extraction. It used to be reachable only at write time,
+# and that made it close to dead for the facts this product is actually about.
+#
+# The gate needs ``(subject_entity_id, predicate, object_value)``.
+# ``EmitMemoryTriple`` populates those during the write with no LLM call, but it
+# resolves a SUBJECT from only two sources: a caller-supplied ``entity_links``
+# row, or an identifier-shaped token. Proper nouns deliberately return None
+# ("Alice", "Atlas" — see ``_infer_subject_token``), deferring to the
+# entity-extraction worker's higher-precision output. Measured on this code:
+#
+#     "Maya lives in Boston"             predicate=lives_in          subject=None
+#     "Acme is headquartered in Berlin"  predicate=headquartered_in  subject=None
+#     "Priya reports to Dana"            predicate=reports_to        subject=None
+#     "TOKEN-XYZ has release date 2027"  predicate=release_date      subject=TOKEN-XYZ
+#
+# So for any human- or company-subject fact the row commits with a NULL subject,
+# this gate fails, and Path A falls straight through to the STOCHASTIC raw-text
+# semantic judge — the R7 miss. Extraction then fills the columns in moments and
+# fires Path C, which does entity-overlap plus another LLM judge and never
+# retries the deterministic check. The one non-stochastic verdict in the module
+# was structurally unreachable exactly where it was needed.
+#
+# Running it again post-extraction is also CHEAPER, not more expensive: Path A's
+# semantic judge is gated on ``if not contradictions``, so a deterministic
+# verdict SUPPRESSES an LLM call rather than adding one.
+#
+# Re-running is safe by construction, and it is worth being exact about WHY,
+# because the reason given here was wrong until 09/22 M-01. Two things carry it:
+#
+#   1. ``memory_find_rdf_conflicts`` selects only ``active``/``confirmed``/
+#      ``pending`` rows, so anything an earlier pass already retired is out of
+#      scope. This half was always true and does the bulk of the work.
+#   2. The chain edge is written under a CAS against NULL, so a second pass
+#      cannot re-point a row the first pass already wired.
+#
+# (2) is only true as of M-01. This comment previously cited "the storage CAS
+# (``WHERE supersedes_id IS NULL``)" as an ambient property of storage. It was
+# not: that clause lived in ``PATCH /memories/{id}/status``, and every forward
+# path below writes through ``POST /memories/batch-update-status``, which set
+# the pointer unconditionally. The batch route now takes
+# ``expect_supersedes_null``, and the edge writes below pass it — so the
+# backstop this paragraph names is one the calls actually request.
+class _RdfPassResult(NamedTuple):
+    contradictions: list[ContradictionInfo]
+    record_pairs: list[tuple[dict, str, float | None]]
+    supersedes_id: Any
+    ran: bool
+    # M-34 — the record_pairs whose loser no edge from this pass points at.
+    unlinked_pairs: list[tuple[dict, str, float | None]]
+
+
+async def _rdf_conflict_pass(
+    sc,
+    new_memory: dict,
+    *,
+    memory_id,
+    tenant_id: str,
+    supersedes_id,
+) -> _RdfPassResult:
+    """Run the deterministic single-value-predicate contradiction check.
+
+    ``ran`` reports whether the triple gate passed, so a caller can tell "no
+    conflict" apart from "could not look" — the distinction that hid this bug.
+    """
+    subject_entity_id = new_memory.get("subject_entity_id")
+    predicate = new_memory.get("predicate")
+    object_value = new_memory.get("object_value")
+    contradictions: list[ContradictionInfo] = []
+    _record_pairs: list[tuple[dict, str, float | None]] = []
+    unlinked: list[tuple[dict, str, float | None]] = []
+    ran = bool(
+        subject_entity_id and predicate and object_value and predicate.lower() in SINGLE_VALUE_PREDICATES
+    )
+
+    # --- Path 1: RDF triple contradiction (single-value predicates only) ---
+    if subject_entity_id and predicate and object_value and predicate.lower() in SINGLE_VALUE_PREDICATES:
+        rdf_conflicts = await sc.find_rdf_conflicts(
+            tenant_id,
+            subject_entity_id,
+            predicate,
+            exclude_id=str(memory_id),
+            # CAURA-123 — scope by fleet so RDF detection respects the
+            # same isolation boundary as semantic detection. Without
+            # this the storage-api router previously forced
+            # ``fleet_id IS NULL`` and the path was unreachable for
+            # any fleeted write.
+            fleet_id=new_memory.get("fleet_id"),
+            # CAURA-123 — pass the new memory's own object_value so
+            # the storage layer's ``Memory.object_value != :ov`` filter
+            # excludes same-value rows. Otherwise two writes of the
+            # same fact trigger a false conflict on themselves.
+            object_value=object_value,
+            # A54 — scope by the writer's visibility tier, exactly as the
+            # semantic path does below. Without it the RDF path could select
+            # another agent's ``scope_agent`` row as a candidate and then mark
+            # it outdated/conflicted: a status write into a row this writer
+            # cannot read. ``agent_id`` pins the owner for the agent-private
+            # tier, where the visibility value alone says only "private to SOME
+            # agent" and so still matches a different agent's private rows.
+            visibility=new_memory.get("visibility", "scope_team"),
+            agent_id=new_memory.get("agent_id"),
+        )
+        # CAURA-125 — state-corruption guard. When ``rdf_conflicts``
+        # mixes older and newer candidates relative to ``new_memory``,
+        # an earlier flipped iteration already marked ``new_memory``
+        # outdated; a later canonical iteration must NOT then re-write
+        # ``new_memory`` back to its previous status ("active") while
+        # setting ``supersedes_id``.
+        new_memory_is_outdated = False
+        # Collapsed-write accumulator — folded in per audit P2 even
+        # though the RDF loop isn't gather-prefaced; same N+1 shape and
+        # keeps the file consistent with semantic / Path C. Keyed by
+        # ``memory_id`` so a mixed canonical/flipped run that touches
+        # ``new_memory`` twice collapses into one merged row (see
+        # ``_merge_status_update`` for the ordering rationale).
+        rdf_updates: dict[str, dict] = {}
+        for old in rdf_conflicts:
+            # CAURA-125 — decide attribution direction AFTER confirming
+            # the conflict, not before. ``_pick_older`` chooses which
+            # row carries ``outdated`` status; the other carries the
+            # supersedes_id edge pointing at the older row. This makes
+            # the verdict symmetric under candidate vs. new_memory swap
+            # while preserving the chain's newer→older direction.
+            older = _pick_older(old, new_memory)
+            older_is_new = str(older.get("id")) == str(memory_id)
+            newer = new_memory if not older_is_new else old
+            older_id = older.get("id")
+            newer_id = newer.get("id")
+
+            _merge_status_update(rdf_updates, {"memory_id": str(older_id), "status": "outdated"})
+            if newer is new_memory:
+                # Canonical case (candidate is older). Track via local
+                # ``supersedes_id`` so multiple conflict candidates in
+                # this run don't each issue a write.
+                #
+                # 09/22 M-01 — the in-run collapse rests on THIS flag and
+                # nothing else. It used to be justified by "storage's CAS
+                # ``WHERE supersedes_id IS NULL`` would only honour the first
+                # anyway", which was not true of the batch route these writes
+                # go to. The flag is load-bearing on its own: it is seeded
+                # from ``new_memory["supersedes_id"]`` by every caller (see
+                # ``_detect`` and the Path C pass), so it also stops a SECOND
+                # detection run from re-pointing an edge an earlier one wired.
+                if not supersedes_id:
+                    supersedes_id = older_id
+                    # Separate the status-reversion guard from the
+                    # chain edge. When a prior flipped iteration has
+                    # already marked ``new_memory`` ``"outdated"``,
+                    # the canonical iteration must still wire
+                    # ``new_memory.supersedes_id`` to ``older_id`` —
+                    # otherwise the older canonical candidate is left
+                    # orphaned (outdated but unreachable via the
+                    # chain). Using ``"outdated"`` as the target
+                    # status here is idempotent with the flipped
+                    # iteration's earlier write.
+                    target_status = (
+                        "outdated" if new_memory_is_outdated else new_memory.get("status", "active")
+                    )
+                    _merge_status_update(
+                        rdf_updates,
+                        {
+                            "memory_id": str(memory_id),
+                            "status": target_status,
+                            "supersedes_id": str(older_id),
+                            "expect_supersedes_null": True,
+                        },
+                    )
+            else:
+                # Flipped case (candidate is newer). The just-written
+                # memory is the older row and is now ``outdated``; the
+                # pre-existing candidate carries supersedes_id pointing
+                # back at new_memory.
+                new_memory_is_outdated = True
+                # Application-level guard against overwriting an
+                # existing supersedes_id on the candidate. It logs an
+                # explicit warning so the orphaning attempt is visible in
+                # logs rather than silently no-op'd at the DB.
+                #
+                # 09/22 M-01 — this guard reads a SNAPSHOT. ``newer`` came
+                # back from ``memory_find_rdf_conflicts`` (or, on the
+                # semantic and Path C loops that mirror this branch, from a
+                # candidate fetch followed by an LLM judge taking seconds),
+                # and nothing holds the row still in between. A concurrent
+                # detection that wires an edge onto the same candidate inside
+                # that window leaves this guard reading a stale NULL, and the
+                # write below then re-points the row and orphans whatever it
+                # had just been made to supersede — a row left
+                # conflicted/outdated with nothing pointing at it, the exact
+                # failure #1690 fixed from the other direction.
+                #
+                # The comment here used to name a storage CAS
+                # (``WHERE supersedes_id IS NULL``) as the last line of
+                # defence behind the snapshot. On the batch route these
+                # writes take, there was none — so the snapshot was the ONLY
+                # guard. ``expect_supersedes_null`` below is that backstop,
+                # now actually requested.
+                if newer.get("supersedes_id"):
+                    logger.warning(
+                        "Flipped contradiction skipped supersedes_id overwrite "
+                        "for candidate %s (already supersedes %s)",
+                        newer_id,
+                        newer.get("supersedes_id"),
+                    )
+                else:
+                    _merge_status_update(
+                        rdf_updates,
+                        {
+                            "memory_id": str(newer_id),
+                            "status": newer.get("status", "active"),
+                            "supersedes_id": str(older_id),
+                            "expect_supersedes_null": True,
+                        },
+                    )
+
+            # ``ContradictionInfo.old_memory_id`` is documented as the
+            # pre-existing candidate. Always populate from ``old``
+            # (the candidate row from storage), never from ``older``
+            # — those diverge in the flipped case.
+            direction = "canonical" if newer is new_memory else "flipped"
+            contradictions.append(
+                ContradictionInfo(
+                    old_memory_id=old.get("id"),
+                    # In canonical, the candidate is the row we just
+                    # marked outdated. In flipped, the candidate's
+                    # status is unchanged — surface its actual current
+                    # state rather than a misleading "outdated".
+                    old_status="outdated" if direction == "canonical" else old.get("status", "active"),
+                    reason="rdf_conflict",
+                    old_content_preview=old.get("content", "")[:200],
+                    direction=direction,
+                )
+            )
+            _record_pairs.append((old, "rdf", None))
+            logger.info(
+                "RDF contradiction: memory %s outdated by %s "
+                "(subject=%s predicate=%s old_value=%s new_value=%s direction=%s)",
+                older_id,
+                newer_id,
+                subject_entity_id,
+                predicate,
+                older.get("object_value"),
+                newer.get("object_value"),
+                direction,
+            )
+
+        if rdf_updates:
+            rdf_result = await sc.batch_update_status(
+                {"updates": list(rdf_updates.values())}, tenant_id=tenant_id
+            )
+            _log_batch_status_result(rdf_result, path="RDF path", memory_id=memory_id)
+        unlinked = _unlinked_pairs(new_memory, _record_pairs, rdf_updates)
+
+    return _RdfPassResult(contradictions, _record_pairs, supersedes_id, ran, unlinked)
+
+
+#: oss-0927-m-03 — one name for both paths, so "this memory was never checked
+#: for contradictions" is one predicate; which path gave up is in
+#: ``error_message``. Deliberately not the ``tracked_task`` name
+#: (``contradiction_detection``): that one only ever records a RAISE, and these
+#: runs do not raise.
+_CONTRADICTION_STRANDED_TASK = "contradiction_stranded"
+
+
+class _JudgeAbstentions:
+    """How many verdicts in the current detection run were no-LLM abstentions.
+
+    An abstain is NOT a verdict. ``call_with_fallback`` does not raise when every
+    provider fails; it returns the abstaining ``fake_fn`` result, so a run whose
+    judge never answered used to finish normally, count as concluded, keep its
+    lock for the full TTL (swallowing the back-channel re-delivery that might
+    have succeeded) and write no stranded row. The entry points read this to
+    treat such a run as not concluded.
+
+    A mutable holder in a ``ContextVar`` rather than a counter in the var, so a
+    judge call running in a COPIED context (a task spawned under the run) still
+    reports into the run's holder.
+    """
+
+    __slots__ = ("count",)
+
+    def __init__(self) -> None:
+        self.count = 0
+
+
+_judge_abstentions: ContextVar[_JudgeAbstentions | None] = ContextVar("_judge_abstentions", default=None)
+
+
+def _note_abstentions(count: int) -> None:
+    holder = _judge_abstentions.get()
+    if holder is not None:
+        holder.count += count
+
+
+class ContradictionJudgeUnavailableError(RuntimeError):
+    """Recorded (never raised) for a run whose judge abstained on some pair."""
+
+
+def _abstained_failure(abstentions: _JudgeAbstentions) -> ContradictionJudgeUnavailableError:
+    return ContradictionJudgeUnavailableError(
+        f"{abstentions.count} verdict(s) abstained because no LLM provider answered"
+    )
+
+
+async def _record_detection_lost(
+    memory_id: UUID, tenant_id: str, path: str, exc: BaseException, tb: str
+) -> None:
+    """Persist one ``background_task_log`` row for a detection pass that failed.
+
+    Both detectors catch everything, log, and return normally, so the
+    ``tracked_task`` wrapping them saw a success and wrote nothing. The lock is
+    released on that exit (H-06), so a LATER trigger can retry — but nothing
+    schedules one, and for most memories no later trigger ever comes. The row
+    makes the loss countable and names the memory to re-check; it repairs
+    nothing. Called AFTER the ``finally`` so the A19 slot is not held across
+    the storage write, hence the traceback captured inside the ``except``.
+
+    Never raises: :func:`record_task_failure` swallows its own storage failures.
+    """
+    await record_task_failure(
+        _CONTRADICTION_STRANDED_TASK,
+        memory_id,
+        tenant_id,
+        RuntimeError(f"{path} detection failed: {type(exc).__name__}: {exc}"),
+        tb=tb,
+    )
+
+
+async def _detection_disabled_for_tenant(tenant_id: str, memory_id, path: str) -> bool:
+    """True when the tenant switched contradiction detection off (SIDE-58).
+
+    lme-0929-m-05. Read at the top of BOTH detector entries, which every
+    trigger reaches — legacy and engine arch alike, via
+    ``run_contradiction_detection`` (``test_contradiction_trigger_coverage``
+    pins that no production path calls around them). Gating here rather than
+    at the call sites is the point: a switch that left one trigger live is the
+    defect class this module keeps fixing, and a trigger added later is gated
+    without anyone having to remember.
+
+    Checked BEFORE the A19 admission slot, the row fetch and the idempotency
+    lock, so a disabled tenant's pass costs one cached settings read and
+    nothing else: no storage traffic, no Redis, no LLM call, no slot held.
+
+    Only an explicit ``False`` disables (``is False``), and a settings read
+    that fails is treated as ENABLED — today's behaviour. The run then reaches
+    its own ``resolve_config`` inside the error handling it always had, so an
+    outage is recorded exactly as before rather than silently turning
+    detection off.
+    """
+    from core_api.services.organization_settings import resolve_config
+
+    try:
+        cfg = await resolve_config(tenant_id)
+    except Exception:
+        return False
+    if getattr(cfg, "contradiction_detection_enabled", True) is not False:
+        return False
+    logger.debug(
+        "%s contradiction detection skipped for memory %s: disabled for tenant_id=%s",
+        path,
+        memory_id,
+        tenant_id,
+    )
+    return True
+
+
+async def detect_contradictions_async(
+    memory_id: UUID,
+    tenant_id: str,
+    fleet_id: str | None,
+    content: str,
+    embedding: list[float],
+    *,
+    new_memory: dict | None = None,
+) -> None:
+    """Post-commit contradiction detection — runs independently.
+
+    Follows the same fire-and-forget pattern as entity extraction:
+    uses the storage client so it can see all committed data (including
+    concurrent writes that were invisible in the caller's transaction).
+
+    ``new_memory`` is an optional pass-through for callers that already
+    fetched the row (e.g. the CAURA-595 ``handle_memory_enriched``
+    consumer). Passing it skips one HTTP GET per call to core-storage-
+    api on the async write path. We still re-check ``deleted_at`` here
+    so a soft-delete that landed AFTER the caller's fetch but BEFORE
+    detection runs cleanly aborts.
+    """
+    from core_api.services.organization_settings import resolve_config
+
+    # SIDE-58 — tenant opt-out, before the slot / fetch / lock below.
+    if await _detection_disabled_for_tenant(tenant_id, memory_id, "content"):
+        return
+
+    # Always-fire completion log (Gap 06): without this, "function ran and
+    # found nothing" is indistinguishable from "function never fired" — the
+    # exact failure mode that hid Gap 01 and Gap 04 for weeks. Memory id is
+    # in the message string itself (rather than ``extra``) so a plain
+    # ``grep path_a_completed <memory_id>`` works regardless of the
+    # structlog renderer's ``extra={}`` behaviour.
+    t_start = time.monotonic()
+    n_conflicts = 0
+    skipped = False
+    lock_held = False
+    concluded = False
+    lock_key = None
+    lock_token = ""
+    failure: Exception | None = None
+    failure_tb = ""
+    # A19 — admission gate BEFORE any storage or Redis traffic, so a queued
+    # pass consumes nothing but a waiting coroutine. Acquired before the
+    # idempotency lock on purpose: the lock's 1h TTL must clock detection,
+    # not queue time, and a duplicate back-channel delivery that queued
+    # behind its twin still exits at the lock check in one Redis roundtrip.
+    # Acquire sits OUTSIDE the try so a cancellation mid-wait (shutdown's
+    # ``cancel_all_tasks``) cannot reach a ``release()`` for a slot that was
+    # never taken.
+    _gate, queued_ms = await _acquire_detection_slot()
+    abstentions = _JudgeAbstentions()
+    abstentions_token = _judge_abstentions.set(abstentions)
+    try:
+        if new_memory is None:
+            sc = get_storage_client()
+            # ``read=False``: the row was committed moments ago and the read
+            # pool lags the primary; a replica miss used to end detection here
+            # without a trace (and judge an edit on its pre-edit text).
+            new_memory = await sc.get_memory(str(memory_id), tenant_id, read=False)
+        if not new_memory or new_memory.get("deleted_at") is not None:
+            # Resolved before the lock is taken, so a gone row never holds one.
+            if not new_memory:
+                logger.warning(
+                    "contradiction_detection_skipped_row_missing",
+                    extra={"memory_id": str(memory_id), "tenant_id": tenant_id},
+                )
+            return
+
+        # A4 #14 — back-channel idempotency. Both the ENRICHED and
+        # EMBEDDED handlers fire ``detect_contradictions_async`` for
+        # the same memory; whichever arrives first owns the lock and
+        # runs detection, the other skips. Fail-open: if Redis is
+        # unavailable, ``_acquire_content_lock`` returns True and we
+        # fall back to the prior double-detection behaviour.
+        #
+        # 09/22 M-01 — what that fallback costs, stated honestly. It used to
+        # read "storage CAS still keeps writes idempotent", naming a guard
+        # the batch route did not have. It has one now
+        # (``expect_supersedes_null``), and it bounds the damage rather than
+        # erasing it: two concurrent passes can still both mark a row
+        # ``conflicted``/``outdated``, but only one can wire the chain edge,
+        # so the loser cannot re-point a row the winner already resolved.
+        # The RDF pass is deterministic and would agree anyway; the semantic
+        # judge is stochastic and two passes CAN pick different candidates —
+        # that is precisely the case the edge CAS now settles by first-writer
+        # rather than by last-write-wins.
+        # H-06: keyed on the CONTENT as well as the memory, so an edit
+        # re-fired by ``update_memory`` is not deduped against the run that
+        # checked the previous text.
+        #
+        # Fingerprint the text detection will ACTUALLY examine — ``_detect``
+        # reads ``new_memory``, not the ``content`` parameter. The parameter is
+        # the caller's copy: the back-channel consumers pass the write-time
+        # payload, which a mid-flight update leaves stale. Keying on it would
+        # put a lock on text nobody looked at, and would make the fix depend on
+        # every future caller keeping the two in step. ``content`` remains the
+        # fallback for a row with no content at all.
+        # ``is None``, not ``or``: an EMPTY row content is a real value, and
+        # ``_detect`` reads it as one (``new_memory.get("content", "")``).
+        # Falling back to the caller's copy for it would key the lock on text
+        # detection never looks at — the very divergence this line exists to
+        # close. The caller's ``content`` is only a stand-in for a row that has
+        # no content field at all, and the final ``or ""`` keeps a str reaching
+        # the fingerprint: an AttributeError there lands in the outer handler
+        # and silently costs that memory its detection.
+        raw_content = new_memory.get("content")
+        examined = raw_content if raw_content is not None else (content or "")
+        lock_key = _content_lock_key(memory_id, examined)
+        lock_token = _lock_token()
+        if not await _acquire_content_lock(memory_id, examined, lock_token):
+            skipped = True
+            return
+        lock_held = True
+
+        tenant_config = await resolve_config(tenant_id)
+        contradictions = await _detect(new_memory, embedding, tenant_config)
+        concluded = True
+        n_conflicts = len(contradictions) if contradictions else 0
+
+        # D3 — log EVERY concluded run, not only the ones that found something.
+        # Before this, a run that found nothing was indistinguishable in the logs
+        # from a run that never happened (lock contention, an early return, a
+        # crashed worker), so "did detection run for this memory?" was
+        # unanswerable — and the answer matters most exactly when a contradiction
+        # was expected and none appeared.
+        logger.info(
+            "Async contradiction detection completed for memory %s: %d conflict(s)",
+            memory_id,
+            n_conflicts,
+            extra={
+                "path": "contradiction-detection",
+                "memory_id": str(memory_id),
+                "conflicts_found": n_conflicts,
+            },
+        )
+
+    except Exception as exc:
+        logger.exception("Async contradiction detection failed for memory %s", memory_id)
+        failure, failure_tb = exc, traceback.format_exc()
+    finally:
+        # A19 — free the slot before the bookkeeping below: the Redis lock
+        # release and the completion log are not the contended work the gate
+        # protects, and a queued pass may as well start during them.
+        _gate.release()
+        _judge_abstentions.reset(abstentions_token)
+        # A judge that abstained reached no verdict on that pair, so the run did
+        # not conclude: release the lock for the next trigger and record the
+        # memory as unchecked, exactly as for a run that raised.
+        if concluded and abstentions.count and failure is None:
+            concluded = False
+            failure = _abstained_failure(abstentions)
+        # H-06: keep the lock only for a run that reached a verdict. The lock
+        # is taken BEFORE detection, so without this one transient LLM or
+        # storage failure suppressed every later trigger for this memory for a
+        # full hour, with nothing scheduled to retry. A run that concluded
+        # keeps its lock — that is the duplicate-delivery collapse the lock
+        # exists for. Mirrors the Path C block below.
+        if lock_held and not concluded and lock_key is not None:
+            await _release_lock(lock_key, lock_token)
+        elapsed_ms = round((time.monotonic() - t_start) * 1000)
+        logger.info(
+            "path_a_completed for memory %s n_conflicts=%d skipped=%s elapsed_ms=%d queued_ms=%d tenant_id=%s",
+            memory_id,
+            n_conflicts,
+            str(skipped).lower(),
+            elapsed_ms,
+            queued_ms,
+            tenant_id,
+        )
+    if failure is not None:
+        await _record_detection_lost(memory_id, tenant_id, "content", failure, failure_tb)
+
+
+# ---------------------------------------------------------------------------
+# Synchronous API (kept for direct-call use cases, e.g. tests)
+# ---------------------------------------------------------------------------
+
+
+async def detect_contradictions(
+    new_memory,
+    embedding: list[float],
+    tenant_config=None,
+) -> list[ContradictionInfo]:
+    """In-session contradiction detection (caller manages commit).
+
+    Kept for backward compatibility and testing. For production writes,
+    prefer detect_contradictions_async which runs post-commit.
+
+    new_memory can be an ORM Memory object or a dict from the storage client.
+    """
+    # Normalize to dict if ORM object
+    if not isinstance(new_memory, dict):
+        new_memory = {
+            "id": str(new_memory.id),
+            "tenant_id": new_memory.tenant_id,
+            "fleet_id": new_memory.fleet_id,
+            "content": new_memory.content,
+            "subject_entity_id": str(new_memory.subject_entity_id) if new_memory.subject_entity_id else None,
+            "predicate": new_memory.predicate,
+            "object_value": new_memory.object_value,
+            "supersedes_id": str(new_memory.supersedes_id) if new_memory.supersedes_id else None,
+            "status": new_memory.status,
+        }
+    # SIDE-58 — honour the tenant switch when the caller hands us its config.
+    # (This in-session API has no production caller; it resolves nothing
+    # itself, so a caller without a config keeps today's behaviour.)
+    if tenant_config is not None and getattr(tenant_config, "contradiction_detection_enabled", True) is False:
+        return []
+    return await _detect(new_memory, embedding, tenant_config)
+
+
+# ---------------------------------------------------------------------------
+# Core detection logic (shared by sync and async paths)
+# ---------------------------------------------------------------------------
+
+
+async def _detect(
+    new_memory: dict,
+    embedding: list[float],
+    tenant_config=None,
+) -> list[ContradictionInfo]:
+    """Find active memories that contradict the new one.
+
+    Two detection paths:
+    1. RDF conflict (single-value predicates only): same subject_entity_id +
+       single-value predicate + different object_value -> old memory outdated.
+       Multi-value predicates skip this path (additive, not contradictory).
+    2. Semantic conflict: high vector similarity, LLM confirms contradiction
+
+    Returns list of contradictions found (may be empty).
+    Side-effect: marks contradicted memories as outdated/conflicted and
+    sets supersession chain (new_memory.supersedes_id -> old memory).
+    """
+    sc = get_storage_client()
+    contradictions: list[ContradictionInfo] = []
+    # A55 1d — (candidate_row, kind, confidence) pairs to persist as
+    # memory_conflicts records after the effect is applied (flag-gated; see
+    # ``_record_conflicts``).
+    _record_pairs: list[tuple[dict, str, float | None]] = []
+    # M-34 — those whose loser no chain edge points at, recorded whatever the flag.
+    _unlinked: list[tuple[dict, str, float | None]] = []
+
+    memory_id = new_memory.get("id")
+    # A40 — the triple is read inside ``_rdf_conflict_pass`` now, not here. It
+    # is deliberately NOT hoisted back out: the pass is also called after entity
+    # extraction, where the row it must read is a fresher one than this caller
+    # ever holds.
+    tenant_id = new_memory.get("tenant_id")
+    content = new_memory.get("content", "")
+    supersedes_id = new_memory.get("supersedes_id")
+
+    # --- Path 1: RDF triple contradiction (single-value predicates only) ---
+    # A40 — the pass itself now lives in ``_rdf_conflict_pass`` so the SAME
+    # deterministic check can run again once entity extraction has populated
+    # the triple. At write time this gate fails for every proper-noun subject
+    # (``EmitMemoryTriple`` resolves only identifier-shaped ones), which is what
+    # sent those writes to the stochastic semantic judge below.
+    _rdf = await _rdf_conflict_pass(
+        sc,
+        new_memory,
+        memory_id=memory_id,
+        tenant_id=tenant_id,
+        supersedes_id=supersedes_id,
+    )
+    contradictions.extend(_rdf.contradictions)
+    _record_pairs.extend(_rdf.record_pairs)
+    _unlinked.extend(_rdf.unlinked_pairs)
+    supersedes_id = _rdf.supersedes_id
+
+    # --- Path 2: Semantic contradiction (vector similarity + batch LLM check) ---
+    if not contradictions:
+        candidates = await sc.find_similar_candidates(
+            {
+                "memory_id": str(memory_id),
+                "tenant_id": tenant_id,
+                "fleet_id": new_memory.get("fleet_id"),
+                "embedding": embedding,
+                # Scope candidates to the writer's visibility tier — prevents
+                # scope_org/scope_agent writes from being marked as superseding
+                # scope_team memories (cross-scope chain pollution).
+                "visibility": new_memory.get("visibility", "scope_team"),
+                # A54 — pins the OWNER for the scope_agent tier. The tier alone
+                # matches any agent's private rows, so without this a writer can
+                # mark another agent's private memory conflicted.
+                "agent_id": new_memory.get("agent_id"),
+            }
+        )
+        # CAURA-132 diag — Path A semantic invocation + candidate count.
+        # Symmetric to PATH_C_DETECTION entry log; lets us tell apart
+        # "Path A ran but found no semantic candidates" from "Path A
+        # ran, found candidates, and the LLM judge said no".
+        #
+        # All seven CAURA-132 diag sites in this module log at DEBUG, not
+        # INFO. They were added to answer one question — why the entity-
+        # aware judge returned verdict=False on populated contexts — and
+        # that wet-test has since run (see CAURA-133, whose test cites
+        # "the wet-test on dev v2.12.1 (CAURA-132 logs)"). What they cost
+        # in the meantime: two of them fire once per (memory x candidate)
+        # pair rather than once per memory, so on 2026-08-29 the seven
+        # accounted for 3,767 of this logger's 4,947 prod lines in 6h —
+        # 76% — against ~10 candidates per memory.
+        #
+        # DEBUG keeps them one env var away (LOG_LEVEL=DEBUG) rather than
+        # deleting them, because the question they answer can recur. What
+        # stays at INFO is everything that records an OUTCOME: the
+        # path_a/path_c_completed summaries (which already carry
+        # n_conflicts, n_candidates and elapsed_ms), the contradictions
+        # actually found, Path C retracting a Path A verdict, and the
+        # preflight fail-open notes. Losing those would cost real
+        # forensics; losing per-candidate trace lines does not.
+        logger.debug(
+            "PATH_A_SEMANTIC entry memory=%s tenant=%s candidates_initial=%d",
+            memory_id,
+            tenant_id,
+            len(candidates) if candidates else 0,
+        )
+        if candidates:
+            # A61 — batch the LLM judge. A single candidate keeps the direct
+            # per-candidate call; multiple candidates (the prod cost driver, up
+            # to 20) are judged in ONE batched call instead of N. Both feed the
+            # SAME _judge_contradiction gates below. ``judged`` is
+            # (verdict, confidence, raw|None).
+            if len(candidates) == 1:
+                _v, _c = await _llm_contradiction_check(
+                    content, candidates[0].get("content", ""), tenant_config
+                )
+                judged: list[tuple[bool, float, dict | None]] = [(_v, _c, None)]
+            else:
+                raws = await _llm_contradiction_check_batch(content, candidates, tenant_config)
+                judged = [(*_judge_contradiction(raw), raw) for raw in raws]
+
+            # CAURA-125 — state-corruption guard, same rationale as the
+            # RDF path above.
+            new_memory_is_outdated = False
+            # Collect per-row status updates and flush them with one
+            # ``batch_update_status`` HTTP after the loop. The prior shape
+            # (one ``update_memory_status`` per row) issued up to 3K
+            # writes per detection cycle — same wire effect, ~Kx the
+            # round-trips (audit P2). All branches that set status here
+            # share one batch; the post-loop call is a no-op when
+            # ``updates`` is empty. Keyed by ``memory_id`` — see
+            # ``_merge_status_update`` for the dedupe rationale.
+            updates: dict[str, dict] = {}
+            # A32 (verified 2026-08-31, no code change): the bare ``if
+            # verdict`` below is safe. ``_judge_contradiction`` forces the
+            # verdict to False on every low-confidence branch, so an
+            # LLM-derived True always carries ``_CONF_CLEAN`` — pinned
+            # exhaustively in ``tests/test_a32_forward_confidence_gate.py``.
+            # The one producer of a low-confidence True is the DELIBERATE fake
+            # provider (``_pairwise_fake_fn`` -> ``_CONF_FALLBACK``), which an
+            # operator opts into for dev/CI; gating that away would break the
+            # stand-in without making anything safer.
+            for candidate, (verdict, _confidence, _raw) in zip(candidates, judged):
+                # CAURA-132 diag — Path A semantic per-candidate verdict.
+                logger.debug(
+                    "PATH_A_SEMANTIC verdict memory=%s candidate=%s verdict=%s confidence=%.2f",
+                    memory_id,
+                    candidate.get("id"),
+                    verdict,
+                    _confidence,
+                )
+                if verdict:
+                    # CAURA-125 — symmetric attribution; see RDF path
+                    # above for the rationale.
+                    older = _pick_older(candidate, new_memory)
+                    older_is_new = str(older.get("id")) == str(memory_id)
+                    newer = new_memory if not older_is_new else candidate
+                    older_id = older.get("id")
+                    newer_id = newer.get("id")
+
+                    _merge_status_update(updates, {"memory_id": str(older_id), "status": "conflicted"})
+                    if newer is new_memory:
+                        if not supersedes_id:
+                            supersedes_id = older_id
+                            # See RDF path above for the rationale of
+                            # separating the status-reversion guard
+                            # from the chain edge. Semantic-path
+                            # status literal is ``"conflicted"`` (not
+                            # ``"outdated"``), matching what the
+                            # flipped iteration would have just set.
+                            target_status = (
+                                "conflicted" if new_memory_is_outdated else new_memory.get("status", "active")
+                            )
+                            _merge_status_update(
+                                updates,
+                                {
+                                    "memory_id": str(memory_id),
+                                    "status": target_status,
+                                    "supersedes_id": str(older_id),
+                                    "expect_supersedes_null": True,
+                                },
+                            )
+                    else:
+                        new_memory_is_outdated = True
+                        # Application-level guard; see RDF flipped
+                        # branch for rationale.
+                        if newer.get("supersedes_id"):
+                            logger.warning(
+                                "Flipped contradiction skipped supersedes_id overwrite "
+                                "for candidate %s (already supersedes %s)",
+                                newer_id,
+                                newer.get("supersedes_id"),
+                            )
+                        else:
+                            _merge_status_update(
+                                updates,
+                                {
+                                    "memory_id": str(newer_id),
+                                    "status": newer.get("status", "active"),
+                                    "supersedes_id": str(older_id),
+                                    "expect_supersedes_null": True,
+                                },
+                            )
+
+                    direction = "canonical" if newer is new_memory else "flipped"
+                    contradictions.append(
+                        ContradictionInfo(
+                            old_memory_id=candidate.get("id"),
+                            old_status="conflicted"
+                            if direction == "canonical"
+                            else candidate.get("status", "active"),
+                            reason="semantic_conflict",
+                            old_content_preview=candidate.get("content", "")[:200],
+                            direction=direction,
+                        )
+                    )
+                    _record_pairs.append((candidate, "semantic", _confidence))
+                    logger.info(
+                        "Semantic contradiction: memory %s conflicted by %s direction=%s",
+                        older_id,
+                        newer_id,
+                        direction,
+                    )
+
+            if updates:
+                sem_result = await sc.batch_update_status(
+                    {"updates": list(updates.values())}, tenant_id=tenant_id
+                )
+                _log_batch_status_result(sem_result, path="semantic path", memory_id=memory_id)
+            # ``_record_pairs`` holds only semantic pairs here: this path runs
+            # only when the RDF pass found nothing.
+            _unlinked.extend(_unlinked_pairs(new_memory, _record_pairs, updates))
+
+    # A55 1d / M-34 — the memory_conflicts records; see ``_record_conflicts``.
+    # Never touches the status/supersedes effect above.
+    await _record_conflicts(
+        new_memory, _record_pairs, _unlinked, tenant_id=tenant_id, tenant_config=tenant_config
+    )
+
+    return contradictions
+
+
+CONTRADICTION_PROMPT = """\
+You are a contradiction detector for a business memory system.
+
+Two statements contradict ONLY IF they make incompatible claims about the
+SAME real-world subject. Different subjects -> NOT a contradiction, even if
+the predicates look opposite or the statements look semantically similar.
+
+Statement A (NEW): {new_content}
+
+Statement B (EXISTING): {old_content}
+
+Follow these steps in order:
+
+1. Extract subject_a: the entity Statement A is primarily about
+   (person, company, project, product, etc.). Use a short noun phrase.
+2. Extract subject_b: the entity Statement B is primarily about.
+3. Decide same_subject. Set true ONLY when subject_a and subject_b refer
+   to the SAME real-world entity. Treat these as same_subject=true:
+     - exact name match
+     - known alias / nickname / abbreviation of the same entity
+     - role description and proper name referring to the same individual
+       in context (e.g., "the CEO" and "Sarah Johnson" when context makes
+       it unambiguous)
+     - pronoun resolved unambiguously to the other statement's subject
+   Treat these as same_subject=false:
+     - two different people who share a first name or last name
+     - two different companies, products, projects, or teams
+     - any case where you are not confident the subjects are the same entity
+4. Decide non_conflict_reason. Even when same_subject is true, certain
+   shapes describe two claims that BOTH hold and so are NOT a
+   contradiction. Pick at most one value; pick "none" when the two
+   statements really do assert mutually exclusive states.
+     - "temporal_supersession": BOTH statements are records of PAST
+       events or completed milestones that stay true as history
+       ("hired in 2020" / "promoted in 2023"; "v1 shipped in March" /
+       "v2 shipped in June"). Records of what happened never compete.
+       This reason does NOT apply when the statements assert a
+       subject's CURRENT state or attribute and the newer one changes
+       it ("status: planned" vs "status: shipped", "lives in X" vs
+       "lives in Y", "runs at 01:00" vs "runs at 03:00") — a state
+       change is an update, and updates ARE contradictions
+       (contradicts=true, reason "none"): flagging them is how the
+       stale value gets retired.
+     - "list_valued_predicate": the two statements describe attributes
+       of the same subject that do not compete for a single slot.
+       Two shapes both qualify:
+       (a) one predicate that naturally holds multiple values at the
+       same time — "supports English" / "supports French"; speaks
+       multiple languages; "reports_to" in matrix orgs; "works_on"
+       parallel projects;
+       (b) two entirely different attributes of the same subject —
+       e.g., "Alice was promoted to Senior Engineer" (her title)
+       and "Alice is on the platform team" (her team) are
+       complementary facts; both hold simultaneously. Different
+       attributes do not exclude each other.
+     - "refinement": one statement is a more specific version of the
+       other ("Europe" vs "Munich"; "tech" vs "Google"; "Q3" vs
+       "September 15"). Both hold; finer granularity does not negate
+       coarser.
+     - "scope_mismatch": the statements describe the same subject with
+       different implicit qualifiers — whole vs part (parent company
+       vs division), different time windows (annual vs quarterly), or
+       different context qualifiers (weekday vs weekend, work vs
+       residence). Both can hold simultaneously.
+     - "same_name_distinct_subject": subject_a and subject_b share a
+       surface name but plausibly refer to different real-world
+       instances (two different builds of "the nightly build", two
+       different days of "today's standup", two different people both
+       called "John" without disambiguator). This is the symmetric
+       complement to same_subject=false for cases where the names
+       happen to match.
+     - "conditional_unrealized": one statement is conditional /
+       hypothetical / irrealis ("if X then Y", "would", "could",
+       "might"), and the other is a realised state. The conditional
+       does not assert a claim that can contradict.
+     - "event_restatement": the two statements describe the SAME
+       event with different tense, aspect, or synonymous verbs
+       ("acquired" / "is acquiring" the same deal; "was hired" /
+       "joined"). They restate the same fact, not different facts.
+     - "none": none of the above applies. Use this when the two
+       statements really do make incompatible claims about the same
+       subject at the same time frame (e.g., "X lives in Tel Aviv"
+       vs "X lives in Haifa" as undated current-state claims).
+   Two state claims about the same subject are also NOT a
+   contradiction when BOTH statements explicitly reference
+   non-overlapping past time periods (e.g., "X lived in Tel Aviv
+   from 2010 to 2014" vs "X lived in Haifa from 2015 to 2018").
+   In that case set non_conflict_reason="scope_mismatch".
+5. Decide contradicts:
+   - If same_subject is false, contradicts MUST be false.
+   - If non_conflict_reason is not "none", contradicts MUST be false.
+   - Otherwise contradicts is true only when the two statements assert
+     mutually exclusive states about that subject in the same time
+     frame. Updates / corrections about the same subject ARE
+     contradictions (e.g., "X lives in Tel Aviv" vs "X lives in
+     Haifa"). Do not speculate that one statement might describe a
+     future state that resolves the conflict. Choose
+     temporal_supersession ONLY when both statements read as records
+     of past events — never merely because two states could have held
+     one after the other; states that replace each other are updates,
+     i.e. contradictions.
+
+Reply with ONLY a JSON object, no prose, no markdown fences:
+{{"subject_a": "<short noun phrase>",
+  "subject_b": "<short noun phrase>",
+  "same_subject": true/false,
+  "non_conflict_reason": "none|temporal_supersession|list_valued_predicate|refinement|scope_mismatch|same_name_distinct_subject|conditional_unrealized|event_restatement",
+  "contradicts": true/false,
+  "reason": "one short phrase referencing the subjects and the conflict (or its absence)"}}
+"""
+
+
+# CAURA-129 — entity-aware retraction prompt. Path C's retraction judge
+# runs AFTER entity extraction has resolved the canonical entities for
+# both memories. This prompt is the "real fix" tier — it asks a
+# structurally different question than ``CONTRADICTION_PROMPT`` (which
+# Path A's semantic judge already used) by surfacing the resolved
+# entity rows authoritatively. Disagreement with Path A now carries
+# meaningful signal (the model is reasoning over RESOLVED entities,
+# not over the raw text NER it ran once already).
+#
+# JSON output schema is intentionally identical to ``CONTRADICTION_PROMPT``
+# so ``_judge_contradiction`` parses both unchanged. The new placeholders
+# are ``{new_entities}`` and ``{old_entities}`` — rendered by
+# ``_format_entity_context``.
+ENTITY_AWARE_CONTRADICTION_PROMPT = """\
+You are a contradiction detector for a business memory system, running
+the second-pass judgement after entity resolution has already linked
+both statements to their canonical entities.
+
+Two statements contradict ONLY IF they make incompatible claims about
+the SAME real-world subject. Different subjects -> NOT a contradiction,
+even if the predicates look opposite or the statements look semantically
+similar.
+
+CRITICAL: Resolved entities below are AUTHORITATIVE. The subject of
+each statement has ALREADY been resolved to a specific entity row
+(identified by ``entity_id``) by upstream entity extraction. Your job
+is NOT to re-do that resolution from raw text; your job is to use the
+resolved entities as ground truth and decide whether the two
+statements' CLAIMS about those entities are mutually exclusive.
+
+  * If the two RESOLVED-ENTITIES blocks have a subject-role entity with
+    the SAME ``entity_id``, the subjects ARE the same real-world entity.
+    same_subject MUST be true. Surface text qualifiers ("from X", "at
+    Y", "the Z", possessives, role modifiers, employer / team / location
+    prefixes) are additional context about that ONE subject, NOT
+    evidence of different subjects.
+
+  * If the two RESOLVED-ENTITIES blocks have a subject-role entity with
+    DIFFERENT ``entity_id`` values, the subjects are different entity
+    rows. same_subject MUST be false, regardless of surface name
+    similarity. (Set non_conflict_reason="same_name_distinct_subject"
+    when the canonical names happen to match.)
+
+Statement A (NEW): {new_content}
+RESOLVED ENTITIES for Statement A:
+{new_entities}
+
+Statement B (EXISTING): {old_content}
+RESOLVED ENTITIES for Statement B:
+{old_entities}
+
+Follow these steps in order:
+
+1. Identify subject_a: from Statement A's resolved entities, the entity
+   with role="subject" (or the canonical subject if no role is marked).
+   Use its canonical name.
+2. Identify subject_b: same from Statement B's resolved entities.
+3. Decide same_subject MECHANICALLY by comparing the subject entities'
+   ``entity_id`` values (not their surface text). Check the GUARD rules
+   first; only fall through to the equality rules if no guard fires.
+     - entity_id starts with "<none-" on either side -> same_subject=false
+       (entity has no stable identifier; do not infer identity even if
+       canonical names happen to match or the two sides happen to
+       render the same "<none-..." sentinel string)
+     - either side missing a subject-role entity -> same_subject=false
+       (degenerate input — this prompt should not have been invoked,
+       but if it is, prefer false)
+     - same canonical name but different entity_type -> same_subject=false
+       (two different real-world things that happen to share a name)
+     - subject_a.entity_id == subject_b.entity_id ->  same_subject=true
+     - subject_a.entity_id != subject_b.entity_id ->  same_subject=false
+   Worked examples:
+     (a) Statement A subject: entity_id=ABC123 canonical_name="Priya"
+         Statement B subject: entity_id=ABC123 canonical_name="Priya"
+         -> same_subject=true even if Statement A says "Priya from
+         AcmeCorp" and Statement B says "Priya from BetaIndustries".
+         The employer text is additional context about the one resolved
+         Priya, not evidence of a different Priya.
+     (b) Statement A subject: entity_id=ABC123 canonical_name="Priya"
+         Statement B subject: entity_id=XYZ789 canonical_name="Priya"
+         -> same_subject=false. Two distinct resolved entities that
+         happen to share a canonical name; this is the
+         ``same_name_distinct_subject`` non-conflict reason.
+4. Decide non_conflict_reason. Even when same_subject is true, certain
+   shapes describe two claims that BOTH hold and so are NOT a
+   contradiction. Pick at most one value; pick "none" when the two
+   statements really do assert mutually exclusive states.
+     - "temporal_supersession": BOTH statements are records of PAST
+       events that stay true as history ("hired in 2020" / "promoted
+       in 2023"). NOT for current-state claims where the newer
+       statement changes the state ("status: planned" vs "status:
+       shipped", "lives in X" vs "lives in Y") — a state change is an
+       update, and updates ARE contradictions (reason "none").
+     - "list_valued_predicate": attributes that do not compete for a
+       single slot — multi-value predicates (supports English /
+       supports French) or two entirely different attributes of the
+       same subject (Alice's title vs Alice's team).
+     - "refinement": one statement is a more specific version of the
+       other (Europe vs Munich; Q3 vs September 15). Both hold.
+     - "scope_mismatch": same subject, different implicit qualifiers
+       (whole vs part, different time windows, different contexts).
+     - "same_name_distinct_subject": surface names match but the
+       resolved entities differ — choose this when you also set
+       same_subject=false because the entity blocks disambiguate.
+     - "conditional_unrealized": one statement is hypothetical /
+       irrealis; conditionals do not contradict realised states.
+     - "event_restatement": the two statements describe the SAME event
+       with different tense / aspect / synonyms.
+     - "none": none of the above; the two statements assert mutually
+       exclusive states about the same subject at the same time frame.
+5. Decide contradicts:
+   - If same_subject is false, contradicts MUST be false.
+   - If non_conflict_reason is not "none", contradicts MUST be false.
+   - Otherwise contradicts is true only when the two statements assert
+     mutually exclusive states about that subject in the same time
+     frame. Corrections / updates about the same subject ARE
+     contradictions.
+
+Reply with ONLY a JSON object, no prose, no markdown fences:
+{{"subject_a": "<canonical name from RESOLVED ENTITIES for A>",
+  "subject_b": "<canonical name from RESOLVED ENTITIES for B>",
+  "same_subject": true/false,
+  "non_conflict_reason": "none|temporal_supersession|list_valued_predicate|refinement|scope_mismatch|same_name_distinct_subject|conditional_unrealized|event_restatement",
+  "contradicts": true/false,
+  "reason": "one short phrase referencing the resolved subjects and the conflict (or its absence)"}}
+"""
+
+
+# CAURA-124 — within-subject false-positive shapes that hard-gate
+# ``contradicts=true`` to ``false``. ``none`` (or absent / unknown
+# value) is the only enum value that allows a contradiction to stand.
+# Keep this set in sync with the enum listed in ``CONTRADICTION_PROMPT``
+# and with the wet-test fixtures in
+# ``scripts/wet_test_contradiction_prompt.py``.
+# A63 — ``temporal_supersession`` is deliberately NOT in this veto set.
+# It was, and the veto ate the product's core case: in Caura "the newer
+# state supersedes the older one" IS the contradiction we exist to flag —
+# flagging is what marks the stale row and writes the supersedes chain.
+# Measured on gpt-5.4-nano (A63 gate A/B, 2026-08-27): on planted
+# current-state updates the model kept answering ``contradicts=true`` with
+# ``non_conflict_reason="temporal_supersession"`` — a semantically coherent
+# reply — and Gate 2 overrode every one of them to False (0/4 planted
+# region migrations flagged, 3/3 runs, both prompt contracts). The label
+# stays in the prompt vocabulary with an events-only definition (records of
+# past events never compete; state changes are updates), and the A55
+# diagnosis/relationship mappers still consume it — it just no longer
+# outranks the model's own ``contradicts`` verdict.
+NON_CONFLICT_REASONS: frozenset[str] = frozenset(
+    {
+        "list_valued_predicate",
+        "refinement",
+        "scope_mismatch",
+        "same_name_distinct_subject",
+        "conditional_unrealized",
+        "event_restatement",
+    }
+)
+
+
+def _parse_contradiction_response(raw: dict) -> bool:
+    """Apply the structured-output safety gates.
+
+    Two gates run, in order:
+
+    1. **Cross-subject gate (CAURA-111).** The prompt requires the model
+       to commit to ``same_subject`` before ``contradicts``. If
+       ``same_subject`` is false (or missing), ``contradicts`` MUST be
+       false regardless of what the model emitted.
+
+    2. **Within-subject FP gate (CAURA-124).** Even when same_subject is
+       true, certain shapes describe two claims that both hold and
+       must not be flagged. The model classifies the shape into
+       ``non_conflict_reason``; any value in ``NON_CONFLICT_REASONS``
+       forces ``contradicts=false``. ``"none"`` (or absent / unknown
+       value) leaves ``contradicts`` untouched.
+
+    Missing keys and non-boolean values are treated conservatively
+    (False for booleans; None for non_conflict_reason, which has the
+    same effect as "none" — neither fires Gate 2). ``bool("false")``
+    is True in Python, so a model returning the *string* "false"
+    instead of the boolean would have silently bypassed the gate —
+    both gates use identity-against-True comparisons to avoid that
+    trap.
+    """
+    if not isinstance(raw, dict):
+        return False
+
+    same_subject = raw.get("same_subject") is True
+    contradicts = raw.get("contradicts") is True
+
+    # Gate 1 — cross-subject (CAURA-111).
+    if contradicts and not same_subject:
+        logger.warning(
+            "Contradiction model returned contradicts=true with same_subject=false; "
+            "overriding to false. subject_a=%r subject_b=%r reason=%r",
+            raw.get("subject_a"),
+            raw.get("subject_b"),
+            raw.get("reason"),
+        )
+        return False
+
+    # Gate 2 — within-subject FP shapes (CAURA-124). Only fires when
+    # the model both flagged a contradiction AND named a recognised
+    # non-conflict shape — otherwise it's a no-op. Locals are named
+    # ``non_conflict_reason`` (not ``reason``) so they don't collide
+    # with the model's free-text ``raw["reason"]`` field that the
+    # logger calls pass through verbatim.
+    raw_ncr = raw.get("non_conflict_reason")
+    non_conflict_reason = raw_ncr if isinstance(raw_ncr, str) else None
+    if contradicts and non_conflict_reason in NON_CONFLICT_REASONS:
+        # WARNING (not INFO): this branch fires only when the model
+        # returned an internally inconsistent response — contradicts=true
+        # alongside a recognised non_conflict_reason, which the prompt
+        # explicitly forbids in step 5. Same severity as Gate 1's
+        # cross-subject override so model regressions surface at the
+        # standard WARNING level rather than getting buried in INFO.
+        logger.warning(
+            "Contradiction model returned contradicts=true with "
+            "non_conflict_reason=%r; overriding to false. "
+            "subject_a=%r subject_b=%r reason=%r",
+            non_conflict_reason,
+            raw.get("subject_a"),
+            raw.get("subject_b"),
+            raw.get("reason"),
+        )
+        return False
+
+    # Both gates passed (or contradicts is already False) — return the
+    # model's verdict.
+    return contradicts
+
+
+# ---------------------------------------------------------------------------
+# A4 #12 — Confidence-scored judge wrapper around the bool parser.
+# ---------------------------------------------------------------------------
+
+
+# Confidence rubric (see ``tests/test_a4_12_contradiction_judge_confidence.py``
+# for the per-branch pin):
+#   0.90 — Clean LLM agreement (both gates aligned with the verdict).
+#   0.85 — Gate 2 fired (model itself named a non-conflict pattern,
+#          parser overrode contradicts=true to false).
+#   0.60 — Gate 1 fired (model's same_subject contradicted its
+#          contradicts=true; parser overrode to false).
+#   0.50 — Malformed / unparseable response (parser conservative-default).
+_CONF_CLEAN = 0.90
+_CONF_GATE2 = 0.85
+_CONF_GATE1 = 0.60
+_CONF_FALLBACK = 0.50
+
+
+def _judge_provider(tenant_config) -> str:
+    """Provider for CONTRADICTION judging.
+
+    C2 — this used to read the entity-extraction provider directly, so the
+    two were welded together: moving entity extraction to a cheaper model
+    silently moved the contradiction judge with it. ``contradiction_provider``
+    overrides it when set; empty preserves the historical behaviour exactly.
+    """
+    if settings.contradiction_provider:
+        return settings.contradiction_provider
+    return tenant_config.entity_extraction_provider if tenant_config else settings.entity_extraction_provider
+
+
+def _judge_model_attr() -> str:
+    """Model attribute name handed to ``call_with_fallback`` for judging.
+
+    Same split as ``_judge_provider``: an explicit ``contradiction_model``
+    wins, otherwise the entity-extraction model is used as before.
+    """
+    return "contradiction_model" if settings.contradiction_model else "entity_extraction_model"
+
+
+def _judge_contradiction(raw) -> tuple[bool, float]:
+    """A4 #12 — wrap ``_parse_contradiction_response`` with a confidence
+    score derived from the model's own coherence.
+
+    Callers (A4 #13 retraction's confidence-weighted veto, A1 #16
+    dedup danger-zone judge) use the score to decide whether the
+    final verdict is trustworthy enough to act on. Verdict semantics
+    are identical to ``_parse_contradiction_response``; this is purely
+    additive on top.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return False, _CONF_FALLBACK
+
+    verdict = _parse_contradiction_response(raw)
+    same_subject = raw.get("same_subject") is True
+    model_contradicts = raw.get("contradicts") is True
+    raw_ncr = raw.get("non_conflict_reason")
+    non_conflict_reason = raw_ncr if isinstance(raw_ncr, str) else None
+
+    if model_contradicts and not same_subject:
+        # Gate 1 fired — model said contradicts=true but its own
+        # same_subject said false. Internal inconsistency → lower trust.
+        return verdict, _CONF_GATE1
+    if model_contradicts and non_conflict_reason in NON_CONFLICT_REASONS:
+        # Gate 2 fired — model recognised a non-conflict pattern AND
+        # said contradicts=true. The pattern-recognition signal is
+        # what we trust — high confidence in NOT-a-contradiction.
+        return verdict, _CONF_GATE2
+    # Either contradicts=False with consistent ancillary fields, or
+    # contradicts=True with both gates aligned. Clean case.
+    return verdict, _CONF_CLEAN
+
+
+# ---------------------------------------------------------------------------
+# Multi-provider LLM contradiction check with fallback chain
+# ---------------------------------------------------------------------------
+
+
+def _judge_effort_kwargs() -> dict:
+    """``complete_json`` kwargs for every contradiction-judge call (E3).
+
+    The judge is the dominant OpenAI spend (up to 20 candidates per write,
+    ~80% of the bill in OUTPUT tokens — mostly hidden reasoning tokens on
+    gpt-5-family models). ``contradiction_reasoning_effort`` caps that
+    per-call reasoning budget. Returned as a kwargs dict, EMPTY when
+    unset, rather than passing ``reasoning_effort=None`` positionally:
+    an unset knob must not change the wire request, and test doubles that
+    predate the parameter keep working without it.
+    """
+    effort = settings.contradiction_reasoning_effort
+    return {"reasoning_effort": effort} if effort else {}
+
+
+async def _llm_contradiction_check(
+    new_content: str,
+    old_content: str,
+    tenant_config=None,
+) -> tuple[bool, float]:
+    """Ask the LLM whether two texts contradict each other.
+
+    Returns ``(verdict, confidence)`` — see ``_judge_contradiction`` for
+    the rubric. A4 #12 widened this from ``bool`` so downstream
+    consumers (A4 #13 retraction, A1 #16 dedup judge) can gate
+    decisions on the model's coherence.
+
+    Uses the standard 3-tier fallback chain:
+    1. Try the configured provider (with retry)
+    2. Try the configured fallback provider (via resolve_fallback)
+    3. Abstain — or, when the operator ASKED for the fake provider, the
+       negation-word heuristic. See :func:`common.llm.retry.deliberate_fake_provider`.
+    """
+    provider_name = _judge_provider(tenant_config)
+
+    prompt = CONTRADICTION_PROMPT.format(new_content=new_content[:500], old_content=old_content[:500])
+
+    async def _do_check(llm) -> tuple[bool, float]:
+        raw = await llm.complete_json(prompt, **_judge_effort_kwargs())
+        return _judge_contradiction(raw)
+
+    return await call_with_fallback(
+        primary_provider_name=provider_name,
+        call_fn=_do_check,
+        fake_fn=_pairwise_fake_fn(provider_name, new_content, old_content),
+        tenant_config=tenant_config,
+        service_label="contradiction",
+        model_attr=_judge_model_attr(),
+        timeout=10.0,
+    )
+
+
+# A61 — batched contradiction judge. The semantic path used to fire one
+# ``_llm_contradiction_check`` (one ``complete_json``) PER candidate, up to the
+# candidate cap (20). This judges ALL candidates against the new statement in a
+# single call (~Nx fewer LLM calls, the prod cost driver). The per-candidate raw
+# output is fed through the SAME ``_judge_contradiction`` gates by the caller, so
+# verdict semantics — Gate 1 (cross-subject), Gate 2 (non_conflict_reason),
+# ``_pick_older`` direction — are unchanged.
+#
+# E4 — the reply is SPARSE: a full judgment only for contradicting candidates
+# (``hits``), a bare index for everything else (``clean``). Rationale, measured
+# on prod-shaped 20-candidate batches: the dense reply cost ~35 output tokens x
+# 20 candidates (~700/call) when typically 0-4 candidates contradict — the
+# filler was ~80% of the judge's OpenAI bill. Same candidates judged, same
+# gates on every hit; only the answer got shorter. The two fields this dropped
+# (``relationship``/``diagnosis``) were emitted "for A55 reuse" but never
+# consumed — ``record_detected_conflicts`` receives only (candidate, path,
+# confidence) and the A55 engine derives its own classification.
+BATCH_CONTRADICTION_PROMPT = """\
+You are a contradiction detector for a business memory system.
+
+A NEW statement is compared against several EXISTING candidate statements.
+Judge EACH candidate INDEPENDENTLY against the NEW statement — one candidate's
+verdict must NOT influence another's.
+
+Two statements contradict ONLY IF they make incompatible claims about the SAME
+real-world subject. Different subjects -> NOT a contradiction, even if the
+predicates look opposite.
+
+NEW statement:
+{new_content}
+
+Candidate statements (judge each, by index):
+{candidates_block}
+
+For EACH candidate index decide, applying the rules in order:
+1. same_subject (bool): true ONLY when the candidate and the NEW statement refer
+   to the SAME real-world entity (exact name / known alias / role+name in
+   context / unambiguously resolved pronoun). false for two people sharing a
+   name, different companies/products/projects/teams, or any uncertainty.
+2. non_conflict_reason (exactly one): "none"; "temporal_supersession"
+   (BOTH statements are records of PAST events that stay true as history —
+   "hired in 2020" / "promoted in 2023"; NOT for current-state claims where
+   the newer statement changes the state, e.g. "lives in X" vs "lives in Y"
+   or "runs at 01:00" vs "runs at 03:00" — a state change is an update and
+   updates ARE contradictions, reason "none");
+   "list_valued_predicate" (a multi-valued predicate or two different attributes
+   that both hold); "refinement" (one is a more specific version of the other);
+   "scope_mismatch" (same subject under different implicit qualifiers — time
+   window / whole vs part / context; both hold); "same_name_distinct_subject"
+   (same surface name, plausibly different instances); "conditional_unrealized"
+   (one is hypothetical/irrealis); "event_restatement" (same event restated).
+3. contradicts (bool): true ONLY when same_subject is true AND
+   non_conflict_reason is "none" AND the two assert mutually exclusive states in
+   the same time frame. Updates / corrections about the same subject ARE
+   contradictions ("X lives in Tel Aviv" vs "X lives in Haifa").
+
+Reply with ONLY a JSON object, no prose, no markdown fences, with exactly two
+keys. EVERY candidate index from 0 to N-1 must appear in exactly one of them:
+- "clean": array of every candidate index (integers) where contradicts is false.
+- "hits": object mapping each contradicting candidate index (as a STRING) to
+  its judgment with the three fields above.
+{{"clean": [1, 2, 4], "hits": {{"0": {{"same_subject": true, "non_conflict_reason": "none", "contradicts": true}}, "3": {{"same_subject": true, "non_conflict_reason": "none", "contradicts": true}}}}}}
+Calibration: in most batches FEW OR NO candidates contradict — an empty "hits"
+is the normal answer, not a failure to find something. Apply the three rules to
+every candidate independently, exactly as if you were judging that one pair on
+its own. A candidate goes in "hits" ONLY when all three rules pass decisively;
+uncertainty, partial overlap, related-but-compatible claims, or any applicable
+non_conflict_reason put it in "clean". Never add a hit because a batch "should"
+contain one. If NO candidate contradicts, "hits" is {{}} and "clean" lists every
+index.
+"""
+
+
+def _expand_sparse_batch(obj: object, n: int) -> list[dict]:
+    """Expand a batch judge reply into one raw judgment dict per candidate,
+    aligned to input order (E4).
+
+    Primary shape is the sparse contract — ``{"clean": [indices], "hits":
+    {"idx": {judgment}}}`` — where only contradicting candidates carry a full
+    judgment. Every index that is not a well-formed ``hits`` entry (listed
+    clean, listed nowhere, or malformed) expands to ``{"contradicts": False}``:
+    byte-identical to what the dense parser produced for a non-hit, so
+    ``_judge_contradiction`` scores it exactly as before. Hits pass through
+    verbatim so Gate 1 / Gate 2 still veto an incoherent one.
+
+    The pre-E4 DENSE shape — index keys at the top level — is still accepted:
+    a fallback provider (or a stale prompt cache) that answers in the old
+    format must degrade to old behaviour, never to "everything is clean".
+    Detection order matters: ``clean``/``hits`` keys mark the sparse shape;
+    otherwise top-level index keys are read densely; anything else expands to
+    the safe default for every candidate.
+    """
+    if not isinstance(obj, dict):
+        return [{"contradicts": False} for _ in range(n)]
+
+    if "hits" in obj or "clean" in obj:
+        hits_raw = obj.get("hits")
+        hits = hits_raw if isinstance(hits_raw, dict) else {}
+        out: list[dict] = []
+        for i in range(n):
+            entry = hits.get(str(i))
+            if entry is None:
+                entry = hits.get(i)  # tolerate int keys
+            out.append(entry if isinstance(entry, dict) else {"contradicts": False})
+        return out
+
+    # Dense back-compat: the pre-E4 per-index mapping.
+    out = []
+    for i in range(n):
+        entry = obj.get(str(i))
+        if entry is None:
+            entry = obj.get(i)  # tolerate int keys
+        out.append(entry if isinstance(entry, dict) else {"contradicts": False})
+    return out
+
+
+async def _llm_contradiction_check_batch(
+    new_content: str,
+    candidates: list[dict],
+    tenant_config=None,
+) -> list[dict]:
+    """Judge ALL ``candidates`` against ``new_content`` in ONE ``complete_json``
+    call (A61). Returns one raw judgment dict per candidate, aligned to input
+    order; a missing / malformed entry defaults to a safe non-contradiction
+    (``{"contradicts": False}``) so a partial response never fabricates or drops
+    a contradiction. The caller runs each raw through ``_judge_contradiction``,
+    so the safety gates are identical to the per-candidate path. E4: the reply
+    is sparse — see ``_expand_sparse_batch``."""
+    provider_name = _judge_provider(tenant_config)
+    candidates_block = "\n".join(f"[{i}] {c.get('content', '')[:500]}" for i, c in enumerate(candidates))
+    prompt = BATCH_CONTRADICTION_PROMPT.format(
+        new_content=new_content[:500], candidates_block=candidates_block
+    )
+
+    async def _do_check(llm) -> list[dict]:
+        raw = await llm.complete_json(prompt, **_judge_effort_kwargs())
+        return _expand_sparse_batch(raw, len(candidates))
+
+    return await call_with_fallback(
+        primary_provider_name=provider_name,
+        call_fn=_do_check,
+        fake_fn=_batch_fake_fn(provider_name, new_content, candidates),
+        tenant_config=tenant_config,
+        service_label="contradiction_batch",
+        model_attr=_judge_model_attr(),
+        timeout=15.0,
+    )
+
+
+def _skip_contradiction_pairwise() -> tuple[bool, float]:
+    """The no-LLM verdict for the per-candidate path: abstain.
+
+    ``(False, _CONF_FALLBACK)`` is not a new convention — it is exactly what
+    ``_judge_contradiction`` returns for a malformed response, and per the rubric
+    above 0.50 means "could not tell, parser conservative-default". With no LLM we
+    are in precisely that position.
+
+    This replaced ``_fake_contradiction_check``'s verdict on the production
+    fallback, because a ``True`` here is not advisory. ``detect_contradictions``
+    acts on the boolean ALONE — the confidence is unpacked as ``_confidence`` and
+    only logged, since A4 #13's confidence-weighted veto is still deferred (the
+    only live threshold, ``RETRACTION_CONFIDENCE_THRESHOLD``, gates retraction and
+    not marking) — so it sets the older memory's ``status`` to ``"conflicted"``.
+
+    What that costs, stated precisely rather than dramatically:
+
+    * ``memory_scored_search`` does NOT drop every conflicted row. It keeps one that
+      is an exact lexical match, un-demoted; otherwise the row is demoted and falls
+      out of non-exact-match recall. So the damage is to semantic/vector recall,
+      which is the path that matters for a memory product, not to lookup-by-phrasing.
+    * Recovery exists but is narrow. No sweep re-checks the status, and Path C's
+      retraction judge (:func:`_attempt_entity_retraction`) only restores the
+      canonical direction, needs resolved entities on both sides, needs confidence
+      ≥ ``RETRACTION_CONFIDENCE_THRESHOLD`` (0.90), and is tenant kill-switchable.
+      A flipped-direction mark is never revisited.
+
+    Abstaining instead loses a real contradiction during an outage, which leaves a
+    memory retrievable that should have been superseded — the recoverable direction,
+    and the same stance ``_fake_dedup_check`` takes when it errs toward keeping a
+    duplicate rather than dropping data.
+    """
+    logger.warning("contradiction_check_skipped candidates=1 reason=no_llm_abstained")
+    _note_abstentions(1)
+    return False, _CONF_FALLBACK
+
+
+def _skip_contradiction_batch(count: int) -> list[dict]:
+    """The no-LLM verdict for the batch path: abstain for every candidate.
+
+    An EMPTY dict per candidate, deliberately — not ``_expand_sparse_batch``'s
+    ``{"contradicts": False}``. Every batch raw is fed straight to
+    ``_judge_contradiction``, and the two shapes score differently there:
+    ``{"contradicts": False}`` is a non-empty dict, so it misses the malformed
+    branch, trips no gate, and comes back ``(False, _CONF_CLEAN)`` — 0.90, which
+    reads as "confidently no contradiction". ``{}`` returns
+    ``(False, _CONF_FALLBACK)`` — 0.50, "could not tell" — matching
+    :func:`_skip_contradiction_pairwise` for the identical situation. Verdict is
+    ``False`` either way, so this is inert today; it stops being inert the moment
+    A4 #13 gates on confidence, when an abstain would otherwise present as a
+    high-confidence clean verdict.
+
+    (``_expand_sparse_batch`` is right to use ``{"contradicts": False}``: there the model DID
+    answer, just not for that index. This path has no answer at all.)
+
+    The previous fallback hardcoded ``same_subject: True`` for every candidate,
+    which contradicted the batch prompt's own rule — "Set true ONLY when subject_a
+    and subject_b refer to the SAME real-world entity", and "If same_subject is
+    false, contradicts MUST be false". See ``_skip_contradiction_pairwise`` for
+    what acting on that costs.
+    """
+    logger.warning("contradiction_check_skipped candidates=%d reason=no_llm_abstained", count)
+    _note_abstentions(count)
+    return [{} for _ in range(count)]
+
+
+def _pairwise_fake_fn(provider_name, new_content: str, old_content: str):
+    """The ``fake_fn`` for a per-candidate judge: heuristic if the operator asked
+    for the fake provider, abstain otherwise. One place so a new call site cannot
+    pick the wrong side of :func:`deliberate_fake_provider` by omission.
+
+    An abstain counts against the run only as an outage. Provider ``none`` asks
+    for the judge to be off, so its abstain is the same verdict, uncounted
+    (L-226): counting it wrote a ``contradiction_stranded`` row on every run."""
+    if deliberate_fake_provider(provider_name):
+        return lambda: (_fake_contradiction_check(new_content, old_content), _CONF_FALLBACK)
+    if provider_name == ProviderName.NONE:
+        return lambda: (False, _CONF_FALLBACK)
+    return _skip_contradiction_pairwise
+
+
+def _batch_fake_fn(provider_name, new_content: str, candidates: list[dict]):
+    """The ``fake_fn`` for the batch judge. See :func:`_pairwise_fake_fn`."""
+    if deliberate_fake_provider(provider_name):
+        return lambda: [
+            {
+                "same_subject": True,
+                "contradicts": _fake_contradiction_check(new_content, c.get("content", "")),
+            }
+            for c in candidates
+        ]
+    if provider_name == ProviderName.NONE:
+        return lambda: [{} for _ in candidates]
+    return lambda: _skip_contradiction_batch(len(candidates))
+
+
+def _fake_contradiction_check(new_content: str, old_content: str) -> bool:
+    """Simple negation-word heuristic. TEST UTILITY ONLY — deliberately NOT wired
+    to the production fallback; see ``_skip_contradiction_pairwise`` for why a
+    heuristic verdict here is not survivable. Exercised directly by
+    ``tests/test_p1_contradiction.py``."""
+    negations = {
+        "not",
+        "no",
+        "never",
+        "none",
+        "isn't",
+        "wasn't",
+        "doesn't",
+        "can't",
+        "won't",
+    }
+    new_words = set(new_content.lower().split())
+    old_words = set(old_content.lower().split())
+    new_has_neg = bool(new_words & negations)
+    old_has_neg = bool(old_words & negations)
+    # If one has negation and the other doesn't, and they share significant overlap
+    if new_has_neg != old_has_neg:
+        shared = new_words & old_words - negations
+        if len(shared) >= 3:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# CAURA-129 — Entity-aware retraction judge.
+# ---------------------------------------------------------------------------
+#
+# Path C runs AFTER ``process_entity_extraction`` has resolved the
+# canonical entities and written ``MemoryEntityLink`` rows. The
+# retraction judge below leverages that — it fetches resolved entity
+# names for both memories and asks ``ENTITY_AWARE_CONTRADICTION_PROMPT``
+# which authoritatively grounds same_subject on entity identity rather
+# than on raw-text NER (Path A's semantic judge already did that, so
+# re-asking the same question gave us LLM-stochastic flips —
+# CAURA-128). Shape mirrors ``_llm_contradiction_check`` so the
+# retraction call site is a one-line swap.
+
+
+_ENTITY_CONTEXT_MAX_ENTITIES = 10
+_ENTITY_CONTEXT_NAME_MAX_CHARS = 100
+
+# CAURA-130 (L3.4) — upper bound on the fall-through set size before
+# the entity-links subject preflight starts fetching. Each candidate
+# costs one parallel storage round-trip; ``find_entity_overlap_candidates``
+# can theoretically return many rows for a high-fanout subject (popular
+# entity referenced by hundreds of memories), so cap the fan-out before
+# it becomes a thundering-herd risk on the storage API. Above the cap
+# we fail open (skip the L3.4 stage, let the LLM judge decide) rather
+# than drop everything — the legacy A1 #17 gate has already done what
+# it can.
+_ENTITY_LINKS_PREFLIGHT_MAX_CANDIDATES = 20
+
+# CAURA-134 — timeout budget (seconds) for the parallel
+# ``_fetch_entity_context`` gather in both Path C entry points
+# (retraction and forward-overlap detection). Raised from 5s -> 30s
+# after CAURA-132 forensic logs showed the 5s ceiling silently firing
+# on dev v2.14.0 with accumulated tenant state, causing
+# ``contexts_fetched`` to stay False and ALL candidates to fall back
+# to the base LLM judge. The fallback bypasses CAURA-131's entity-
+# aware wiring and CAURA-133's entity-aware prompt — i.e. the priya-
+# class silence was being driven by this timeout, not by a weak
+# prompt.
+#
+# 30s is safe because Path C runs in a fire-and-forget background
+# task after the write has already returned 201; the timeout only
+# bounds the background task's wall-clock, not user-perceived
+# latency. The two storage round-trips per memory (one batch +
+# per-link gather) complete in ~50-200ms p95 in the working
+# trials we observed; 30s is comfortably above any reasonable
+# per-tenant accumulated-state cost while still cancelling truly
+# hung tasks.
+_CONTEXT_FETCH_TIMEOUT_SECONDS = 30.0
+
+# CAURA-133 — process-scoped prefix for the missing-entity_id sentinel
+# emitted by ``_format_entity_context``. A real entity_id (always a
+# UUID written by the entity-extraction worker) cannot accidentally
+# collide with this prefix, so any rendered ``entity_id: <none-...>``
+# in the prompt is unambiguously a "no resolved identity" signal. The
+# random hex segment is generated once per process at import time —
+# its purpose is to make the sentinel format distinctive vs any real
+# value, NOT to disambiguate within-process cross-side calls (rule 3
+# of the prompt's same_subject step handles that override).
+_NONE_ID_PREFIX = f"<none-{_uuid.uuid4().hex[:8]}"
+
+# CAURA-131 — absolute upper bound on the TOTAL candidate count we'll
+# issue parallel entity-context fetches for (fall-through PLUS A1 #17-
+# matched candidates). The fall-through cap above bounds the L3.4
+# preflight set; this constant additionally bounds the entity-aware
+# detection-judge fetch. Without it, a popular entity producing 500
+# A1-#17-matched candidates would issue 501 parallel storage calls
+# even though fall-through is tiny. Set to 2x the preflight cap on the
+# heuristic that the entity-aware lift is marginal for A1-#17-matched
+# rows (subject identity is already confirmed by the column match),
+# so we don't need to pay the full thundering-herd budget for them.
+_ENTITY_LINKS_DETECTION_FETCH_MAX_CANDIDATES = _ENTITY_LINKS_PREFLIGHT_MAX_CANDIDATES * 2
+
+
+def _format_entity_context(entities: list[dict]) -> str:
+    """Render resolved entity rows into a readable block for the prompt.
+
+    ``entities`` is a list of dicts shaped ``{name, entity_type, role}``
+    (also accepts ``canonical_name`` as a primary alias for ``name``).
+    Returns one bullet per entity, e.g.
+
+        - "Project Helios" (type: project, role: subject)
+        - "2027-05-01" (type: date, role: object)
+
+    Bounds (mirror the ``[:500]`` content truncation in
+    ``_llm_entity_aware_contradiction_check`` — keep prompt token
+    cost bounded against runaway / adversarial inputs):
+
+      * At most ``_ENTITY_CONTEXT_MAX_ENTITIES`` (10) bullets rendered;
+        excess entities are dropped silently. The judge's signal
+        saturates well before 10 entities per memory; in practice we
+        see 1-5.
+      * Each ``name`` is truncated to
+        ``_ENTITY_CONTEXT_NAME_MAX_CHARS`` (100) characters. Canonical
+        names are short by construction (the entity extractor produces
+        ≤30-char names typically); 100 chars covers the long tail
+        without giving an attacker a runaway lever.
+
+    Returns the literal string ``"(none resolved)"`` when ``entities``
+    is empty — defensive; callers SHOULD have guarded earlier, but if
+    they didn't the prompt still reads as well-formed.
+    """
+    if not entities:
+        return "(none resolved)"
+    capped = entities[:_ENTITY_CONTEXT_MAX_ENTITIES]
+    lines: list[str] = []
+    for i, e in enumerate(capped):
+        name = (e.get("canonical_name") or e.get("name") or "<unknown>")[:_ENTITY_CONTEXT_NAME_MAX_CHARS]
+        etype = e.get("entity_type") or "<unknown>"
+        role = e.get("role") or "<unspecified>"
+        # CAURA-133 — render ``entity_id`` so the LLM can perform the
+        # mechanical ``subject_a.entity_id == subject_b.entity_id``
+        # comparison the prompt instructs. Without this, the prompt
+        # tells the model to compare a field the rendered context never
+        # surfaces, and the LLM falls back to name-matching — exactly
+        # the priya-silence regression CAURA-133 targets.
+        #
+        # Two layers protect the missing-entity_id case:
+        #   (1) WITHIN-side disambiguation: each missing-id row in THIS
+        #       call gets a per-row suffix (``-{i}>``) so two missing
+        #       rows in the same context block never render the same
+        #       sentinel. ``_NONE_ID_PREFIX`` adds a process-scoped
+        #       hex segment so the sentinel can never collide with a
+        #       real entity_id (real ids are UUIDs written by the
+        #       entity-extraction worker).
+        #   (2) CROSS-side disambiguation: the prompt's same_subject
+        #       step has an explicit rule that any ``<none-``-prefixed
+        #       entity_id forces ``same_subject=false`` regardless of
+        #       whether the two sides happen to render the same
+        #       sentinel string. This is the load-bearing override for
+        #       the case where both ``_format_entity_context`` calls in
+        #       a single judge invocation produce ``<none-{prefix}-0>``
+        #       for their first missing row — string-equality alone
+        #       can't tell them apart.
+        entity_id = e.get("entity_id") or f"{_NONE_ID_PREFIX}-{i}>"
+        lines.append(f'- "{name}" (type: {etype}, role: {role}, entity_id: {entity_id})')
+    return "\n".join(lines)
+
+
+def _normalize_subject_name(name: str | None) -> str:
+    """WT-3 — normalise a canonical subject name for the L3.4 preflight's
+    name-equality check: lowercase, collapse internal whitespace, strip.
+
+    Returns ``""`` when the name is missing or is the
+    ``_extract_subject_canonical_identity`` ``"<unknown>"`` placeholder —
+    an unresolvable name can never *establish* a collision, so callers
+    treat ``""`` as "names do not match" (fail open to the judge).
+    """
+    if not name or name == "<unknown>":
+        return ""
+    return " ".join(name.lower().split())
+
+
+def _extract_subject_canonical_identity(
+    entities: list[dict],
+) -> tuple[str, str, str] | None:
+    """CAURA-130 (L3.4) — extract the canonical subject identity from a
+    list of resolved entity rows.
+
+    Returns ``(canonical_name, entity_type, entity_id)`` of the FIRST
+    entity with ``role == "subject"``, or ``None`` if no subject-role
+    entity is present (degenerate / object-only link sets, empty
+    lists, malformed data). Used by the forward-Path-C preflight to
+    catch first-name collisions when ``subject_entity_id`` is NULL on
+    either memory (the A1 #17 legacy gate can't decide those cases —
+    see the inline TODO at the preflight site for the original
+    ``priya``-collision write-up).
+
+    Identity is keyed on ``entity_id`` — two ``priya`` rows with the
+    same canonical name but different entity rows ARE distinct subjects
+    (that's the whole point). WT-3: the canonical name (index 0,
+    compared via ``_normalize_subject_name``) additionally scopes the
+    preflight's drop to that same-name collision class — differing ids
+    under DIFFERING names may be a canonicalisation split of one
+    subject, and the preflight fails open there. ``entity_type`` stays
+    logging/debugging-only.
+    """
+    if not entities:
+        return None
+    for e in entities:
+        if (e.get("role") or "").lower() == "subject":
+            name = e.get("canonical_name") or e.get("name") or "<unknown>"
+            etype = e.get("entity_type") or "<unknown>"
+            entity_id = e.get("entity_id") or e.get("id")
+            if not entity_id:
+                # No identity to key on — caller should treat as
+                # "unknown subject" rather than asserting mismatch.
+                continue
+            return (str(name), str(etype), str(entity_id))
+    return None
+
+
+_ENTITY_CTX_FANOUT_LIMIT = 8
+
+
+async def _bounded_gather(coros, limit=_ENTITY_CTX_FANOUT_LIMIT):
+    """``asyncio.gather`` capped at ``limit`` concurrent coroutines.
+
+    The Path-C entity-context fan-out (one ``_fetch_entity_context`` per
+    candidate — up to ``_ENTITY_LINKS_DETECTION_FETCH_MAX_CANDIDATES`` — each
+    hydrating N entity links) would otherwise open dozens of simultaneous
+    storage handshakes that saturate the Cloud Run VPC connector and surface as
+    ``ConnectTimeout`` storms. Capping concurrency keeps each burst within the
+    connector's handshake headroom; combined with the storage client's warm
+    keep-alive pool the calls reuse connections instead of re-handshaking. A
+    fresh semaphore per call (bound to the running loop) sidesteps cross-loop
+    binding issues in tests. Order is preserved (``gather`` semantics).
+
+    That fan-out is now the FALLBACK shape, not the normal one:
+    ``_fetch_entity_contexts`` batches the whole candidate set into two
+    round-trips and only fans out when a batch call fails. The cap still has
+    to exist for exactly that window — a storage instance that 404s
+    ``/entities/by-ids`` puts every run back on the per-id path at once.
+    """
+    sem = asyncio.Semaphore(limit)
+
+    async def _run(coro):
+        async with sem:
+            return await coro
+
+    return await asyncio.gather(*(_run(c) for c in coros))
+
+
+async def _fetch_entity_context(sc, memory_id: str, tenant_id: str) -> list[dict]:
+    """Fetch and denormalise ``MemoryEntityLink`` rows for a single memory.
+
+    Two storage round-trips at worst:
+      1. ``get_entity_links_for_memories([memory_id])`` — batch endpoint;
+         returns ``{memory_id: [{entity_id, role}, ...]}``.
+      2. ``get_entity(entity_id, tenant_id)`` per link, fan-out via
+         ``asyncio.gather`` — Path C is post-commit async so the round-trip
+         parallelism is latency-invisible to the write path.
+
+    Returns ``[]`` (not ``None``) when the memory has no resolved links;
+    the caller treats empty as the skip-retraction signal so this
+    function never raises on missing data.
+
+    NOT the hot path any more. Both Path C call sites go through
+    ``_fetch_entity_contexts`` (plural), which asks for every memory at
+    once; this stays as that function's per-memory FALLBACK and as the
+    one-memory case. See ``_fetch_entity_contexts`` for the round-trip
+    arithmetic that made the difference worth having.
+    """
+    try:
+        links_by_mem = await sc.get_entity_links_for_memories([memory_id], tenant_id)
+    except Exception as e:
+        logger.warning(
+            "Path C entity-context fetch failed (links) for memory %s: %s",
+            memory_id,
+            e,
+        )
+        return []
+    links = (links_by_mem or {}).get(memory_id, []) if isinstance(links_by_mem, dict) else []
+    if not links:
+        return []
+
+    async def _hydrate(link: dict) -> dict | None:
+        entity_id = link.get("entity_id")
+        if not entity_id:
+            return None
+        try:
+            entity = await sc.get_entity(str(entity_id), tenant_id)
+        except Exception as e:
+            logger.warning(
+                "Path C entity-context fetch failed (entity %s) for memory %s: %s",
+                entity_id,
+                memory_id,
+                e,
+            )
+            return None
+        if not entity:
+            return None
+        # ``canonical_name`` is the column on Entity; fall back to
+        # ``name`` for any future schema change / mocked-test data.
+        # ``entity_id`` is preserved on the normalised shape (CAURA-
+        # 130 L3.4 — the forward-Path-C preflight uses it as the
+        # canonical-subject identity key).
+        return {
+            "name": entity.get("canonical_name") or entity.get("name"),
+            "entity_type": entity.get("entity_type"),
+            "role": link.get("role"),
+            "entity_id": str(entity_id),
+        }
+
+    hydrated = await _bounded_gather([_hydrate(link) for link in links])
+    return [h for h in hydrated if h is not None]
+
+
+async def _fetch_entity_contexts(sc, memory_ids: list[str], tenant_id: str) -> dict[str, list[dict]]:
+    """Entity context for MANY memories in two storage round-trips, total.
+
+    Same output as calling ``_fetch_entity_context`` once per memory — a
+    ``{memory_id: [{name, entity_type, role, entity_id}, ...]}`` mapping,
+    link order preserved per memory, missing/foreign entities dropped —
+    but with the fan-out collapsed:
+
+      1. ONE ``get_entity_links_for_memories(all_ids)``. That endpoint has
+         always taken a LIST; the per-memory helper just never used it as
+         one, calling it with a single-element list per candidate.
+      2. ONE ``get_entities_by_ids(unique_entity_ids)``, deduplicated
+         across every memory. Entity-overlap candidates are selected
+         BECAUSE they share entities with the new memory, so the same
+         entity row was previously refetched once per candidate that
+         linked it.
+
+    Why it mattered enough to add a storage route (#1461 context): a Path C
+    detection pass fetches context for the new memory plus up to
+    ``_ENTITY_LINKS_DETECTION_FETCH_MAX_CANDIDATES`` (40) candidates, and
+    each of those made 1 links call + one ``get_entity`` per link. At the
+    ~1-5 links per memory documented on ``_format_entity_context`` that is
+    41 + ~120 ≈ 160 HTTP round-trips per run, plus 2 + ~6 more for the
+    retraction phase. This is 2 per phase, flat, independent of candidate
+    count.
+
+    The admission gate (#1461) made this MORE visible, not less: it bounds
+    how many runs contend at once, so a run's round-trips now sit inside a
+    held slot rather than racing other runs for the pool. Round-trips per
+    slot is exactly the term that sets gated throughput.
+
+    Failure handling is deliberately unchanged from the per-memory path,
+    because batching introduces failure modes single fetches did not have
+    (a payload storage rejects wholesale; a route an older core-storage-api
+    deployment does not serve yet — the two services deploy separately):
+
+      * links call raises → fall back to the per-memory
+        ``_fetch_entity_context`` fan-out, i.e. exactly the old code path.
+      * entity batch raises or answers a non-mapping → fall back to
+        per-entity ``get_entity`` hydration (see ``_hydrate_entities``).
+
+    Never raises. Path C is post-commit best-effort; a memory that could
+    not be resolved gets ``[]`` and its caller treats that as "no context",
+    which is what it already did.
+    """
+    # Dedup while preserving first-seen order: the result is keyed by id, so
+    # asking twice for the same memory would only buy a duplicate row in the
+    # request body.
+    ordered_ids = list(dict.fromkeys(str(m) for m in memory_ids))
+    if not ordered_ids:
+        return {}
+
+    try:
+        links_by_mem = await sc.get_entity_links_for_memories(ordered_ids, tenant_id)
+    except Exception as e:
+        logger.warning(
+            "Path C batched entity-context fetch failed (links, %d memories): %s. "
+            "Falling back to per-memory fetch.",
+            len(ordered_ids),
+            e,
+        )
+        per_memory = await _bounded_gather([_fetch_entity_context(sc, mid, tenant_id) for mid in ordered_ids])
+        return dict(zip(ordered_ids, per_memory, strict=False))
+
+    # Same defensive shape check the per-memory helper applies to this
+    # response: a non-dict means the contract drifted, and the honest answer
+    # is "no links" rather than an AttributeError inside a background task.
+    links_map = links_by_mem if isinstance(links_by_mem, dict) else {}
+
+    def _links_for(mid: str) -> list[dict]:
+        raw = links_map.get(mid) or []
+        return [link for link in raw if isinstance(link, dict)]
+
+    unique_entity_ids = list(
+        dict.fromkeys(
+            str(link["entity_id"]) for mid in ordered_ids for link in _links_for(mid) if link.get("entity_id")
+        )
+    )
+    if not unique_entity_ids:
+        return {mid: [] for mid in ordered_ids}
+
+    entities_by_id = await _hydrate_entities(sc, unique_entity_ids, tenant_id)
+
+    contexts: dict[str, list[dict]] = {}
+    for mid in ordered_ids:
+        rows: list[dict] = []
+        for link in _links_for(mid):
+            entity_id = link.get("entity_id")
+            if not entity_id:
+                continue
+            entity = entities_by_id.get(str(entity_id))
+            if not entity:
+                # Absent from the batch == ``get_entity`` returning None:
+                # deleted, or not this tenant's row. Drop the link, keep the
+                # rest — the per-entity path's behaviour, preserved.
+                continue
+            rows.append(
+                {
+                    "name": entity.get("canonical_name") or entity.get("name"),
+                    "entity_type": entity.get("entity_type"),
+                    "role": link.get("role"),
+                    "entity_id": str(entity_id),
+                }
+            )
+        contexts[mid] = rows
+    return contexts
+
+
+async def _hydrate_entities(sc, entity_ids: list[str], tenant_id: str) -> dict[str, dict]:
+    """``{entity_id: row}`` for these ids — one batch call, per-id fallback.
+
+    An EMPTY mapping from the batch route is a real answer (none of the ids
+    are this tenant's) and is returned as-is. Only a raised exception or a
+    response that is not a mapping falls through to the per-id fan-out —
+    the cases where we learned nothing, as opposed to learning "nothing".
+
+    The fallback is load-bearing rather than paranoid: core-api and
+    core-storage-api are deployed separately, so a core-api carrying
+    ``/entities/by-ids`` can reach a storage instance that 404s it, and the
+    detector must keep working across that window on the old per-id route.
+    """
+    try:
+        batch = await sc.get_entities_by_ids(entity_ids, tenant_id)
+    except Exception as e:
+        logger.warning(
+            "Path C batched entity hydration failed (%d entities): %s. Falling back to per-entity fetch.",
+            len(entity_ids),
+            e,
+        )
+    else:
+        if isinstance(batch, dict):
+            return {str(k): v for k, v in batch.items() if isinstance(v, dict)}
+        logger.warning(
+            "Path C batched entity hydration returned %s, not a mapping. Falling back to per-entity fetch.",
+            type(batch).__name__,
+        )
+
+    async def _one(entity_id: str) -> tuple[str, dict] | None:
+        try:
+            entity = await sc.get_entity(entity_id, tenant_id)
+        except Exception as e:
+            logger.warning("Path C entity-context fetch failed (entity %s): %s", entity_id, e)
+            return None
+        return (entity_id, entity) if entity else None
+
+    fetched = await _bounded_gather([_one(eid) for eid in entity_ids])
+    return dict(f for f in fetched if f is not None)
+
+
+async def _llm_entity_aware_contradiction_check(
+    new_content: str,
+    old_content: str,
+    new_entities: list[dict],
+    old_entities: list[dict],
+    tenant_config=None,
+) -> tuple[bool, float]:
+    """Entity-aware variant of ``_llm_contradiction_check``.
+
+    Same return shape, same fallback chain, same ``_judge_contradiction``
+    parser; differs only in the prompt template (which receives resolved
+    entity context as ``{new_entities}`` / ``{old_entities}``). Callers
+    MUST have verified both ``new_entities`` and ``old_entities`` are
+    non-empty before invoking — see ``_attempt_entity_retraction`` for
+    the guard.
+    """
+    provider_name = _judge_provider(tenant_config)
+
+    prompt = ENTITY_AWARE_CONTRADICTION_PROMPT.format(
+        new_content=new_content[:500],
+        old_content=old_content[:500],
+        new_entities=_format_entity_context(new_entities),
+        old_entities=_format_entity_context(old_entities),
+    )
+
+    async def _do_check(llm) -> tuple[bool, float]:
+        raw = await llm.complete_json(prompt, **_judge_effort_kwargs())
+        return _judge_contradiction(raw)
+
+    return await call_with_fallback(
+        primary_provider_name=provider_name,
+        call_fn=_do_check,
+        fake_fn=_pairwise_fake_fn(provider_name, new_content, old_content),
+        tenant_config=tenant_config,
+        service_label="contradiction-entity-aware",
+        model_attr=_judge_model_attr(),
+        timeout=10.0,
+    )
+
+
+# A61 — batched entity-aware judge. Path C's forward-detection loop
+# previously fanned out one ``_llm_entity_aware_contradiction_check`` call
+# per candidate (mirroring the Path A semantic fan-out that #770 batched).
+# For a high-fanout subject (a popular entity referenced by many memories)
+# that is up to ``_ENTITY_LINKS_DETECTION_FETCH_MAX_CANDIDATES`` LLM calls
+# per newly-written memory. This variant judges the whole entity-aware
+# group in ONE ``complete_json`` call, carrying each candidate's OWN
+# resolved entity context so the authoritative same-subject grounding is
+# preserved per candidate.
+BATCH_ENTITY_AWARE_CONTRADICTION_PROMPT = """\
+You are a contradiction detector for a business memory system, running
+the second-pass judgement AFTER entity resolution has already linked every
+statement to its canonical entities.
+
+A NEW statement is compared against several EXISTING candidate statements.
+Judge EACH candidate INDEPENDENTLY against the NEW statement — one
+candidate's verdict must NOT influence another's.
+
+CRITICAL: the RESOLVED ENTITIES blocks are AUTHORITATIVE. The subject of
+each statement has ALREADY been resolved to a specific entity row
+(identified by ``entity_id``) by upstream entity extraction. Do NOT re-do
+that resolution from raw text; use the resolved entities as ground truth
+and decide whether the two statements' CLAIMS about those entities are
+mutually exclusive.
+  * Same subject-role ``entity_id`` on both sides -> same_subject MUST be
+    true (surface qualifiers like "from X", "at Y", possessives, employer /
+    team / location prefixes are extra context about the ONE subject, NOT
+    evidence of different subjects).
+  * Different subject-role ``entity_id`` -> same_subject MUST be false
+    regardless of surface-name similarity (set
+    non_conflict_reason="same_name_distinct_subject" when the canonical
+    names happen to match).
+  * ``entity_id`` starting with "<none-" on either side, or a side missing
+    a subject-role entity -> same_subject=false.
+
+NEW statement: {new_content}
+RESOLVED ENTITIES for the NEW statement:
+{new_entities}
+
+Candidate statements (judge each, by index):
+{candidates_block}
+
+For EACH candidate index decide, applying the rules in order:
+1. same_subject (bool): decided MECHANICALLY by comparing subject-role
+   ``entity_id`` values per the CRITICAL rules above.
+2. non_conflict_reason (exactly one): "none"; "temporal_supersession"
+   (BOTH statements are records of PAST events that stay true as history;
+   NOT for current-state claims where the newer statement changes the
+   state — a state change is an update and updates ARE contradictions,
+   reason "none");
+   "list_valued_predicate" (multi-valued predicate or two different
+   attributes that both hold); "refinement" (one more specific than the
+   other); "scope_mismatch" (same subject, different implicit qualifiers;
+   both hold); "same_name_distinct_subject" (surface names match, resolved
+   entities differ); "conditional_unrealized" (one is hypothetical /
+   irrealis); "event_restatement" (same event restated).
+3. contradicts (bool): true ONLY when same_subject is true AND
+   non_conflict_reason is "none" AND the two assert mutually exclusive
+   states in the same time frame. Corrections / updates about the same
+   subject ARE contradictions.
+Reply with ONLY a JSON object, no prose, no markdown fences, with exactly two
+keys. EVERY candidate index from 0 to N-1 must appear in exactly one of them:
+- "clean": array of every candidate index (integers) where contradicts is false.
+- "hits": object mapping each contradicting candidate index (as a STRING) to
+  its judgment with the three fields above.
+{{"clean": [1, 2, 4], "hits": {{"0": {{"same_subject": true, "non_conflict_reason": "none", "contradicts": true}}, "3": {{"same_subject": true, "non_conflict_reason": "none", "contradicts": true}}}}}}
+Calibration: in most batches FEW OR NO candidates contradict — an empty "hits"
+is the normal answer, not a failure to find something. Apply the three rules to
+every candidate independently, exactly as if you were judging that one pair on
+its own. A candidate goes in "hits" ONLY when all three rules pass decisively;
+uncertainty, partial overlap, related-but-compatible claims, or any applicable
+non_conflict_reason put it in "clean". Never add a hit because a batch "should"
+contain one. If NO candidate contradicts, "hits" is {{}} and "clean" lists every
+index.
+"""
+
+
+async def _llm_entity_aware_contradiction_check_batch(
+    new_content: str,
+    new_entities: list[dict],
+    candidates: list[dict],
+    tenant_config=None,
+) -> list[dict]:
+    """Entity-aware variant of ``_llm_contradiction_check_batch`` (A61 Path C).
+
+    Judge ALL ``candidates`` against ``new_content`` + ``new_entities`` in ONE
+    ``complete_json`` call. Each candidate dict MUST carry ``content`` and its
+    OWN resolved ``entities`` list (the caller assembles these from the
+    per-candidate context fetch). Returns one raw judgment dict per candidate,
+    aligned to input order; a missing / malformed entry defaults to a safe
+    non-contradiction (``{"contradicts": False}``). The caller runs each raw
+    through ``_judge_contradiction`` so the safety gates are identical to the
+    per-candidate entity-aware path.
+    """
+    provider_name = _judge_provider(tenant_config)
+    candidates_block = "\n".join(
+        f"[{i}] {c.get('content', '')[:500]}\n    RESOLVED ENTITIES: "
+        f"{_format_entity_context(c.get('entities', []))}"
+        for i, c in enumerate(candidates)
+    )
+    prompt = BATCH_ENTITY_AWARE_CONTRADICTION_PROMPT.format(
+        new_content=new_content[:500],
+        new_entities=_format_entity_context(new_entities),
+        candidates_block=candidates_block,
+    )
+
+    async def _do_check(llm) -> list[dict]:
+        raw = await llm.complete_json(prompt, **_judge_effort_kwargs())
+        return _expand_sparse_batch(raw, len(candidates))
+
+    return await call_with_fallback(
+        primary_provider_name=provider_name,
+        call_fn=_do_check,
+        fake_fn=_batch_fake_fn(provider_name, new_content, candidates),
+        tenant_config=tenant_config,
+        service_label="contradiction-entity-aware_batch",
+        model_attr=_judge_model_attr(),
+        timeout=15.0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# A4 #13 — Retraction phase: re-judge a Path A verdict with full entity
+# context and undo it via the A4 #10 storage primitive when the re-judge
+# disagrees with sufficient confidence.
+# ---------------------------------------------------------------------------
+
+
+# Minimum confidence the judge must report for a ``verdict=False`` to
+# trigger retraction. Above this we trust the "not a contradiction"
+# call; below this we leave Path A's verdict in place.
+#
+# CAURA-128 — tightened from 0.60 → 0.90.
+#
+# The retraction code was originally written as "re-judge with full
+# entity context"; the comment block at A4 #13's introduction promised
+# the judge would see the resolved entity_links and answer a different,
+# entity-aware question than Path A's semantic similarity check. In
+# practice ``_attempt_entity_retraction`` calls ``_llm_contradiction_check
+# (new_content, old_content, ...)`` with the SAME prompt and SAME inputs
+# as Path A's semantic judge. There is no entity context in the request
+# — it is the same LLM call rolled twice.
+#
+# Wet-tested on memclaw.net 2026-05-26 (S2 race probe, scripts/  # legacy-name-floor: historical
+# repro_contradictions_race.py). Two memories with directly conflicting
+# release dates about a synthetic proper-noun subject. Path A correctly
+# flagged the conflict; Path C's independent roll returned
+# ``(verdict=False, confidence=0.60)`` on a non-trivial fraction of runs
+# and silently retracted the correct flag. Confidence rubric:
+#   0.90 — clean LLM agreement (both gates aligned on "not contradict")
+#   0.85 — gate 2 fired (model named a non_conflict_reason)
+#   0.60 — gate 1 fired (model said contradicts=True same_subject=False;
+#          parser overrode). THIS IS THE STOCHASTIC FLIP CASE.
+#   0.50 — malformed response, or a no-LLM abstain (``_skip_contradiction_*``).
+#          NOT a heuristic verdict any more: the production fallback abstains.
+#
+# Raising the floor to 0.90 means retraction only fires on clean
+# agreement — both gates of the parser say "not a contradiction" with
+# no parser-override. Gate-1 (the stochastic-flip case) and gate-2
+# (single-gate non_conflict_reason) both now leave Path A's verdict in
+# place. This is the "quick fix" tier; the deeper fix (an entity-aware
+# prompt that actually receives entity_links + canonical names) is
+# tracked separately and will revisit this threshold once the judge has
+# a different question to answer.
+RETRACTION_CONFIDENCE_THRESHOLD = _CONF_CLEAN
+
+
+def _rdf_object_key(value: Any) -> str:
+    """``_normalized_object_sql`` in Python: case, whitespace and thousands
+    separators only, so "7,500 RPM" and "7500 rpm" are one value."""
+    return re.sub(r"[\s,]", "", str(value)).lower()
+
+
+#: ``memory_find_rdf_conflicts`` considers only rows in these states.
+_RDF_LIVE_STATUSES = ("active", "confirmed", "pending")
+
+
+def _rdf_pass_would_mark(new_memory: dict, other: dict, *, other_is_loser: bool) -> bool:
+    """Whether ``_rdf_conflict_pass`` for ``new_memory`` would mark ``other``.
+
+    One subject, one single-value attribute (a ``predicate_cluster``), two
+    different values. Mirrors the pass's gate and ``memory_find_rdf_conflicts``
+    term by term, each side normalised as its source does: the gate lower-cases
+    ``new_memory``'s predicate and ``predicate_cluster`` strips and lower-cases it
+    for the query, while the query only lower-cases ``other``'s stored predicate.
+    The query's scope (live status, fleet, visibility, owning agent) is mirrored
+    too: a verdict joined the pair inside it, but either row can have moved since.
+    A loser is exempt from the status term, because retraction reverts it to
+    ``active`` before the pass runs. Returning True for a pair the pass would skip
+    would block a retraction that nothing else would undo.
+    """
+    subject, predicate = new_memory.get("subject_entity_id"), new_memory.get("predicate")
+    value, other_value = new_memory.get("object_value"), other.get("object_value")
+    if not (subject and predicate and value) or predicate.lower() not in SINGLE_VALUE_PREDICATES:
+        return False
+    if other.get("deleted_at") is not None or str(other.get("subject_entity_id")) != str(subject):
+        return False
+    if not other_is_loser and other.get("status") not in _RDF_LIVE_STATUSES:
+        return False
+    if (other.get("predicate") or "").lower() not in predicate_cluster(predicate):
+        return False
+    if (other.get("fleet_id") or "") != (new_memory.get("fleet_id") or ""):
+        return False
+    visibility = new_memory.get("visibility", "scope_team")
+    if visibility and other.get("visibility") != visibility:
+        return False
+    agent_id = new_memory.get("agent_id")
+    if visibility == "scope_agent" and agent_id and other.get("agent_id") != agent_id:
+        return False
+    return other_value is not None and _rdf_object_key(value) != _rdf_object_key(other_value)
+
+
+async def _attempt_entity_retraction(
+    sc,
+    new_memory: dict,
+    tenant_config,
+) -> bool:
+    """Re-judge whatever candidate Path A retracted; undo if the judge
+    disagrees with sufficient confidence. Returns True iff a retraction
+    was performed.
+
+    A53 — resolution is DIRECTION-AWARE. Canonical verdicts put the edge on
+    ``new_memory`` (dereference ``supersedes_id``); flipped verdicts put it on
+    the pre-existing candidate and leave ``new_memory`` ``outdated`` with a NULL
+    ``supersedes_id``. The previous implementation dereferenced ``new_memory``
+    unconditionally and so returned False for every flipped verdict — and this
+    docstring used to claim the opposite ("works in both directions"), which was
+    never true. The flipped counterpart is found with a retraction-shaped
+    storage lookup; a chain claimed by more than one row is left alone rather
+    than guessed at.
+
+    Retraction is a two-step write via A4 #10:
+      1. ``update_memory_status(candidate.id, "active")`` — revert
+         the conflicted row. Idempotent if a concurrent writer beat
+         us to it.
+      2. ``update_memory_status(new_memory.id, status,
+         unset_supersedes=True, expected_supersedes_id=candidate.id)``
+         — clear the chain edge with a CAS anchor. A 409 from the
+         storage layer means someone else mutated the chain between
+         our read and our write; we treat that as "the retraction is
+         no longer ours to do" and swallow it.
+    """
+    # CAURA-130 (L3.8) — per-tenant retraction kill-switch. Ops escape
+    # valve: flip ``retraction_enabled`` to False on a misbehaving
+    # tenant to leave Path A's verdict in place unconditionally,
+    # without a deploy. Default ON (no behavior change for existing
+    # tenants — the resolver returns True when the JSONB key is
+    # absent / None). Check before any other work so the early exit
+    # is also cheap.
+    if tenant_config is not None and not getattr(tenant_config, "retraction_enabled", True):
+        logger.info(
+            "Path C retraction skipped — disabled by tenant config for memory %s",
+            new_memory.get("id"),
+        )
+        return False
+
+    # Bound once: the candidate lookup and the entity-context fetches below are
+    # by bare id and must be scoped to the row's own tenant.
+    retraction_tenant_id = str(new_memory["tenant_id"])
+
+    # A53 — resolve the pair DIRECTION-AWARE. The content route (ex-"Path A")
+    # records its verdict two different ways:
+    #
+    #   canonical: new_memory wins  -> new_memory.supersedes_id = candidate.id
+    #                                  candidate becomes `conflicted`
+    #   flipped:   candidate wins   -> candidate.supersedes_id = new_memory.id
+    #                                  NEW_MEMORY becomes `outdated`
+    #
+    # The old code only dereferenced ``new_memory.supersedes_id``, which is NULL
+    # in the flipped case — so a flipped verdict could never be retracted, and
+    # the docstring claiming otherwise was simply wrong. The row to revert and
+    # the row owning the edge swap places between the two directions.
+    edge_owner: dict | None = None  # the row whose supersedes_id must be cleared
+    candidate: dict | None = None  # the row whose status must be reverted
+
+    if new_memory.get("supersedes_id"):
+        candidate = await sc.get_memory(str(new_memory["supersedes_id"]), retraction_tenant_id)
+        edge_owner = new_memory
+    else:
+        # Flipped: find who points AT us. Retraction-shaped lookup on purpose —
+        # ``find_successors`` filters to active/confirmed and applies visibility
+        # scoping, so it would miss the edge owner precisely when it matters.
+        try:
+            owners = await sc.find_by_supersedes_id(retraction_tenant_id, str(new_memory.get("id")))
+        except Exception:
+            logger.warning(
+                "Retraction could not resolve the flipped counterpart for memory %s",
+                new_memory.get("id"),
+                exc_info=True,
+            )
+            return False
+        if len(owners) != 1:
+            # Zero: nothing to retract. More than one: the chain is ambiguous and
+            # picking arbitrarily could clear an edge a DIFFERENT contradiction
+            # legitimately created. Leave it to a human / the next run.
+            if owners:
+                logger.warning(
+                    "Retraction skipped for memory %s: %d rows claim the chain edge",
+                    new_memory.get("id"),
+                    len(owners),
+                )
+            return False
+        edge_owner = owners[0]
+        candidate = new_memory
+
+    if not candidate or candidate.get("deleted_at") is not None:
+        return False
+
+    # Only retract a row still in the state the content route produced. Shape-
+    # based, not a single status literal: canonical marks the loser
+    # ``conflicted``, flipped marks it ``outdated``. If another writer (or an
+    # earlier retraction) already moved the row on, ours is no longer meaningful
+    # — skip without paying for the judge.
+    if candidate.get("status") not in ("conflicted", "outdated"):
+        return False
+
+    # The edge must still point where we think it does; otherwise the pair we
+    # resolved is not the pair the chain describes. The storage CAS below is the
+    # real guard, but failing here avoids an LLM call we would only discard.
+    #
+    # 09/22 M-01 — checked, and this one is accurate. "The storage CAS below"
+    # is the retraction CAS, not the phantom ``WHERE supersedes_id IS NULL``
+    # the forward paths used to cite: the ``unset_supersedes`` call at the end
+    # of this function passes ``expected_supersedes_id``, and the storage route
+    # gates the clear on ``supersedes_id == expected OR IS NULL``, answering
+    # 409 on anything else. That gate is opt-in and this path opts in, which
+    # is exactly what the forward paths did not do.
+    if str(edge_owner.get("supersedes_id") or "") != str(candidate.get("id")):
+        return False
+    # A row cannot be judged against itself. The chain says the two differ, so
+    # this only fires on a corrupt self-edge; refuse it rather than ask the judge
+    # whether X contradicts X, which it always answers "no" with full confidence.
+    if str(edge_owner.get("id")) == str(candidate.get("id")):
+        return False
+    # L-27: a verdict the deterministic RDF pass would reach is not the judge's
+    # to revisit. If the judge disagreed, the RDF pass that runs right after this
+    # in the same Path C call re-applies it, so a retraction only churns writes.
+    # The pass runs for ``new_memory``: the winner in a canonical verdict, the
+    # loser in a flipped one.
+    if edge_owner is new_memory:
+        rdf_would_mark = _rdf_pass_would_mark(new_memory, candidate, other_is_loser=True)
+    else:
+        rdf_would_mark = _rdf_pass_would_mark(new_memory, edge_owner, other_is_loser=False)
+    if rdf_would_mark:
+        return False
+
+    # Judge the PAIR the chain describes: the edge owner (the verdict's winner)
+    # against the row it superseded. In the canonical direction the owner is
+    # ``new_memory``; in the flipped one it is the OTHER row and ``new_memory``
+    # is the loser. Reading the winner side from ``new_memory`` unconditionally
+    # made the flipped branch compare the loser with itself, which the judge
+    # answers "no contradiction" at 0.90 -- enough to retract every flipped
+    # verdict it reached.
+    new_content = edge_owner.get("content", "") or ""
+    old_content = candidate.get("content", "") or ""
+
+    # CAURA-129 — fetch resolved entity context for BOTH memories. If
+    # either side has no resolved entities, the entity-aware judge has
+    # nothing to ground same_subject on, and we'd degenerate to the
+    # CAURA-128 pre-fix state (same prompt + same inputs as Path A,
+    # stochastically flipping). Empty on either side → skip retraction;
+    # Path A's verdict stands. This is correct for the common case (the
+    # entity-extraction worker that *enqueued* Path C populates the
+    # links by definition), and conservative for the edge case
+    # (degenerate inputs / extractor failure).
+    # Wrap the fetch in ``asyncio.wait_for`` so a hung storage
+    # round-trip cannot block Path C indefinitely (mirrors the LLM
+    # call's cancellation boundary below). On failure (timeout,
+    # network, storage error), treat as "no context, leave Path A
+    # alone" rather than retrying. See ``_CONTEXT_FETCH_TIMEOUT_SECONDS``
+    # for the timeout rationale (CAURA-134).
+    owner_id = str(edge_owner.get("id"))
+    candidate_id = str(candidate.get("id"))
+    try:
+        # One batched fetch for BOTH sides rather than two parallel
+        # per-memory fetches: same contexts, two round-trips instead of
+        # 2 + one per link on each side. See ``_fetch_entity_contexts``.
+        ctx_by_memory = await asyncio.wait_for(
+            _fetch_entity_contexts(sc, [owner_id, candidate_id], retraction_tenant_id),
+            timeout=_CONTEXT_FETCH_TIMEOUT_SECONDS,
+        )
+        new_entities = ctx_by_memory.get(owner_id, [])
+        old_entities = ctx_by_memory.get(candidate_id, [])
+    except Exception as e:
+        # CAURA-134 — include exception class name in the log. The
+        # default str(e) is empty for ``asyncio.TimeoutError``, which
+        # made the old "failed: . Path A's verdict stands." message
+        # un-diagnosable; the class name disambiguates timeouts from
+        # network errors from malformed responses.
+        #
+        # No symmetric INFO line here: the retraction path has no
+        # success-side ``context_fetched`` INFO to mirror (unlike the
+        # detection path, which emits one on the happy path for GCP
+        # metric parity). A redundant failure-only INFO would skew
+        # any retraction-path success/failure counter built from
+        # ``context_fetched`` / ``context_fetch_failed`` pairs.
+        logger.warning(
+            "PATH_C_RETRACTION context_fetch_failed memory=%s candidate=%s "
+            "exc_type=%s exc=%s. Path A's verdict stands.",
+            new_memory.get("id"),
+            candidate.get("id"),
+            type(e).__name__,
+            e,
+        )
+        return False
+
+    if not new_entities or not old_entities:
+        logger.info(
+            "Path C retraction skipped — empty entity context for "
+            "memory %s (new_n=%d cand_n=%d). Path A's verdict stands.",
+            new_memory.get("id"),
+            len(new_entities),
+            len(old_entities),
+        )
+        return False
+
+    # No outer ``wait_for`` (L-179): ``call_with_fallback`` bounds each attempt,
+    # and a 10 s cut here cancelled a hanging primary before its retry or the
+    # fallback provider could run.
+    try:
+        verdict, confidence = await _llm_entity_aware_contradiction_check(
+            new_content, old_content, new_entities, old_entities, tenant_config
+        )
+    except Exception as e:
+        # CAURA-134 — include the exception class name and use the
+        # grep-friendly ``PATH_C_RETRACTION judge_failed`` prefix.
+        # str(e) is empty for ``asyncio.TimeoutError``, which was the
+        # silent failure mode masked by the prior log shape.
+        logger.warning(
+            "PATH_C_RETRACTION judge_failed memory=%s candidate=%s exc_type=%s exc=%s",
+            new_memory.get("id"),
+            candidate.get("id"),
+            type(e).__name__,
+            e,
+        )
+        return False
+
+    if verdict:
+        # Judge agrees with Path A — real contradiction, leave it.
+        return False
+    if confidence < RETRACTION_CONFIDENCE_THRESHOLD:
+        # Below the CAURA-128 floor (0.90). Covers gate-1 (0.60, the
+        # stochastic-flip case where parser overrode ``contradicts=True
+        # same_subject=False`` to False), gate-2 (0.85, single-gate
+        # ``non_conflict_reason``), and the malformed / no-LLM-abstain
+        # case (0.50). None are trustworthy enough on their own —
+        # the judge call is the same prompt + same inputs as Path A's
+        # semantic judge, so a single-gate disagreement is just an
+        # independent LLM roll flipping. Leave Path A's verdict in
+        # place until the deeper entity-aware-prompt fix lands.
+        logger.info(
+            "Path C retraction skipped low-confidence verdict for memory %s "
+            "candidate %s (confidence=%.2f < threshold=%.2f)",
+            new_memory.get("id"),
+            candidate.get("id"),
+            confidence,
+            RETRACTION_CONFIDENCE_THRESHOLD,
+        )
+        return False
+
+    # Two-step retraction via A4 #10. Each write is scoped to the HOME tenant
+    # of the row it touches — the candidate and new_memory live in the same
+    # (trigger) tenant, but we pass each row's own ``tenant_id`` so the
+    # storage-layer cross-tenant guard never silently no-ops a legitimate write.
+    # Extract each row's home tenant explicitly. ``get_memory`` always
+    # serialises ``tenant_id`` (NOT NULL column in MEMORY_FIELDS), so this
+    # never fires in practice — but raising beats ``str(None)`` -> "None",
+    # which would silently match no row and turn the retraction into a
+    # no-op rather than surfacing the broken invariant.
+    cand_tenant = candidate.get("tenant_id")
+    new_tenant = new_memory.get("tenant_id")
+    if not cand_tenant or not new_tenant:
+        raise ValueError(
+            f"Path C retraction missing tenant_id (candidate={candidate.get('id')}, "
+            f"new_memory={new_memory.get('id')})"
+        )
+    # A53 — revert the LOSER and clear the edge on whichever row OWNS it. In the
+    # canonical direction that is new_memory; in the flipped direction it is the
+    # pre-existing candidate, and the loser is new_memory itself. Writing these
+    # the canonical way round in a flipped chain would revert the wrong row and
+    # leave the real edge dangling.
+    # Revert ONLY a status detection itself set. The literal "active" used to be
+    # written unconditionally, so whatever the row held at this moment was
+    # overwritten — including a status this path never assigned. Detection marks
+    # a losing candidate "outdated" or "conflicted"; anything else means another
+    # writer has moved the row since (confirmed by a human, archived by the
+    # crystallizer, superseded by a different chain), and stamping "active" over
+    # that discards someone else's decision to undo our own.
+    #
+    # Mirrors the guard the content-edit reset already applies for exactly this
+    # reason (``memory_service._revert_superseded_row``); the two paths clear the
+    # same state and had no business disagreeing, which is why the tuple they
+    # both read is now ``CONTRADICTED_STATUSES`` rather than two literals.
+    #
+    # NOTE this restores "active", not the status the row held BEFORE detection.
+    # A row that was "confirmed" and got marked "conflicted" comes back as
+    # "active", because nothing records what was overwritten — neither
+    # ``memories`` nor ``memory_conflicts`` has a prior-status column. Narrowing
+    # the write is the part that can be fixed without a migration; recovering the
+    # original value cannot.
+    cand_status = candidate.get("status")
+    if cand_status in CONTRADICTED_STATUSES:
+        await sc.update_memory_status(str(candidate.get("id")), "active", tenant_id=cand_tenant)
+    else:
+        logger.info(
+            "PATH_C_RETRACTION candidate_revert_skipped memory=%s candidate=%s status=%s "
+            "(not a status detection set; leaving it to its current owner)",
+            new_memory.get("id"),
+            candidate.get("id"),
+            cand_status,
+        )
+    try:
+        await sc.update_memory_status(
+            str(edge_owner.get("id")),
+            edge_owner.get("status", "active"),
+            tenant_id=str(edge_owner.get("tenant_id") or new_tenant),
+            unset_supersedes=True,
+            # CAS anchor: the edge must still point at the row we just reverted,
+            # or another writer has taken the chain and this retraction is no
+            # longer ours to make.
+            expected_supersedes_id=str(candidate.get("id")),
+        )
+    except Exception as e:
+        # CAS rejection (409) means another writer mutated the chain
+        # — the candidate revert above still landed (idempotent), and
+        # the chain edge is whatever the other writer chose. Don't
+        # roll the candidate back.
+        logger.warning(
+            "Path C retraction chain-clear failed for memory %s candidate %s: %s",
+            new_memory.get("id"),
+            candidate.get("id"),
+            e,
+        )
+
+    logger.info(
+        "Path C retracted Path A's verdict for memory %s: candidate %s reverted to active (confidence=%.2f)",
+        new_memory.get("id"),
+        candidate.get("id"),
+        confidence,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Entity-based contradiction detection (post entity extraction)
+# ---------------------------------------------------------------------------
+
+
+async def detect_contradictions_by_entities_async(
+    memory_id: UUID,
+    tenant_id: str,
+    fleet_id: str | None,
+) -> None:
+    """Post-entity-extraction contradiction detection using shared entities.
+
+    Runs after entity extraction completes, so MemoryEntityLink rows exist.
+    Finds memories that share entities with the new memory and checks for
+    contradictions via LLM -- catches by-the-way updates that embedding
+    similarity misses.
+
+    Also re-judges any candidate Path A retracted (A4 #13). If the
+    entity-aware re-judge disagrees with Path A's verdict at sufficient
+    confidence, the retraction is undone via the A4 #10 storage primitive.
+    """
+    from core_api.services.organization_settings import resolve_config
+
+    # SIDE-58 — tenant opt-out. Skips the retraction phase and the post-
+    # extraction RDF pass too: both are contradiction detection.
+    if await _detection_disabled_for_tenant(tenant_id, memory_id, "entity"):
+        return
+
+    # Always-fire completion log (Gap 06) — see ``detect_contradictions_async``
+    # above for the rationale. Same memory-id-in-message convention.
+    t_start = time.monotonic()
+    n_candidates = 0
+    n_conflicts = 0
+    n_retractions = 0
+    skipped = False
+    lock_held = False
+    concluded = False
+    lock_key = None
+    lock_token = ""
+    failure: Exception | None = None
+    failure_tb = ""
+    # A19 — same admission gate as Path A, and deliberately the SAME gate:
+    # Path C is the heavier occupant (it runs the entity-context fetch, and
+    # on the per-id fallback path that still holds up to
+    # ``_ENTITY_CTX_FANOUT_LIMIT`` storage connections at once), so giving it
+    # a second Semaphore(N) would double the very stampede budget the cap
+    # exists to bound. See ``_acquire_detection_slot`` for ordering + the
+    # outside-the-try rationale. The batched fetch (m-05) cut the round-trips
+    # a held slot spends on storage from ~170 to 4 across both phases; it did
+    # not change which gate Path C belongs in.
+    _gate, queued_ms = await _acquire_detection_slot()
+    abstentions = _JudgeAbstentions()
+    abstentions_token = _judge_abstentions.set(abstentions)
+    try:
+        # The row is fetched BEFORE the lock is taken, unlike Path A. The lock
+        # key carries a fingerprint of the content this run will examine (H-06)
+        # and Path C — unlike Path A — is not handed that content by its
+        # caller. The extra GET on a duplicate delivery is cheap beside the LLM
+        # work the lock protects, and fetching first also means a soft-deleted
+        # row no longer burns a lock for the rest of the TTL.
+        sc = get_storage_client()
+        new_memory = await sc.get_memory(str(memory_id), tenant_id)
+        if not new_memory or new_memory.get("deleted_at") is not None:
+            return
+
+        # A4 #14 — back-channel idempotency. Entity extraction can
+        # complete more than once per memory (delta re-extraction,
+        # partial retry), each completion firing Path C. First caller
+        # wins the lock; the rest skip. Fail-open on Redis outage.
+        # H-06: per-content, so entity re-extraction after a content edit is
+        # not deduped against the run that examined the previous text.
+        content = new_memory.get("content") or ""
+        lock_key = _entity_lock_key(memory_id, content)
+        lock_token = _lock_token()
+        if not await _acquire_entity_lock(memory_id, content, lock_token):
+            skipped = True
+            return
+        lock_held = True
+
+        tenant_config = await resolve_config(tenant_id)
+
+        # A4 #13 — re-judge Path A's verdict (if any) before the
+        # standard entity-overlap detection. Phases are independent:
+        # this lookup dereferences ``new_memory.supersedes_id``, while
+        # the detection phase below looks at memories that share
+        # entities with new_memory. A retraction in this phase doesn't
+        # short-circuit the detection phase — Path C may still find a
+        # different (genuine) contradiction below.
+        if await _attempt_entity_retraction(sc, new_memory, tenant_config):
+            n_retractions = 1
+            # The new memory's ``supersedes_id`` was just cleared.
+            # Re-fetch so the detection phase below sees the fresh state.
+            refreshed = await sc.get_memory(str(memory_id), tenant_id)
+            if refreshed and refreshed.get("deleted_at") is None:
+                new_memory = refreshed
+
+        # A40 — run the DETERMINISTIC pass here, where the triple finally
+        # exists. This is the whole point of the fix: at write time
+        # ``EmitMemoryTriple`` resolves a subject only for identifier-shaped
+        # tokens, so every proper-noun fact ("Maya lives in Boston") committed
+        # with a NULL subject, Path A's RDF gate failed, and the verdict was
+        # handed to the stochastic raw-text judge. Entity extraction has now
+        # populated ``subject_entity_id`` / ``predicate`` / ``object_value``,
+        # and it is extraction completing that fired this very function — so
+        # this is the first moment the check CAN run for those rows.
+        #
+        # Cheaper, not dearer: a deterministic verdict short-circuits the
+        # entity-overlap LLM judge below, exactly as an RDF hit short-circuits
+        # Path A's semantic judge. Re-running is safe — the query selects only
+        # live rows, so anything Path A already retired is out of scope.
+        rdf = await _rdf_conflict_pass(
+            sc,
+            new_memory,
+            memory_id=memory_id,
+            tenant_id=tenant_id,
+            supersedes_id=new_memory.get("supersedes_id"),
+        )
+        if rdf.contradictions:
+            n_conflicts += len(rdf.contradictions)
+            await _record_conflicts(
+                new_memory,
+                rdf.record_pairs,
+                rdf.unlinked_pairs,
+                tenant_id=tenant_id,
+                tenant_config=tenant_config,
+            )
+            concluded = True
+            return
+
+        candidates = await sc.find_entity_overlap_candidates(
+            {
+                "memory_id": str(memory_id),
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                # Same visibility scoping as the semantic path above.
+                "visibility": new_memory.get("visibility", "scope_team"),
+                # A54 — pins the OWNER for the scope_agent tier. The tier alone
+                # matches any agent's private rows, so without this a writer can
+                # mark another agent's private memory conflicted.
+                "agent_id": new_memory.get("agent_id"),
+            }
+        )
+        n_candidates = len(candidates) if candidates else 0
+        # CAURA-132 diag — surface Path C invocation + initial candidate
+        # count. The wet-test miss class (links=2/2, no contradiction)
+        # could be either (a) zero candidates returned even though the
+        # entity overlap exists, or (b) candidates returned but dropped
+        # downstream. Without this log we can't distinguish them.
+        logger.debug(
+            "PATH_C_DETECTION entry memory=%s tenant=%s fleet=%s candidates_initial=%d",
+            memory_id,
+            tenant_id,
+            fleet_id,
+            n_candidates,
+        )
+        if not candidates:
+            concluded = True
+            return
+
+        # A1 #17 — subject preflight. Drop candidates whose
+        # ``subject_entity_id`` is non-NULL AND differs from the new
+        # memory's: they're definitionally about different subjects,
+        # so the LLM judge would be (1) at risk of a false-positive
+        # contradiction call when entities share canonical names like
+        # "priya" but resolve to distinct entity rows (see
+        # ``followup-path-c-judge-first-name-collisions``) and (2)
+        # wasteful API spend regardless. Candidates with NULL
+        # ``subject_entity_id`` on either side fall through to the
+        # entity-links preflight below.
+        new_subject = new_memory.get("subject_entity_id")
+        filtered_candidates = [
+            c
+            for c in candidates
+            if not _subjects_differ_with_certainty(new_subject, c.get("subject_entity_id"))
+        ]
+        n_preflight_skipped = len(candidates) - len(filtered_candidates)
+        candidates = filtered_candidates
+        # CAURA-132 diag — A1 #17 outcome.
+        logger.debug(
+            "PATH_C_DETECTION after_a1_17 memory=%s preflight_skipped=%d remaining=%d",
+            memory_id,
+            n_preflight_skipped,
+            len(candidates),
+        )
+        if not candidates:
+            logger.info(
+                "Path C preflight skipped all %d candidates for memory %s (distinct subject_entity_id)",
+                n_preflight_skipped,
+                memory_id,
+            )
+            concluded = True
+            return
+
+        # CAURA-130 (L3.4) — entity-links subject preflight. The A1 #17
+        # gate above only fires when BOTH sides have non-NULL
+        # ``subject_entity_id``. When one side is NULL (heuristic
+        # missed but entity-extraction worker populated entity_links
+        # with a subject-role entity), same-canonical-name distinct-
+        # entity pairs (the ``priya``-collision case in the original
+        # followup TODO) silently fell through to the LLM judge — which
+        # then mis-classified as a contradiction. Here we resolve the
+        # canonical subject identity from ``entity_links`` for the
+        # affected candidates and drop on identity mismatch.
+        #
+        # Cost: only fetch entity context for candidates whose legacy
+        # ``subject_entity_id`` gate fell through (at least one side
+        # NULL). When BOTH sides have non-NULL ids the A1 #17 gate
+        # already handled them — those candidates skip this stage.
+        # New memory's context fetched once (1 storage round-trip);
+        # remaining work scales with the size of the fall-through set.
+        # The whole stage is wrapped in ``asyncio.wait_for(timeout=
+        # 5.0)`` — on failure we fail-open (keep candidates) rather
+        # than dropping potentially-real contradictions.
+        # CAURA-131 — fetch resolved entity context once for the new
+        # memory + every surviving candidate, then reuse the same dict
+        # for BOTH the L3.4 preflight (canonical-subject mismatch drop)
+        # AND the detection LLM call (entity-aware judge — see below).
+        # Previously the preflight fetched and discarded; the detection
+        # loop ran the base ``_llm_contradiction_check`` which gets
+        # fooled by surface qualifiers ("Priya from AcmeCorp" vs
+        # "Priya from BetaIndustries" → "different subjects" → no
+        # flag, even when entity-extraction merged them to the same
+        # canonical entity row). Sharing the contexts closes that gap.
+        #
+        # Cost guard: cap on the FALL-THROUGH count (candidates where
+        # ``new_subject`` is NULL or the candidate's
+        # ``subject_entity_id`` is NULL) — the set that L3.4 actually
+        # needs the fetch for. A1-#17-matched rows (both sides
+        # non-NULL, same entity_id) don't need L3.4 treatment, so
+        # counting them toward the cap would silently disable both
+        # L3.4 AND the entity-aware judge for exactly the null-id
+        # candidates that benefit from them. When the cap is not
+        # exceeded, we fetch contexts for ALL candidates so the
+        # entity-aware detection judge can run on the matched rows
+        # too — bounded by the fall-through count, which is the real
+        # high-fanout risk surface.
+        contexts: dict[str, list[dict]] = {}
+        new_ctx: list[dict] = []
+        contexts_fetched = False
+        n_entity_links_skipped = 0
+        fallthrough_count = sum(
+            1 for c in candidates if new_subject is None or c.get("subject_entity_id") is None
+        )
+        if (
+            fallthrough_count > _ENTITY_LINKS_PREFLIGHT_MAX_CANDIDATES
+            or len(candidates) > _ENTITY_LINKS_DETECTION_FETCH_MAX_CANDIDATES
+        ):
+            # Two cost guards combined: the L3.4-specific fall-through
+            # cap, AND an absolute bound on parallel fetches so a
+            # popular entity with hundreds of A1-#17-matched
+            # candidates can't issue an unbounded thundering herd on
+            # the storage API (fall-through could be tiny while total
+            # is huge — see CAURA-131 follow-up).
+            logger.warning(
+                "Path C entity-links context fetch skipped for memory %s — "
+                "fall-through %d > cap %d OR total %d > cap %d. "
+                "Falling through to base LLM judge.",
+                memory_id,
+                fallthrough_count,
+                _ENTITY_LINKS_PREFLIGHT_MAX_CANDIDATES,
+                len(candidates),
+                _ENTITY_LINKS_DETECTION_FETCH_MAX_CANDIDATES,
+            )
+        else:
+            try:
+                # ONE batched fetch for the new memory and every candidate,
+                # not one fan-out group each. The cost guards above still
+                # bound the candidate count; what changed is that the count
+                # no longer multiplies storage round-trips (1 + N links
+                # calls + one per link became 2 calls, flat). The gate from
+                # #1461 bounds concurrent runs, so round-trips per run is
+                # what sets throughput per slot. See
+                # ``_fetch_entity_contexts``.
+                fetched = await asyncio.wait_for(
+                    _fetch_entity_contexts(
+                        sc,
+                        [str(memory_id), *(str(c.get("id")) for c in candidates)],
+                        tenant_id,
+                    ),
+                    timeout=_CONTEXT_FETCH_TIMEOUT_SECONDS,
+                )
+                new_ctx = fetched.get(str(memory_id), [])
+                for c in candidates:
+                    contexts[str(c.get("id"))] = fetched.get(str(c.get("id")), [])
+                contexts_fetched = True
+                # CAURA-132 diag — context-fetch outcome. Per-candidate
+                # context sizes show which candidates have populated
+                # entity_links (eligible for the entity-aware judge) vs
+                # which are still in cold extraction (will fall back).
+                ctx_sizes = {cid: len(ctx) for cid, ctx in contexts.items()}
+                logger.debug(
+                    "PATH_C_DETECTION context_fetched memory=%s new_ctx_size=%d cand_ctx_sizes=%s",
+                    memory_id,
+                    len(new_ctx),
+                    ctx_sizes,
+                )
+            except Exception as e:
+                # Fail open — keep candidates and let the LLM judge
+                # decide via the base prompt. Conservative against
+                # losing real contradictions on a transient storage
+                # hiccup.
+                #
+                # CAURA-134 — WARNING in grep-friendly ``key=value``
+                # form (matching the retraction path's
+                # ``PATH_C_RETRACTION context_fetch_failed`` WARNING),
+                # always including ``type(e).__name__`` (default
+                # ``str(e)`` is empty for ``asyncio.TimeoutError`` —
+                # the dominant production failure mode — and the
+                # original log shape rendered as an un-diagnosable
+                # "failed: . Falling through to base LLM judge.").
+                #
+                # WARNING-only (no symmetric INFO mirror). A separate
+                # failure-side INFO at the same severity-floor as the
+                # success-side ``PATH_C_DETECTION context_fetched``
+                # would double-count failures in any GCP log-based
+                # metric using the default ``severity>=INFO`` filter
+                # (which matches WARNING too), distorting any
+                # success/failure ratio built on the
+                # ``PATH_C_DETECTION context_fetch`` text prefix. A
+                # metric that needs paired success/failure counters
+                # should define two filters at different severities,
+                # not match both at INFO+.
+                logger.warning(
+                    "PATH_C_DETECTION context_fetch_failed memory=%s exc_type=%s "
+                    "exc=%s candidates=%d. Falling through to base LLM judge.",
+                    memory_id,
+                    type(e).__name__,
+                    e,
+                    len(candidates),
+                )
+
+        # L3.4 preflight (CAURA-130) — when the legacy A1 #17 gate fell
+        # through (NULL ``subject_entity_id`` on either side), use the
+        # fetched contexts to drop candidates whose canonical subject
+        # is a distinct entity row even though canonical names match
+        # (the ``priya``-collision class from the original followup
+        # TODO). Now that the contexts are fetched once above, the
+        # preflight is a cheap dict lookup.
+        #
+        # WT-3 — the drop is scoped to the NAME-COLLISION class the
+        # gate was built for: same canonical subject name (under
+        # ``_normalize_subject_name``) resolving to DISTINCT entity
+        # rows ("priya" vs "priya"). When the canonical NAMES differ
+        # as well as the ids, the two rows may instead be a
+        # canonicalisation SPLIT of one real-world subject ("new
+        # analytics service" vs "analytics service" — the WT-2 class);
+        # dropping there silently eats real contradictions, so we
+        # FAIL OPEN and let the LLM judge decide. Costs judge spend on
+        # genuinely-different subjects; the judge is the correct
+        # arbiter for those, the preflight is not.
+        if contexts_fetched and new_ctx:
+            new_identity = _extract_subject_canonical_identity(new_ctx)
+            if new_identity is not None:
+                new_eid = new_identity[2]
+                new_name = _normalize_subject_name(new_identity[0])
+                drop_ids: set[str] = set()
+                n_failopen_id_mismatch = 0
+                for c in candidates:
+                    if new_subject is not None and c.get("subject_entity_id") is not None:
+                        # Both sides had non-NULL subject_entity_id — A1
+                        # #17 already covered this row.
+                        continue
+                    cand_ctx = contexts.get(str(c.get("id")), [])
+                    cand_identity = _extract_subject_canonical_identity(cand_ctx)
+                    if cand_identity is None:
+                        continue  # No subject resolved — fail open.
+                    if cand_identity[2] == new_eid:
+                        continue  # Same entity row — same subject.
+                    cand_name = _normalize_subject_name(cand_identity[0])
+                    if new_name and cand_name and new_name == cand_name:
+                        # Same canonical name, distinct entity rows —
+                        # the name-collision class. Drop.
+                        drop_ids.add(str(c.get("id")))
+                    else:
+                        # Names differ (or one is unresolvable) — may
+                        # be a canonicalisation split of ONE subject
+                        # (WT-3). Fail open: keep the candidate.
+                        n_failopen_id_mismatch += 1
+                if drop_ids:
+                    before = len(candidates)
+                    candidates = [c for c in candidates if str(c.get("id")) not in drop_ids]
+                    n_entity_links_skipped = before - len(candidates)
+                    logger.info(
+                        "Path C entity-links preflight dropped %d candidate(s) "
+                        "for memory %s (same canonical subject name, entity_id "
+                        "differs — name-collision class)",
+                        n_entity_links_skipped,
+                        memory_id,
+                    )
+                if n_failopen_id_mismatch:
+                    logger.info(
+                        "Path C entity-links preflight retained %d candidate(s) "
+                        "for memory %s despite entity_id mismatch (canonical "
+                        "subject names differ — possible canonicalisation "
+                        "split; failing open to the LLM judge)",
+                        n_failopen_id_mismatch,
+                        memory_id,
+                    )
+
+        if not candidates:
+            logger.info(
+                "Path C preflight skipped all %d candidates for memory %s (entity-links subject mismatch)",
+                n_entity_links_skipped,
+                memory_id,
+            )
+            concluded = True
+            return
+
+        # CAURA-131 — entity-aware judge for each surviving candidate
+        # when we have non-empty contexts on both sides. Otherwise fall
+        # back to the base ``_llm_contradiction_check`` (preserves
+        # pre-CAURA-131 behaviour for memories without populated
+        # entity_links yet — e.g. entity-extraction hasn't completed
+        # for the candidate at the time Path C runs).
+        new_content = new_memory.get("content", "")
+        # CAURA-132 diag — record which judge was selected for each
+        # candidate so the post-hoc analysis can correlate
+        # judge_kind → verdict.
+        judge_kinds: list[str] = []
+        for c in candidates:
+            cand_ctx = contexts.get(str(c.get("id")), []) if contexts_fetched else []
+            judge_kinds.append("entity_aware" if (contexts_fetched and new_ctx and cand_ctx) else "base")
+        logger.debug(
+            "PATH_C_DETECTION judge_selection memory=%s candidates=%d entity_aware=%d base=%d",
+            memory_id,
+            len(candidates),
+            judge_kinds.count("entity_aware"),
+            judge_kinds.count("base"),
+        )
+        # A61 — batch the per-candidate judge fan-out. Path C's forward
+        # detection previously issued ONE LLM call per candidate (up to
+        # ``_ENTITY_LINKS_DETECTION_FETCH_MAX_CANDIDATES``); for a popular
+        # subject that is the same per-write cost blow-up #770 fixed on the
+        # Path A semantic path. We now collapse the fan-out into at most TWO
+        # LLM calls — one batched entity-aware call for the candidates whose
+        # context is populated on both sides, one batched base call for the
+        # rest — while keeping the exact judge-selection semantics above.
+        #
+        # A single candidate keeps the direct per-candidate call (mirrors the
+        # Path A ``len == 1`` special case; leaves the large single-candidate
+        # test corpus untouched). ``results`` stays aligned to ``candidates``
+        # and preserves the ``(verdict, confidence)`` / ``Exception`` shape the
+        # downstream loop already handles — a whole-batch failure defaults its
+        # group to ``Exception`` so those candidates are skipped, never
+        # fabricated.
+        results: list = [None] * len(candidates)
+        if len(candidates) == 1:
+            c = candidates[0]
+            # Awaited directly, like the batched branch and Path A (L-179):
+            # ``call_with_fallback`` bounds each attempt, and an outer 10 s cut
+            # cancelled a hanging primary before its retry or the fallback ran.
+            try:
+                if judge_kinds[0] == "entity_aware":
+                    cand_ctx = contexts.get(str(c.get("id")), [])
+                    results[0] = await _llm_entity_aware_contradiction_check(
+                        new_content, c.get("content", ""), new_ctx, cand_ctx, tenant_config
+                    )
+                else:
+                    results[0] = await _llm_contradiction_check(
+                        new_content, c.get("content", ""), tenant_config
+                    )
+            except Exception as e:  # mirror gather(return_exceptions=True)
+                results[0] = e
+        else:
+            ea_idx = [i for i, k in enumerate(judge_kinds) if k == "entity_aware"]
+            base_idx = [i for i, k in enumerate(judge_kinds) if k == "base"]
+            if ea_idx:
+                ea_cands = [
+                    {
+                        "content": candidates[i].get("content", ""),
+                        "entities": contexts.get(str(candidates[i].get("id")), []),
+                    }
+                    for i in ea_idx
+                ]
+                try:
+                    ea_raws = await _llm_entity_aware_contradiction_check_batch(
+                        new_content, new_ctx, ea_cands, tenant_config
+                    )
+                    for j, i in enumerate(ea_idx):
+                        results[i] = _judge_contradiction(ea_raws[j])
+                except Exception as e:
+                    for i in ea_idx:
+                        results[i] = e
+            if base_idx:
+                base_cands = [candidates[i] for i in base_idx]
+                try:
+                    base_raws = await _llm_contradiction_check_batch(new_content, base_cands, tenant_config)
+                    for j, i in enumerate(base_idx):
+                        results[i] = _judge_contradiction(base_raws[j])
+                except Exception as e:
+                    for i in base_idx:
+                        results[i] = e
+        # 09/22 L-12 — chain-edge guard, tracked SEPARATELY from the
+        # status-reversion guard below, exactly as both Path A loops in
+        # ``_detect()`` do. A single flag covering both branches (the
+        # previous ``found``) meant the first confirmed conflict in a run
+        # suppressed every later edge write while the ``"conflicted"``
+        # status write at the top of the loop still landed — leaving a row
+        # conflicted with nothing pointing at it, which is the orphaning
+        # Path A's ``if not supersedes_id`` split exists to prevent (see
+        # ``test_mixed_conflicts_complete_three_way_chain``). Both
+        # mixed-direction orderings produced it: flipped-then-canonical
+        # orphaned the older candidate, canonical-then-flipped orphaned
+        # ``new_memory`` itself.
+        #
+        # Seeded from the row's current edge, as the semantic loop is: a
+        # verdict this run's retraction phase did NOT clear is still owned
+        # by whoever wrote it, so an unseeded write would re-point the row
+        # and orphan its previous target.
+        #
+        # ``memory_update_status`` still has no implicit
+        # ``supersedes_id IS NULL`` guard — that observation, made here by
+        # #1690, is what 09/22 M-01 then traced through the rest of the
+        # module. The edge writes below now request one explicitly
+        # (``expect_supersedes_null``), which closes the concurrent-writer
+        # half of the race. This seeding remains necessary for the other
+        # half: the CAS only refuses to overwrite a NON-NULL pointer, so a
+        # run that has already cleared and must not re-wire still depends on
+        # starting from the row's own value.
+        chain_supersedes_id = new_memory.get("supersedes_id")
+        # CAURA-125 — state-corruption guard; mirrors the RDF and
+        # semantic paths in ``_detect()``.
+        new_memory_is_outdated = False
+        # Collapsed-write accumulator — same rationale as the semantic
+        # path's ``updates`` dict (audit P2 Path C). Keyed by
+        # ``memory_id`` so a mixed canonical/flipped run produces one
+        # merged row per memory; see ``_merge_status_update``.
+        updates: dict[str, dict] = {}
+        record_pairs: list[tuple[dict, str, float | None]] = []
+        for idx, (candidate, result) in enumerate(zip(candidates, results, strict=False)):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "Entity contradiction check failed for candidate %s: %s",
+                    candidate.get("id"),
+                    result,
+                )
+                continue
+            # A4 #12 — judge now returns (verdict, confidence).
+            # Path C continues to gate only on verdict at this site;
+            # A4 #13 will introduce confidence-weighted vetoes here.
+            verdict, _confidence = result  # type: ignore[misc]
+            # CAURA-132 diag — per-candidate verdict log. Tagged with
+            # the judge_kind so we can see whether the entity-aware
+            # judge returns verdict=False when both contexts are
+            # populated but no flag fires (the wet-test miss class).
+            logger.debug(
+                "PATH_C_DETECTION verdict memory=%s candidate=%s judge=%s verdict=%s confidence=%.2f",
+                memory_id,
+                candidate.get("id"),
+                judge_kinds[idx] if idx < len(judge_kinds) else "unknown",
+                verdict,
+                _confidence,
+            )
+            if verdict:
+                # CAURA-125 — symmetric attribution; see RDF path for
+                # the rationale. ``new_memory`` carries at most one
+                # outgoing edge (first canonical match wins — candidates
+                # are ordered by shared-entity-count DESC); every flipped
+                # match wires its own edge back at ``new_memory``, since
+                # many newer rows may supersede one older row.
+                older = _pick_older(candidate, new_memory)
+                older_is_new = str(older.get("id")) == str(memory_id)
+                newer = new_memory if not older_is_new else candidate
+                older_id = older.get("id")
+                newer_id = newer.get("id")
+
+                _merge_status_update(updates, {"memory_id": str(older_id), "status": "conflicted"})
+                if newer is new_memory:
+                    if not chain_supersedes_id:
+                        chain_supersedes_id = older_id
+                        # See RDF path above for the rationale of
+                        # separating the status-reversion guard from
+                        # the chain edge. Entity-based path uses
+                        # ``"conflicted"`` (matching the flipped
+                        # iteration's earlier write to new_memory).
+                        target_status = (
+                            "conflicted" if new_memory_is_outdated else new_memory.get("status", "active")
+                        )
+                        _merge_status_update(
+                            updates,
+                            {
+                                "memory_id": str(memory_id),
+                                "status": target_status,
+                                "supersedes_id": str(older_id),
+                                "expect_supersedes_null": True,
+                            },
+                        )
+                else:
+                    new_memory_is_outdated = True
+                    # Application-level guard; see RDF flipped
+                    # branch in _detect() for rationale.
+                    if newer.get("supersedes_id"):
+                        logger.warning(
+                            "Flipped contradiction skipped supersedes_id overwrite "
+                            "for candidate %s (already supersedes %s)",
+                            newer_id,
+                            newer.get("supersedes_id"),
+                        )
+                    else:
+                        _merge_status_update(
+                            updates,
+                            {
+                                "memory_id": str(newer_id),
+                                "status": newer.get("status", "active"),
+                                "supersedes_id": str(older_id),
+                                "expect_supersedes_null": True,
+                            },
+                        )
+                n_conflicts += 1
+                record_pairs.append((candidate, "entity", _confidence))
+                logger.info(
+                    "Entity-based contradiction: %s conflicted by %s direction=%s",
+                    older_id,
+                    newer_id,
+                    "canonical" if newer is new_memory else "flipped",
+                )
+
+        if updates:
+            entity_result = await sc.batch_update_status(
+                {"updates": list(updates.values())}, tenant_id=tenant_id
+            )
+            _log_batch_status_result(entity_result, path="Path C entity-overlap", memory_id=memory_id)
+        await _record_conflicts(
+            new_memory,
+            record_pairs,
+            _unlinked_pairs(new_memory, record_pairs, updates),
+            tenant_id=tenant_id,
+            tenant_config=tenant_config,
+        )
+        concluded = True
+
+        # A58 — Path D (basis invalidation) SHADOW. Fires HERE, not in Path A:
+        # ``subject_entity_id`` is populated by entity extraction (A63), so at
+        # Path A time it is still NULL on this stack. Runs under Path C's lock
+        # (double back-channel can't double-fire it), reuses this run's
+        # entity-overlap candidates as the fallback pool, logs verdicts,
+        # never writes. Own try/except inside; this guard keeps even an
+        # import error away from Path C's outcome.
+        if settings.basis_invalidation_shadow and new_memory.get("subject_entity_id"):
+            try:
+                from core_api.services.contradiction.basis_invalidation import (
+                    run_basis_shadow,
+                )
+
+                await run_basis_shadow(
+                    new_memory,
+                    tenant_id,
+                    fleet_id,
+                    tenant_config,
+                    overlap_candidates=candidates,
+                )
+            except Exception:
+                logger.warning("path_d_shadow wrapper failed for %s", memory_id, exc_info=True)
+    except Exception as exc:
+        logger.exception("Entity-based contradiction detection failed for %s", memory_id)
+        failure, failure_tb = exc, traceback.format_exc()
+    finally:
+        # A19 — free the slot before the bookkeeping; see Path A's block.
+        _gate.release()
+        _judge_abstentions.reset(abstentions_token)
+        # An abstaining judge is not a verdict; see Path A's block.
+        if concluded and abstentions.count and failure is None:
+            concluded = False
+            failure = _abstained_failure(abstentions)
+        # H-06 — see the matching block in ``detect_contradictions_async``.
+        # ``concluded`` is set at each legitimate exit rather than once early,
+        # so a throw ANYWHERE in the judging loop still releases: a failure
+        # half way through must not block the retry for the rest of the TTL.
+        # Re-running is safe: the candidate query selects only live rows, so
+        # anything an earlier pass retired is out of scope, and the chain-edge
+        # writes go out under ``expect_supersedes_null`` so a retry cannot
+        # re-point an edge the abandoned run already wired. (09/22 M-01 — the
+        # second clause said "the storage writes are CAS-guarded" while the
+        # batch route these writes use had no such guard.)
+        if lock_held and not concluded and lock_key is not None:
+            await _release_lock(lock_key, lock_token)
+        elapsed_ms = round((time.monotonic() - t_start) * 1000)
+        logger.info(
+            "path_c_completed for memory %s n_candidates=%d n_conflicts=%d "
+            "n_retractions=%d skipped=%s elapsed_ms=%d queued_ms=%d tenant_id=%s",
+            memory_id,
+            n_candidates,
+            n_conflicts,
+            n_retractions,
+            str(skipped).lower(),
+            elapsed_ms,
+            queued_ms,
+            tenant_id,
+        )
+        # Inside the ``finally``, unlike Path A: this body exits through
+        # ``return`` at every concluded outcome, so a record placed after the
+        # ``finally`` would only ever see the exception path, never a run whose
+        # judge abstained. The slot is already free by this point.
+        if failure is not None:
+            await _record_detection_lost(memory_id, tenant_id, "entity", failure, failure_tb)
+
+
+# Backward-compat re-exports for tests
+from core_api.providers._credentials import has_credentials as _has_api_key  # noqa: F401
+from core_api.providers._credentials import (
+    resolve_openai_compatible as _resolve_openai_compatible,  # noqa: F401
+)

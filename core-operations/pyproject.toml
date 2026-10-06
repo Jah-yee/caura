@@ -1,0 +1,114 @@
+[project]
+name = "core-operations"
+version = "1.0.0"
+description = "Caura core-operations — host for cron/scheduled background jobs (lifecycle, retention, etc.)"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    # FastAPI 0.137+ OK since #364 (core-api startup guard reads app.openapi()).
+    # The committed uv.lock pins the exact version; this range only bounds re-locks.
+    "fastapi>=0.141.1,<1",
+    "uvicorn[standard]>=0.51.0,<1",
+    "pydantic>=2.0,<3",
+    "pydantic-settings>=2.15.0,<3",
+    "httpx>=0.27,<1",
+    "structlog>=25.4,<27",
+    "python-dateutil>=2.8,<3",
+    "cachetools>=7.1.7,<8",
+]
+
+[project.optional-dependencies]
+pubsub = ["google-cloud-pubsub>=2.39.1,<3"]
+# Datadog APM tracer (CAURA-0000). Opt-in: installed only in SaaS builds via
+# --build-arg DD_APM_ENABLED=true (--extra datadog); OSS/on-prem carry no
+# Datadog code. Auto-instruments FastAPI/httpx/pubsub.
+datadog = ["ddtrace>=4.12.2"]
+dev = [
+    "core-operations[test,pubsub]",
+    "mypy>=2.3.0,<3.0",
+    "ruff>=0.16.2,<1.0",
+]
+test = [
+    "pytest>=9.1.1,<10.0",
+    "pytest-asyncio>=0.24,<2.0",
+    "pytest-cov>=6.0,<8.0",
+    "httpx>=0.27,<1.0",
+]
+
+[build-system]
+requires = ["setuptools>=83.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 110
+exclude = [
+    ".git", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".venv", "__pycache__", "build", "dist",
+]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "B", "C4", "UP", "ARG",
+    "SIM", "TCH", "PTH", "RUF", "ASYNC",
+]
+ignore = [
+    "E501", "TC001", "TC002", "TC003", "ARG001", "ARG002",
+    "B008", "B904", "RUF022", "PTH123", "RUF006", "SIM117",
+    "RUF012", "RUF009",
+]
+fixable = ["ALL"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ARG", "S101", "F841"]
+"__init__.py" = ["F401", "E402"]
+"**/app.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["core_operations", "common"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.12"
+# ``..`` is the repo root, where ``common/`` lives. common/ is not an installed
+# distribution — it is PYTHONPATH-mounted (the Dockerfile COPYs it to
+# /app/common), so without the repo root here every ``common.*`` import degrades
+# to Any under ``ignore_missing_imports`` and this service's use of the shared
+# library is checked by nothing. That is what let ``from common.llm import
+# LLMRequest`` — a name that has never existed there — ship in the forge cron and
+# raise on every tick (#955) while ``mypy src/`` reported no issues in 200 files.
+# Relative to this file, so CI, a local ``mypy src/`` and an IDE all agree.
+mypy_path = "src:.."
+explicit_package_bases = true
+warn_return_any = false
+warn_unused_ignores = false
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+omit = ["*/tests/*", "*/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+fail_under = 50
+show_missing = true

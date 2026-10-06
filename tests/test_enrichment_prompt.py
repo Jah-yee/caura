@@ -1,0 +1,279 @@
+"""P2-6: Enrichment prompt signal phrases for better type classification.
+
+Unit tests validate:
+- Prompt text includes signal phrases for decision, commitment, rule
+- Signal phrases don't inflate prompt token count excessively
+- Keyword heuristic still correctly classifies all types (regression)
+"""
+
+import pytest
+
+# ---------------------------------------------------------------------------
+# Unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestEnrichmentPromptSignalPhrases:
+    """Verify signal phrases are present in the enrichment prompt."""
+
+    def _get_prompt(self) -> str:
+        from core_api.services.memory_enrichment import ENRICHMENT_PROMPT
+
+        return ENRICHMENT_PROMPT
+
+    def test_decision_has_signal_phrases(self):
+        """CAURA-717 V2.2 sharpened decision around the deliberation markers
+        (reasoning / alternatives / group framing) and removed the plain
+        "opted for" / "selected" verb list, so approval-deeds without any
+        visible deliberation stop being mislabelled as decisions."""
+        prompt = self._get_prompt()
+        assert "decided to" in prompt
+        assert "chose X over Y" in prompt
+        assert "the team concluded" in prompt
+
+    def test_commitment_signal_phrases_absent(self):
+        """CAURA-717: ``commitment`` is now classifier-deprecated and its
+        bullet is filtered out of the prompt (mirrors the CAURA-699 handling
+        of the reserved ``rule`` type), so its cue phrases must not appear."""
+        prompt = self._get_prompt()
+        assert "committed to" not in prompt
+        assert "pledged" not in prompt
+
+    def test_rule_signal_phrases_absent(self):
+        """CAURA-699: ``rule`` is server-reserved and no longer offered to the
+        classifier, so its directive cues ("always"/"never") — which only ever
+        lived in the rule bullet — must be gone from the prompt."""
+        prompt = self._get_prompt().lower()
+        assert "always" not in prompt
+        assert "never" not in prompt
+
+    def test_prompt_token_count_reasonable(self):
+        """Prompt ceiling — keeps cost bounded while leaving room for small additions.
+
+        Baseline grew with retrieval_hint, atomic_facts, the temporal
+        ts_valid_end guidance, A8's tag-format guidance, and A9's
+        action/episode disambiguation pairs (1200 as of 2026-05-24).
+        Raised to 1500 (2026-07-06) for CAURA-701's V2.1 taxonomy —
+        expanded fact/episode/action descriptions and the 3-way
+        action-vs-episode-vs-fact contrastive block.
+        Raised to 1800 (2026-08-19) for CAURA-717's V2.2 taxonomy —
+        added the action-vs-decision resolver, refined decision/action/
+        plan/preference/task definitions, and expanded the contrastive
+        example block from 10 to ~18 lines. Deprecating three types
+        (intention/commitment/cancellation) subtracted three bullets
+        but the resolver + examples net-added more words.
+        """
+        prompt = self._get_prompt()
+        word_count = len(prompt.split())
+        assert word_count < 1800, (
+            f"Prompt is {word_count} words — too long, will increase cost"
+        )
+
+    def test_prompt_structure_unchanged(self):
+        """JSON template should still be present and valid.
+
+        CAURA-719 dropped the ``tags`` key from the template (the field is
+        caller-owned now and no longer asked of the LLM), so this pins the
+        keys that remain rather than the retired one. ``test_caura719_
+        tags_status_off_prompt.py`` owns the negative assertion.
+
+        CAURA-720 moved the ``weight`` exemplar from ``0.0`` to ``0.5``:
+        ``0.0`` sat outside every band the rubric described and was being
+        copied verbatim. ``0.5`` is simply the mid-range neutral, inside a
+        described band — NOT a match for a default-weight constant. This
+        path's fallback is a hardcoded ``0.7``; see
+        ``test_caura720_weight_band.py``.
+        """
+        prompt = self._get_prompt()
+        assert '"memory_type": "..."' in prompt
+        assert '"weight": 0.5' in prompt
+        assert '"summary": "..."' in prompt
+        assert "Content:" in prompt
+
+
+@pytest.mark.unit
+class TestEnrichmentPromptVocabularySync:
+    """Prompt vocabulary must stay in lock-step with the *classifiable* types.
+
+    Lives here because the prompt was the original drift site: ``insight``
+    was added to the tuple but missed in the prompt's hardcoded list,
+    causing the LLM to never emit that type. The renderer in
+    ``common/enrichment/_prompts.py`` now derives both the inline list
+    and the bullet descriptions from ``MEMORY_TYPE_DESCRIPTIONS``.
+
+    CAURA-699: the server-reserved types (insight/outcome/rule) are
+    deliberately EXCLUDED from the classifier vocabulary — they are authored
+    only by internal flows (insights_service / evolve_service). The renderer
+    filters them out, and these tests guard both halves of that contract:
+    every agent-writable type is present, and no reserved type leaks in.
+    """
+
+    def _get_prompt(self) -> str:
+        from core_api.services.memory_enrichment import ENRICHMENT_PROMPT
+
+        return ENRICHMENT_PROMPT
+
+    def test_every_classifiable_type_appears_quoted_in_inline_list(self):
+        from common.enrichment.constants import (
+            CLASSIFIER_DEPRECATED_MEMORY_TYPES,
+            MEMORY_TYPES,
+            SERVER_RESERVED_MEMORY_TYPES,
+        )
+
+        prompt = self._get_prompt()
+        for t in MEMORY_TYPES:
+            if (
+                t in SERVER_RESERVED_MEMORY_TYPES
+                or t in CLASSIFIER_DEPRECATED_MEMORY_TYPES
+            ):
+                continue
+            assert f'"{t}"' in prompt, (
+                f"memory_type {t!r} missing from inline list — prompt vocabulary "
+                "drifted from the classifiable types"
+            )
+
+    def test_reserved_types_excluded_from_vocabulary(self):
+        """The classifier must never be OFFERED a server-reserved type."""
+        from common.enrichment.constants import SERVER_RESERVED_MEMORY_TYPES
+
+        prompt = self._get_prompt()
+        for t in sorted(SERVER_RESERVED_MEMORY_TYPES):
+            assert f'"{t}"' not in prompt, (
+                f"reserved memory_type {t!r} must not appear in the inline list"
+            )
+            assert f"   - {t}: " not in prompt, (
+                f"reserved memory_type {t!r} must not have a prompt bullet"
+            )
+
+    def test_deprecated_types_excluded_from_vocabulary(self):
+        """CAURA-701: deprecated types (currently ``semantic``) must not be
+        offered to the classifier, so the LLM cannot mint them. Historical
+        rows keep their labels at the storage layer — only the classifier
+        surface hides them."""
+        from common.enrichment.constants import CLASSIFIER_DEPRECATED_MEMORY_TYPES
+
+        prompt = self._get_prompt()
+        for t in sorted(CLASSIFIER_DEPRECATED_MEMORY_TYPES):
+            assert f'"{t}"' not in prompt, (
+                f"deprecated memory_type {t!r} must not appear in the inline list"
+            )
+            assert f"   - {t}: " not in prompt, (
+                f"deprecated memory_type {t!r} must not have a prompt bullet"
+            )
+
+    def test_every_classifiable_type_has_a_bullet(self):
+        from common.enrichment.constants import (
+            CLASSIFIER_DEPRECATED_MEMORY_TYPES,
+            MEMORY_TYPE_DESCRIPTIONS,
+            SERVER_RESERVED_MEMORY_TYPES,
+        )
+
+        prompt = self._get_prompt()
+        for name, desc in MEMORY_TYPE_DESCRIPTIONS.items():
+            if (
+                name in SERVER_RESERVED_MEMORY_TYPES
+                or name in CLASSIFIER_DEPRECATED_MEMORY_TYPES
+            ):
+                continue
+            assert f"   - {name}: " in prompt, f"{name!r} bullet missing from prompt"
+            # First clause of the description should also land verbatim
+            first_clause = desc.split(".")[0].split(",")[0].strip()
+            assert first_clause in prompt, (
+                f"{name!r} description first clause not found in prompt: {first_clause!r}"
+            )
+
+    def test_pattern_matches_every_memory_type(self):
+        import re
+
+        from common.enrichment.constants import MEMORY_TYPES
+        from core_api.constants import MEMORY_TYPES_PATTERN
+
+        for t in MEMORY_TYPES:
+            assert re.match(MEMORY_TYPES_PATTERN, t), (
+                f"{t!r} not accepted by MEMORY_TYPES_PATTERN — pattern drifted"
+            )
+
+
+@pytest.mark.unit
+class TestHeuristicRegressions:
+    """Ensure keyword heuristic still classifies all types correctly after prompt changes."""
+
+    def test_decision_classification(self):
+        from core_api.services.memory_enrichment import _fake_enrich
+
+        assert _fake_enrich("We decided to use PostgreSQL").memory_type == "decision"
+        assert _fake_enrich("Team chose Redis for caching").memory_type == "decision"
+        assert _fake_enrich("Management approved the budget").memory_type == "decision"
+
+    def test_preference_classification(self):
+        from core_api.services.memory_enrichment import _fake_enrich
+
+        assert _fake_enrich("The team prefers dark mode").memory_type == "preference"
+
+    def test_episode_classification(self):
+        from core_api.services.memory_enrichment import _fake_enrich
+
+        assert _fake_enrich("We deployed v2.3 to production").memory_type == "episode"
+
+    def test_task_classification(self):
+        from core_api.services.memory_enrichment import _fake_enrich
+
+        assert _fake_enrich("Need to review the PR by Friday").memory_type == "task"
+
+    def test_commitment_classification(self):
+        from core_api.services.memory_enrichment import _fake_enrich
+
+        assert (
+            _fake_enrich("We committed to delivering by Q2").memory_type == "commitment"
+        )
+
+    def test_rule_classification(self):
+        from core_api.services.memory_enrichment import _fake_enrich
+
+        assert (
+            _fake_enrich("Always notify security before deploying").memory_type
+            == "rule"
+        )
+        assert _fake_enrich("Never store PII in Redis").memory_type == "rule"
+
+    def test_cancellation_classification(self):
+        from core_api.services.memory_enrichment import _fake_enrich
+
+        assert (
+            _fake_enrich("The project was cancelled last week").memory_type
+            == "cancellation"
+        )
+
+    def test_outcome_classification(self):
+        from core_api.services.memory_enrichment import _fake_enrich
+
+        assert (
+            _fake_enrich("The migration achieved 99.9% uptime").memory_type == "outcome"
+        )
+
+    def test_fact_default(self):
+        from core_api.services.memory_enrichment import _fake_enrich
+
+        assert _fake_enrich("The server runs on port 8080").memory_type == "fact"
+
+    def test_plan_classification(self):
+        from core_api.services.memory_enrichment import _fake_enrich
+
+        assert _fake_enrich("The roadmap includes three phases").memory_type == "plan"
+
+    def test_intention_classification(self):
+        from core_api.services.memory_enrichment import _fake_enrich
+
+        assert (
+            _fake_enrich("We intend to migrate to AWS next quarter").memory_type
+            == "intention"
+        )
+
+    def test_action_classification(self):
+        from core_api.services.memory_enrichment import _fake_enrich
+
+        assert (
+            _fake_enrich("I executed the database backup script").memory_type
+            == "action"
+        )

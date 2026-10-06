@@ -1,0 +1,159 @@
+/**
+ * Plugin deployment logic.
+ *
+ * Security controls:
+ * - Size validation on source code (MAX_SOURCE_SIZE)
+ * - Only the plugin's own env-var prefixes accepted, via
+ *   ``hasPluginEnvPrefix`` (key filtering) — a remote deploy command cannot
+ *   write an arbitrary key into the plugin's ``.env``
+ * - Backup and restore on build failure
+ *
+ * Note: caller authentication (HMAC or token) is handled upstream —
+ * in heartbeat.ts processCommand() and index.ts gateway method.
+ */
+
+import { readFileSync, writeFileSync, existsSync } from "fs";
+import { join } from "path";
+import { execSync } from "child_process";
+import { getPluginDir, getPluginSrcPath } from "./config.js";
+import { BUILD_TIMEOUT_MS, MAX_SOURCE_SIZE, hasPluginEnvPrefix } from "./env.js";
+import { logError } from "./logger.js";
+
+const BUILD_COMMAND = "npx tsc 2>&1";
+
+/**
+ * Keys a REMOTE deploy may never set, whatever the server sends: where the
+ * node sends its key, the key itself, the tenant it acts for, and the switches
+ * that keep it safe. Changing them is a local operator decision. The server
+ * refuses the same keys (``_REMOTE_ENV_DENYLIST_SUFFIXES`` in
+ * ``core_api/routes/fleet.py``); this is the node's own copy of the rule.
+ */
+export const REMOTE_ENV_DENYLIST_SUFFIXES = [
+  "_API_URL",
+  "_API_KEY",
+  "_API_PREFIX",
+  "_KEY_TRANSPORT",
+  "_TENANT_ID",
+  "_ALLOW_INSECURE_HTTP",
+  "_REQUIRE_SIGNED_COMMANDS",
+  "_TASK_DB_PATH",
+];
+
+export function isRemoteEnvDenied(key: string): boolean {
+  const upper = key.toUpperCase();
+  return (
+    hasPluginEnvPrefix(upper) &&
+    REMOTE_ENV_DENYLIST_SUFFIXES.some((suffix) => upper.endsWith(suffix))
+  );
+}
+
+type BuildRunner = (
+  command: string,
+  options: { cwd: string; encoding: "utf-8"; timeout: number },
+) => string;
+
+/** Compile without package lifecycle hooks that only exist in the monorepo. */
+export function runPluginBuild(
+  pluginDir: string,
+  runner: BuildRunner = execSync,
+): string {
+  return runner(BUILD_COMMAND, {
+    cwd: pluginDir,
+    encoding: "utf-8",
+    timeout: BUILD_TIMEOUT_MS,
+  });
+}
+
+export async function deployPlugin(
+  source: string,
+  envVars?: Record<string, string>,
+): Promise<{
+  ok: boolean;
+  error?: string;
+  buildOutput?: string;
+  envUpdated?: string[];
+}> {
+  if (source.length > MAX_SOURCE_SIZE) {
+    return { ok: false, error: `source too large (${source.length} bytes, max ${MAX_SOURCE_SIZE})` };
+  }
+
+  const pluginDir = getPluginDir();
+  const srcPath = getPluginSrcPath();
+
+  try {
+    // 1. Backup current source
+    if (existsSync(srcPath)) {
+      writeFileSync(srcPath + ".bak", readFileSync(srcPath, "utf-8"), "utf-8");
+    }
+
+    // 2. Write new source
+    writeFileSync(srcPath, source, "utf-8");
+
+    // 3. Merge env vars into existing .env file if provided
+    const envChanges: string[] = [];
+    if (envVars && typeof envVars === "object") {
+      const envPath = join(pluginDir, ".env");
+
+      // Read existing .env into a Map to preserve keys not being updated
+      const existing = new Map<string, string>();
+      if (existsSync(envPath)) {
+        for (const line of readFileSync(envPath, "utf-8").split("\n")) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith("#")) continue;
+          const eq = trimmed.indexOf("=");
+          if (eq < 1) continue;
+          const k = trimmed.slice(0, eq).trim();
+          const v = trimmed.slice(eq + 1).trim();
+          if (hasPluginEnvPrefix(k)) existing.set(k, v);
+        }
+      }
+
+      // Merge provided keys over existing
+      for (const [key, val] of Object.entries(envVars)) {
+        if (isRemoteEnvDenied(key)) {
+          logError("deploy: refusing remote env var", key);
+          continue;
+        }
+        if (hasPluginEnvPrefix(key) && typeof val === "string") {
+          existing.set(key, val.replace(/[\r\n]/g, ""));
+          envChanges.push(key);
+        }
+      }
+
+      // Write merged result only if there were actual changes
+      if (envChanges.length > 0) {
+        const lines = Array.from(existing, ([k, v]) => `${k}=${v}`);
+        writeFileSync(envPath, lines.join("\n") + "\n", "utf-8");
+      }
+    }
+
+    // 4. Run tsc directly. ``npm run build`` triggers the package's
+    // monorepo-only prebuild hook (../scripts/gen-version.sh), which is not
+    // present in flat plugin installs. Manifest deploys already stamp the
+    // version explicitly; source-push deploys must be equally self-contained.
+    const buildOutput = runPluginBuild(pluginDir);
+
+    return {
+      ok: true,
+      buildOutput: buildOutput.slice(-5000),
+      envUpdated: envChanges,
+    };
+  } catch (e: unknown) {
+    // Build failed — restore backup
+    const bakPath = srcPath + ".bak";
+    if (existsSync(bakPath)) {
+      try {
+        writeFileSync(srcPath, readFileSync(bakPath, "utf-8"), "utf-8");
+      } catch (restoreErr: unknown) {
+        logError("Failed to restore backup", restoreErr);
+      }
+    }
+
+    const err = e as Error & { stdout?: string; stderr?: string };
+    return {
+      ok: false,
+      error: "Deploy failed: " + (err.message || "unknown error"),
+      buildOutput: (err.stdout || err.stderr || "").slice(-5000),
+    };
+  }
+}

@@ -1,0 +1,337 @@
+"""Memory Crystallizer routes."""
+
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+
+from core_api import errors
+from core_api import openapi_responses as _oar
+from core_api.auth import AuthContext, get_auth_context
+from core_api.clients.storage_client import get_storage_client
+from core_api.errors import coded_detail
+from core_api.schemas import STRICT_WRITE_BODY, TenantScopedBody
+from core_api.services.agent_service import resolve_crystallize_fleet
+from core_api.services.audit_service import log_action
+from core_api.services.crystallizer_service import start_crystallization
+
+router = APIRouter(tags=["Memory Crystallizer"])
+
+
+# --- Schemas ---
+
+
+class CrystallizeRequest(TenantScopedBody):
+    model_config = STRICT_WRITE_BODY
+    fleet_id: str | None = None
+
+
+class CrystallizeResult(BaseModel):
+    report_id: str
+    status: str
+
+
+class CrystallizeAllResult(BaseModel):
+    reports: list[dict]
+
+
+class ReportSummaryOut(BaseModel):
+    id: str
+    tenant_id: str
+    fleet_id: str | None
+    trigger: str
+    status: str
+    started_at: str | None
+    completed_at: str | None
+    duration_ms: int | None
+    summary: dict
+
+
+# --- Endpoints ---
+
+
+@router.post("/crystallize", response_model=CrystallizeResult)
+async def trigger_crystallization(
+    body: CrystallizeRequest,
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Trigger crystallization for a tenant (analysis + auto-curate).
+
+    Auth: a write-capable credential for the target tenant. An agent credential
+    below trust level 3 is held to its own fleet: an omitted ``fleet_id`` is
+    pinned to it, and any other fleet is refused.
+    """
+    # Found by ``tests/test_authz_gate_inventory.py`` on its first run — the
+    # same class as H-12/H-13/M-25/#1335/#1337, and the reason that file exists.
+    #
+    # ``enforce_tenant`` alone says WHICH tenant, never whether this credential
+    # may write to it. A run is not read-shaped despite the response being a
+    # bare report id: ``start_crystallization`` reserves a report row and then
+    # does "a create per extracted fact, each with its own embedding and dedup
+    # lookups" (see its docstring), so a demo-sandbox or capabilities={'read'}
+    # credential could author memories across the tenant.
+    #
+    # ``enforce_usage_limits`` is NOT added, and this one IS settled — do not
+    # "finish" it by adding the gate. The gate's set is
+    # ``PLAN_LIMIT_GATED_OPS`` (create / bulk_create / redistribute), not
+    # ``WRITE_QUOTA_OPS``, and this route performs none of those: it reserves a
+    # report row and publishes a request to the event bus, so the creates
+    # happen later in a worker that holds no ``AuthContext``. Gating here would
+    # gate the TRIGGER, not the writes.
+    #
+    # And a run is a reduction path, which is the case ``enforce_usage_limits``
+    # explicitly carves out ("users in read-only mode must be able to delete
+    # data to get back under limits"): each cluster archives its members —
+    # ``batch_update_status`` to ``archived``, a status change, not a delete —
+    # and emits fewer crystallized facts than the ``CRYSTALLIZER_MIN_CLUSTER_SIZE``
+    # (3) rows it consumed. Blocking an over-quota org here would deny it the
+    # operation that shrinks its live set.
+    auth.enforce_read_only()
+    auth.enforce_tenant(body.tenant_id)
+    # L-70: which fleets the run may archive in. A user or tenant credential
+    # keeps the tenant-wide run; an agent credential is held to its own fleet
+    # below trust 3, as a by-id write would be.
+    fleet_id = body.fleet_id
+    if auth.agent_id and not auth.is_admin:
+        fleet_id = await resolve_crystallize_fleet(body.tenant_id, auth.agent_id, fleet_id)
+    from core_api.services.organization_settings import resolve_config
+
+    config = await resolve_config(body.tenant_id)
+    # H-07: the run is scheduled, not awaited. This response has always said
+    # ``status="running"``; awaiting the run made that false, and — once the run
+    # stopped aborting on the first duplicate — made the request exceed its
+    # timeout on any non-trivial tenant. Poll ``GET /crystallize/reports``.
+    report_id = await start_crystallization(
+        body.tenant_id,
+        fleet_id,
+        trigger="manual",
+        auto_crystallize=config.auto_crystallize_enabled,
+    )
+    # The report row says what the run did; only this says who started it and
+    # from where.
+    await log_action(
+        tenant_id=body.tenant_id,
+        agent_id=auth.agent_id,
+        action="crystallize",
+        resource_type="crystallization_report",
+        resource_id=report_id,
+        detail={"fleet_id": fleet_id, "trigger": "manual", **auth.audit_actor()},
+    )
+    return CrystallizeResult(report_id=str(report_id), status="running")
+
+
+@router.post("/crystallize/all", response_model=CrystallizeAllResult)
+async def trigger_crystallization_all(
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Trigger crystallization for ALL tenants (nightly batch).
+
+    Standalone-only. The fan-out needs a list of tenants and there is no tenant
+    enumeration on the storage client, so the single standalone tenant is the
+    only set this endpoint can build. On a multi-tenant deployment it therefore
+    cannot do what its name promises.
+
+    It used to say so with a 500: ``get_standalone_tenant_id()`` raises
+    ``RuntimeError`` when standalone was never initialised, nothing caught it,
+    and every hosted call returned "internal server error" — which reads as an
+    outage and sends whoever is on call looking for a broken crystallizer. The
+    condition is not a fault, it is a deployment mode, so it answers 501 with
+    the route that DOES work.
+    """
+    auth.enforce_admin()
+    # In OSS standalone mode, only one tenant exists
+    from core_api.standalone import get_standalone_tenant_id
+
+    try:
+        tenant_ids = [get_standalone_tenant_id()]
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "POST /crystallize/all is standalone-only: there is no tenant "
+                "enumeration to fan out over on a multi-tenant deployment. "
+                "Trigger each tenant with POST /crystallize?tenant_id=..."
+            ),
+        ) from exc
+    reports = []
+    for tid in tenant_ids:
+        from core_api.services.organization_settings import resolve_config
+
+        config = await resolve_config(tid)
+        # Scheduled per tenant for the same reason, and more so: this endpoint
+        # fans out, so awaiting each run in turn makes the request's cost the SUM
+        # of them.
+        report_id = await start_crystallization(
+            tid,
+            fleet_id=None,
+            trigger="scheduled",
+            auto_crystallize=config.auto_crystallize_enabled,
+        )
+        reports.append({"tenant_id": tid, "report_id": str(report_id)})
+    return CrystallizeAllResult(reports=reports)
+
+
+@router.get("/crystallize/reports", response_model=list[ReportSummaryOut])
+async def list_reports(
+    tenant_id: str = Query(...),
+    limit: int = Query(default=10, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """List crystallization reports for a tenant, newest first.
+
+    09/02 M-12 — ``limit`` and ``offset`` are now actually applied. They were
+    declared and validated here but never passed on, so the storage service ran
+    its own default window: every request returned the same first 10 reports,
+    ``offset`` did nothing, and a caller paging through got page 1 forever.
+    """
+    auth.enforce_tenant(tenant_id)
+    sc = get_storage_client()
+    reports = await sc.list_reports(tenant_id, limit=limit, offset=offset)
+    return [
+        ReportSummaryOut(
+            id=str(r.get("id", "")),
+            tenant_id=r.get("tenant_id", ""),
+            fleet_id=r.get("fleet_id"),
+            trigger=r.get("trigger", ""),
+            status=r.get("status", ""),
+            started_at=r.get("started_at"),
+            completed_at=r.get("completed_at"),
+            duration_ms=r.get("duration_ms"),
+            summary=r.get("summary") or {},
+        )
+        for r in reports
+    ]
+
+
+@router.get(
+    "/crystallize/reports/{report_id}",
+    responses={200: {"model": _oar.CrystallizeReport}},
+)
+async def get_report(
+    report_id: UUID,
+    # ``Annotated[...] = None`` rather than the ``= Query(None)`` spelling used
+    # elsewhere in this tree, because this handler is one of the very few called
+    # DIRECTLY by tests rather than over HTTP — including the audit-finding-#22
+    # regression below it. With ``= Query(None)`` such a call receives the
+    # ``Query`` object itself, which is truthy and would sail past the check
+    # below as if it were a tenant: a value that looks like a scope and is not,
+    # which is the shape of mistake this whole PR is about. This way the
+    # function's default is a real ``None`` however it is invoked.
+    tenant_id: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Tenant that owns the report. Defaults to the calling credential's own "
+                "tenant; required for credentials that have none (admin keys), and used "
+                "to name one of the other tenants a cross-tenant read key may read."
+            ),
+        ),
+    ] = None,
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Get a full crystallization report by ID."""
+    sc = get_storage_client()
+    # Storage requires the owning tenant (#1167): it authenticates nothing, so a
+    # bare report UUID was enough to read any tenant's report off 0.0.0.0:8002.
+    # Which tenant to ask for has to be decided here, and it is a genuine
+    # decision because a report id does not say who owns it:
+    #
+    #   * a tenant-scoped credential asks about its own tenant by default;
+    #   * a cross-tenant read key names one of the tenants it may read — that
+    #     capability existed before this change and is preserved, not narrowed;
+    #   * an admin key has NO tenant of its own, so it must name one. That is
+    #     the one behaviour this change takes away, and it matches what the
+    #     sibling ``GET /reports`` in this package already requires of admin
+    #     keys.
+    scope = tenant_id or auth.tenant_id
+    if not scope:
+        # 400, not 401: the credential IS authenticated, this request just names
+        # no tenant — the distinction #987 drew on the skills-inbox routes.
+        raise HTTPException(
+            status_code=400,
+            detail=coded_detail(
+                errors.AUTH_TENANT_REQUIRED,
+                "This credential has no tenant of its own, so the report's tenant must be named.",
+                remediation="Retry with ?tenant_id=<owning tenant>.",
+            ),
+        )
+    # Compares two strings the caller already knows, before any lookup, so the
+    # 403 it can raise says something about the credential and nothing about
+    # whether the report — or the named tenant — exists.
+    auth.enforce_readable_tenant(scope)
+    report = await sc.get_report(str(report_id), scope)
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    # Kept, though the scoped fetch above now makes it unreachable in normal
+    # operation. Collapsing foreign-tenant (403) into not-found (404) is what
+    # stops a caller probing for reports in other tenants by distinguishing the
+    # two on random UUIDs (audit finding #22), and the two checks fail
+    # independently: drop the ``scope`` argument and this still masks; drop this
+    # and storage still refuses. Neither is a reason to remove the other.
+    if not auth.is_admin and report.get("tenant_id") not in auth.readable_tenant_ids:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return {
+        "id": str(report.get("id", "")),
+        "tenant_id": report.get("tenant_id"),
+        "fleet_id": report.get("fleet_id"),
+        "trigger": report.get("trigger"),
+        "status": report.get("status"),
+        "started_at": report.get("started_at"),
+        "completed_at": report.get("completed_at"),
+        "duration_ms": report.get("duration_ms"),
+        "summary": report.get("summary") or {},
+        "hygiene": report.get("hygiene") or {},
+        "health": report.get("health") or {},
+        "usage_data": report.get("usage_data") or {},
+        "issues": report.get("issues") or [],
+        "crystallization": report.get("crystallization") or {},
+    }
+
+
+@router.get(
+    "/crystallize/latest",
+    responses={200: {"model": _oar.CrystallizeReport | None}},
+)
+async def get_latest_report(
+    tenant_id: str = Query(...),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Get the most recent completed crystallization report for a tenant.
+
+    Returns ``200`` with the report body when a completed report exists;
+    returns ``200`` with body ``null`` when the tenant has none yet. The
+    URL itself is the well-defined "give me my latest report" resource —
+    the fact that no completed report exists yet is *empty state*, not a
+    missing resource. ``404`` would conflate the two and force every
+    client to special-case it as "actually empty"; see CAURA-646. The
+    sibling ``/crystallize/reports/{report_id}`` keeps its 404 because
+    *that* endpoint genuinely points at an opaque id that may not exist.
+    """
+    auth.enforce_tenant(tenant_id)
+    sc = get_storage_client()
+    report = await sc.get_latest_report(tenant_id)
+    # Identity check, not truthiness — the storage client's contract is
+    # ``dict | None``. ``not {}`` would also be True, which would
+    # silently null-return an empty (but otherwise valid) report dict
+    # if storage ever changed to return ``{}`` instead of ``None`` on a
+    # miss. ``is None`` is the precise guard the contract supports.
+    if report is None:
+        return None
+    return {
+        "id": str(report.get("id", "")),
+        "tenant_id": report.get("tenant_id"),
+        "fleet_id": report.get("fleet_id"),
+        "trigger": report.get("trigger"),
+        "status": report.get("status"),
+        "started_at": report.get("started_at"),
+        "completed_at": report.get("completed_at"),
+        "duration_ms": report.get("duration_ms"),
+        "summary": report.get("summary") or {},
+        "hygiene": report.get("hygiene") or {},
+        "health": report.get("health") or {},
+        "usage_data": report.get("usage_data") or {},
+        "issues": report.get("issues") or [],
+        "crystallization": report.get("crystallization") or {},
+    }

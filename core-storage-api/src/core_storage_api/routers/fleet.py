@@ -1,0 +1,391 @@
+"""Fleet node and command endpoints."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, Request
+
+from core_storage_api.routers._validation import _require, _require_uuid
+from core_storage_api.schemas import FLEET_COMMAND_FIELDS, FLEET_NODE_FIELDS, orm_to_dict
+from core_storage_api.services.postgres_service import UNSCOPED, PostgresService
+
+router = APIRouter(prefix="/fleet", tags=["Fleet"])
+_svc = PostgresService()
+
+
+# ------------------------------------------------------------------
+# Fleets (top-level)
+# ------------------------------------------------------------------
+
+
+@router.get("")
+async def list_fleets(tenant_id: str) -> list[dict]:
+    rows = await _svc.fleet_list(tenant_id=tenant_id)
+    return [
+        {
+            "fleet_id": r.fleet_id,
+            "node_count": r.node_count,
+            "last_heartbeat": r.last_heartbeat.isoformat() if r.last_heartbeat else None,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/stats")
+async def fleet_stats(
+    tenant_id: str,
+    fleet_id: str | None = None,
+) -> dict:
+    return await _svc.fleet_agent_stats(tenant_id, fleet_id)
+
+
+@router.get("/exists")
+async def fleet_exists(tenant_id: str, fleet_id: str) -> dict:
+    exists = await _svc.fleet_exists(tenant_id=tenant_id, fleet_id=fleet_id)
+    return {"exists": exists}
+
+
+@router.delete("/{fleet_id}")
+async def delete_fleet(fleet_id: str, tenant_id: str) -> dict:
+    await _svc.fleet_delete(tenant_id=tenant_id, fleet_id=fleet_id)
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------
+# Nodes
+# ------------------------------------------------------------------
+
+
+@router.post("/nodes")
+async def upsert_node(request: Request) -> dict:
+    body: dict = await request.json()
+    # Parse ISO datetime strings from HTTP JSON
+    for dt_key in ("last_heartbeat",):
+        if isinstance(body.get(dt_key), str):
+            body[dt_key] = datetime.fromisoformat(body[dt_key])
+    # The credential the heartbeat came from (M-85), applied under the binding
+    # rule ``fleet_upsert_node`` documents rather than written as a column.
+    owner_principal = body.pop("owner_principal", None)
+    if owner_principal is not None and not isinstance(owner_principal, str):
+        raise HTTPException(status_code=422, detail="'owner_principal' must be a string or null")
+    node_id = await _svc.fleet_upsert_node(values=body, owner_principal=owner_principal)
+    if node_id is None:
+        raise HTTPException(status_code=409, detail="Node is bound to another credential")
+    return {"id": str(node_id)}
+
+
+@router.post("/nodes/{node_id}/release")
+async def release_node(node_id: UUID, request: Request) -> dict:
+    """Clear a node's binding, or bind it straight to ``owner_principal`` (M-85)."""
+    body: dict = await request.json()
+    tenant_id = _require(body, "tenant_id")
+    owner_principal = body.get("owner_principal")
+    if owner_principal is not None and not isinstance(owner_principal, str):
+        raise HTTPException(status_code=422, detail="'owner_principal' must be a string or null")
+    if not await _svc.fleet_release_node(
+        tenant_id=tenant_id, node_id=node_id, owner_principal=owner_principal
+    ):
+        raise HTTPException(status_code=404, detail="Node not found")
+    return {"ok": True}
+
+
+@router.get("/nodes")
+async def list_nodes(
+    tenant_id: str,
+    fleet_id: str | None = None,
+) -> list[dict]:
+    nodes = await _svc.fleet_list_nodes(tenant_id=tenant_id, fleet_id=fleet_id)
+    return [orm_to_dict(n, FLEET_NODE_FIELDS) for n in nodes]
+
+
+@router.get("/nodes/count")
+async def count_nodes(
+    tenant_id: str,
+    fleet_id: str | None = None,
+) -> dict:
+    if fleet_id:
+        count = await _svc.fleet_count_nodes(tenant_id=tenant_id, fleet_id=fleet_id)
+    else:
+        nodes = await _svc.fleet_list_nodes(tenant_id=tenant_id)
+        count = len(nodes)
+    return {"count": count}
+
+
+@router.get("/nodes/summary")
+async def nodes_summary(
+    tenant_id: str,
+    days: int = 7,
+) -> dict:
+    """Recently-seen node count and their distinct plugin versions, one tenant.
+
+    Backs ``counts.plugin_nodes_7d`` / ``counts.plugin_versions`` in the
+    anonymous heartbeat (core-api ``heartbeat/payload.py``). Declared before
+    ``/nodes/{node_name}`` so the literal segment wins the match.
+    """
+    if days < 1 or days > 365:
+        raise HTTPException(status_code=422, detail="days must be between 1 and 365")
+    since = datetime.now(UTC) - timedelta(days=days)
+    nodes, versions = await _svc.fleet_nodes_summary(tenant_id=tenant_id, since=since)
+    return {"nodes_7d": nodes, "plugin_versions": versions}
+
+
+@router.get("/nodes/{node_name}")
+async def get_node(
+    node_name: str,
+    tenant_id: str,
+) -> dict:
+    node_id = await _svc.fleet_get_node_id(tenant_id=tenant_id, node_name=node_name)
+    if node_id is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    node = await _svc.fleet_get_node_by_id(node_id=node_id, tenant_id=tenant_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return orm_to_dict(node, FLEET_NODE_FIELDS)
+
+
+@router.delete("/nodes/{node_name}")
+async def delete_node(
+    node_name: str,
+    tenant_id: str,
+) -> dict:
+    node_id = await _svc.fleet_get_node_id(tenant_id=tenant_id, node_name=node_name)
+    if node_id is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    # Delete the NODE, which is what a caller asked for. This used to delete
+    # the node's commands and return ``{"ok": True}`` with the row still
+    # there — so the node kept reporting in, kept appearing in
+    # ``GET /nodes``, and a second DELETE succeeded just as loudly. The
+    # command cleanup was real but it was never the operation; the node row
+    # was the operation, and only the commands were ever touched.
+    #
+    # Deleting the commands was also conditional on the node having a
+    # ``fleet_id``, which nothing about a delete depends on: an unfleeted
+    # node's commands were left behind as well.
+    deleted = await _svc.fleet_delete_node(tenant_id=tenant_id, node_id=node_id)
+    if not deleted:
+        # Lost a race with a concurrent delete. The caller's intent holds
+        # either way, so this is not an error — but it is not "I deleted it".
+        raise HTTPException(status_code=404, detail="Node not found")
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------
+# Commands
+# ------------------------------------------------------------------
+
+
+@router.post("/commands")
+async def create_command(request: Request) -> dict:
+    body: dict = await request.json()
+    # The node must belong to the tenant the command is being filed under.
+    # ``fleet_commands.node_id`` has an FK to ``fleet_nodes.id`` but there is no
+    # cross-column tenant constraint, so an insert naming ANOTHER tenant's node
+    # UUID satisfies the FK and lands. The caller's tenant gate upstream only
+    # ever sees ``tenant_id``, which the caller is free to set to its own, so
+    # the node/tenant PAIR has to be checked here.
+    #
+    # It is the fetch predicate now rather than a comparison afterwards:
+    # ``fleet_get_node_by_id`` takes the tenant and returns None when either
+    # half misses. Same outcome, one fewer thing a later caller can forget.
+    #
+    # ``_require`` rather than ``body.get``: a missing tenant would otherwise
+    # scope to nothing and surface as "Node not found" — fail-closed, but it
+    # says the wrong thing, and it leaves this route's scoping unreadable to the
+    # tenant-scope gate's AST pass, which is the whole of the ``blind-spot``
+    # category. A malformed request is a 422.
+    tenant_id = _require(body, "tenant_id")
+    raw_node_id = body.get("node_id")
+    node = None
+    if raw_node_id is not None:
+        try:
+            node = await _svc.fleet_get_node_by_id(node_id=UUID(str(raw_node_id)), tenant_id=tenant_id)
+        except ValueError:
+            node = None
+    if node is None:
+        # 404 for "no such node" and "not your node" alike. Splitting them would
+        # make this route an existence oracle for node UUIDs — and an unguarded
+        # insert of an unknown UUID raises ForeignKeyViolationError, which is an
+        # unhandled 500 rather than an answer.
+        raise HTTPException(status_code=404, detail="Node not found")
+    command = await _svc.fleet_add_command(body)
+    return orm_to_dict(command, FLEET_COMMAND_FIELDS)
+
+
+@router.get("/commands")
+async def list_commands(
+    tenant_id: str,
+    node_name: str | None = None,
+    node_id: UUID | None = None,
+    status: str | None = None,
+    command: str | None = None,
+    limit: int = 50,
+    owner_principal: str | None = None,
+) -> list[dict]:
+    # ``node_id`` accepted directly (OSS 09/02 M-26) as well as by name. The
+    # service has always filtered on the id; only ``node_name`` was reachable
+    # from outside, so core-api's ``GET /fleet/commands?node_id=...`` — which
+    # takes a UUID — had nothing to send it to and dropped the filter.
+    # An explicit id wins over a name: it needs no lookup and cannot be
+    # ambiguous.
+    if node_id is None and node_name:
+        node_id = await _svc.fleet_get_node_id(tenant_id=tenant_id, node_name=node_name)
+        if node_id is None:
+            # The caller named a node this tenant does not have. Returning []
+            # is the only honest answer: falling through with ``node_id=None``
+            # would DROP the filter and list every command in the tenant, so a
+            # typo would read as "here is everything" rather than "no such
+            # node". (Before this lookup could return None it raised, so the
+            # endpoint 500'd instead — neither answer was the right one.)
+            return []
+    # status/command are filtered in SQL (pre-limit) — the previous
+    # post-limit status filter could silently hide matching rows older
+    # than the ``limit`` newest commands.
+    commands = await _svc.fleet_list_commands(
+        tenant_id=tenant_id,
+        node_id=node_id,
+        status=status,
+        command=command,
+        limit=limit,
+        owner_principal=owner_principal,
+    )
+    return [orm_to_dict(c, FLEET_COMMAND_FIELDS) for c in commands]
+
+
+@router.get("/commands/pending")
+async def get_pending_commands(
+    tenant_id: str,
+    node_name: str,
+) -> list[dict]:
+    node_id = await _svc.fleet_get_node_id(tenant_id=tenant_id, node_name=node_name)
+    if node_id is None:
+        # Unknown node has no pending commands — see ``get_commands`` for why
+        # this returns empty rather than querying with a null node filter.
+        return []
+    commands = await _svc.fleet_get_pending_commands(node_id=node_id, tenant_id=tenant_id)
+    return [orm_to_dict(c, FLEET_COMMAND_FIELDS) for c in commands]
+
+
+@router.get("/commands/in-flight-deploy")
+async def in_flight_deploy(node_id: UUID, tenant_id: str, since: datetime) -> dict:
+    """True if a ``deploy`` command for this node is still in flight
+    (status pending/acked, created_at >= since), within ``tenant_id``.
+
+    ``tenant_id`` is a **required** query parameter. Without it this answered
+    for any node whose UUID the caller could name, from a service that
+    authenticates nothing — so another tenant's rollouts were observable as
+    they happened.
+    """
+    in_flight = await _svc.fleet_has_recent_in_flight_deploy(
+        node_id=node_id, tenant_id=tenant_id, since=since
+    )
+    return {"in_flight": in_flight}
+
+
+@router.get("/commands/deploy-attempt-count")
+async def deploy_attempt_count(node_id: UUID, tenant_id: str, target_version: str, since: datetime) -> dict:
+    """Count auto-upgrade ``deploy`` commands for this node at
+    ``target_version`` since ``since`` — ALL statuses, within ``tenant_id``.
+
+    ``tenant_id`` is **required**, as on ``in-flight-deploy``. Unscoped, this
+    also answered "is this node moving to version X" for a caller-named
+    version, which made it an oracle for another tenant's release schedule.
+    """
+    count = await _svc.fleet_count_recent_deploys_for_target(
+        node_id=node_id,
+        tenant_id=tenant_id,
+        target_version=target_version,
+        since=since,
+    )
+    return {"count": count}
+
+
+@router.patch("/commands/{command_id}/status")
+async def update_command_status(command_id: UUID, request: Request) -> dict:
+    """Update a command's status / result.
+
+    ``tenant_id`` scopes the UPDATE so a tenant can only complete its own
+    commands — keying on ``command_id`` alone let any caller that knew a
+    command UUID mark another tenant's command done/failed (cross-tenant
+    BOLA). ``ok`` reports whether a row actually matched so the caller can
+    surface 404 instead of silently succeeding.
+
+    The key must be **present**; ``null`` is the admin/unscoped opt-out.
+    Absent and null used to be the same request, which made the unscoped
+    UPDATE what a caller got by omission — the one mistake this endpoint
+    cannot afford, since storage authenticates nothing and trusts the
+    tenant its caller names. Distinguishing them costs the caller nothing:
+    core-api already sends ``{"tenant_id": auth.tenant_id}`` on every
+    call and serializes the admin case as an explicit ``null``.
+    """
+    body: dict = await request.json()
+    if "tenant_id" not in body:
+        raise HTTPException(
+            status_code=422,
+            detail="'tenant_id' is required; send null to update unscoped (admin callers)",
+        )
+    raw_tenant_id = body["tenant_id"]
+    if raw_tenant_id is not None and not isinstance(raw_tenant_id, str):
+        raise HTTPException(
+            status_code=422,
+            detail="'tenant_id' must be a string or null",
+        )
+    owner_principal = body.get("owner_principal")
+    if owner_principal is not None and not isinstance(owner_principal, str):
+        raise HTTPException(status_code=422, detail="'owner_principal' must be a string or null")
+    completed_at_raw = body.get("completed_at")
+    matched = await _svc.fleet_update_command_result(
+        command_id=command_id,
+        status=body["status"],
+        tenant_id=UNSCOPED if raw_tenant_id is None else raw_tenant_id,
+        result=body.get("result"),
+        completed_at=(datetime.fromisoformat(completed_at_raw) if completed_at_raw else datetime.now(UTC)),
+        owner_principal=owner_principal,
+    )
+    return {"ok": matched}
+
+
+@router.post("/commands/{command_id}/claim")
+async def claim_interview_request(command_id: UUID, request: Request) -> dict:
+    """Spend a delivered ``interview_request`` on one interview window (M-86).
+
+    ``ok`` is True only the first time, and only for this tenant's request,
+    queued for ``node_id`` and acked by that node's heartbeat.
+    """
+    body: dict = await request.json()
+    tenant_id = _require(body, "tenant_id")
+    node_id = _require_uuid(body, "node_id")
+    claimed = await _svc.fleet_claim_interview_request(
+        tenant_id=tenant_id, command_id=command_id, node_id=node_id
+    )
+    return {"ok": claimed}
+
+
+@router.post("/commands/ack")
+async def ack_commands(request: Request) -> dict:
+    """Mark commands acked. ``tenant_id`` scopes which ones can be touched.
+
+    Keyed on ``command_ids`` alone, this took a bare list of UUIDs and acked
+    every row that matched, whichever tenant owned it — cross-tenant BOLA, the
+    same shape as GHSA-xw4x-jwf5-8m9h in this subsystem and as
+    ``PATCH /commands/{command_id}/status`` above, which was scoped for it.
+
+    Unlike that route there is no ``null`` admin opt-out, because nothing acks
+    across tenants: the only caller is core-api's heartbeat, whose
+    ``tenant_id`` is a required ``str``. ``_require`` rejects a missing or
+    empty one with a 422.
+
+    ``count`` is the number of rows that actually matched rather than the
+    number asked for, so acking a command that is not yours reports 0 instead
+    of a silent success.
+    """
+    body: dict = await request.json()
+    tenant_id = _require(body, "tenant_id")
+    command_ids = [UUID(cid) if isinstance(cid, str) else cid for cid in body["command_ids"]]
+    matched = await _svc.fleet_ack_commands(
+        command_ids=command_ids,
+        tenant_id=tenant_id,
+        now=datetime.now(UTC),
+    )
+    return {"ok": True, "count": matched}
