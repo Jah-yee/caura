@@ -23,6 +23,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from common import permanent_failure
+from common.constants import QUARANTINE_EXITS, QUARANTINED_MEMORY_STATUS
 from common.enrichment.constants import SERVER_RESERVED_MEMORY_TYPES
 from core_api import openapi_responses as _oar
 from core_api import request_phase
@@ -44,6 +45,7 @@ from core_api.constants import (
 from core_api.errors import (
     AUTH_AGENT_TRUST_TOO_LOW,
     AUTH_FLEET_SCOPE_FORBIDDEN,
+    AUTH_PERSON_REQUIRED,
     AUTH_TARGET_AGENT_RESTRICTED,
     REQUEST_BUDGET_EXCEEDED,
     coded_detail,
@@ -62,6 +64,7 @@ from core_api.schemas import (
     BulkMemoryCreate,
     BulkMemoryItem,
     BulkMemoryResponse,
+    HeldMemoryPage,
     IngestCommitRequest,
     IngestRequest,
     MemoryCreate,
@@ -76,6 +79,8 @@ from core_api.schemas import (
     SearchRequest,
     SearchResponse,
     SearchWarning,
+    SessionRollbackRequest,
+    SessionRollbackResponse,
     STMWriteResponse,
     UsageSummary,
 )
@@ -878,6 +883,105 @@ async def memory_count(
     return {"count": count}
 
 
+def _require_person(auth: AuthContext, what: str) -> None:
+    """Held memories and their review are a person's (g2.7, g2.9): 403 to anyone else."""
+    if not auth.is_person:
+        raise HTTPException(
+            status_code=403,
+            detail=coded_detail(
+                AUTH_PERSON_REQUIRED, f"{what} is for a signed-in person, not an agent or an API key."
+            ),
+        )
+
+
+@router.get("/memories/held", response_model=HeldMemoryPage)
+async def list_held_memories(
+    tenant_id: str = Query(...),
+    session_id: str | None = Query(
+        default=None, min_length=1, max_length=200, description="Only what this broker session had held."
+    ),
+    limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """The memories held for a person's review, newest first, and how many.
+
+    The write gate's queue (g2.9). A held memory shows here, and in the
+    inspector opened from here, and nowhere else. A person releases or rejects
+    one with ``PATCH /memories/{id}/status``. Pass ``next_cursor`` back as
+    ``cursor``; ``total`` counts the whole queue, not only the page. Declared
+    BEFORE ``/memories/{memory_id}`` so ``held`` isn't read as an id.
+    """
+    auth.enforce_tenant(tenant_id)
+    _require_person(auth, "The held-memory queue")
+    cursor_ts = cursor_id = None
+    if cursor:
+        try:
+            cursor_ts, cursor_id = decode_cursor(cursor)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid cursor")
+    page = await get_storage_client().list_held_memories(
+        tenant_id, session_id=session_id, limit=limit + 1, cursor_ts=cursor_ts, cursor_id=cursor_id
+    )
+    rows = page["items"]
+    next_cursor = None
+    if len(rows) > limit:
+        last = rows[limit - 1]
+        next_cursor = encode_cursor(datetime.fromisoformat(last["created_at"]), UUID(last["id"]))
+    return HeldMemoryPage(
+        items=[_memory_to_out(m) for m in rows[:limit]], next_cursor=next_cursor, total=page["total"]
+    )
+
+
+@router.post("/memories/rollback-session", response_model=SessionRollbackResponse)
+async def rollback_session(
+    body: SessionRollbackRequest,
+    tenant_id: str = Query(...),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Undo what an agent wrote in one broker session (g2.9).
+
+    Its live memories, and the rows derived from them, become ``outdated``, and
+    what they had superseded or contradicted ``active`` again; the ones held for review become
+    ``cancelled``, as a reject would make them. A person only. Each memory
+    changed gets its own ``session.rollback`` audit row naming that person, so
+    the trail shows it on the memory. A second rollback of the same session
+    changes nothing.
+    """
+    auth.enforce_read_only()
+    auth.enforce_tenant(tenant_id)
+    _require_person(auth, "Rolling back a session")
+    changed = await get_storage_client().rollback_session(tenant_id, body.session_id)
+    # Storage has committed the rollback, and a second one changes nothing, so a
+    # row missed here is never written. Each is ``critical``: a full audit queue
+    # writes it straight to storage instead of dropping it. A write that still
+    # fails (no queue, storage down) is logged and the rest go on, so it costs
+    # its own row only, and the response still says what changed.
+    for kind, new_status in (("outdated", "outdated"), ("restored", "active"), ("cancelled", "cancelled")):
+        for memory_id in changed[kind]:
+            try:
+                await log_action(
+                    tenant_id=tenant_id,
+                    action="session.rollback",
+                    resource_type="memory",
+                    resource_id=memory_id,
+                    detail={"session_id": body.session_id, "new_status": new_status, **auth.audit_actor()},
+                    critical=True,
+                )
+            except Exception:
+                logger.exception(
+                    "session.rollback audit row not written for memory %s (session %s)",
+                    memory_id,
+                    body.session_id,
+                )
+    return SessionRollbackResponse(
+        session_id=body.session_id,
+        outdated=changed["outdated"],
+        restored=changed["restored"],
+        cancelled=changed["cancelled"],
+    )
+
+
 @router.delete("/memories", status_code=204)
 async def delete_all_memories(
     tenant_id: str = Query(...),
@@ -1090,7 +1194,11 @@ async def get_memory(
     try:
         # Storage bundles the row + entity-link outerjoin + server-computed
         # embedding stats (raw pgvector never crosses the wire) in one call.
-        detail = await get_storage_client().get_memory_detail(tenant_id, str(memory_id))
+        # A held memory opens for a person reviewing it and is a 404 to
+        # everyone else, agents and machine keys included.
+        detail = await get_storage_client().get_memory_detail(
+            tenant_id, str(memory_id), include_held=auth.is_person
+        )
         if detail is None:
             raise HTTPException(status_code=404, detail="Memory not found")
         memory = detail["memory"]
@@ -2026,7 +2134,12 @@ async def update_memory_status(
     tenant_id: str = Query(...),
     auth: AuthContext = Depends(get_auth_context),
 ):
-    """Update memory status (e.g., active → confirmed)."""
+    """Update memory status (e.g., active → confirmed).
+
+    A memory held for review leaves quarantine here, and only here: a person
+    releases it (``active``) or rejects it (``cancelled``). To anyone else it
+    is a 404, as on every other read.
+    """
     auth.enforce_read_only()
     # Asked, not assumed. ``transition`` is not in ``PLAN_LIMIT_GATED_OPS``, so
     # this is a no-op today — deliberately written as a lookup rather than as an
@@ -2050,10 +2163,17 @@ async def update_memory_status(
         )
     sc = get_storage_client()
     # ``get_memory`` filters out soft-deleted / cross-tenant rows
-    # server-side, so a returned row is live + owned.
-    memory = await sc.get_memory(str(memory_id), tenant_id)
+    # server-side, so a returned row is live + owned. A held one comes back
+    # for a person only.
+    memory = await sc.get_memory(str(memory_id), tenant_id, include_held=auth.is_person)
     if not memory:
         raise HTTPException(status_code=404, detail="Memory not found")
+    held = memory.get("status") == QUARANTINED_MEMORY_STATUS
+    if held and status not in QUARANTINE_EXITS:
+        raise HTTPException(
+            status_code=409,
+            detail="A held memory is released (status 'active') or rejected (status 'cancelled'), nothing else.",
+        )
     # Cross-fleet / scope_agent row authorization for the authenticated agent
     # (no-op for tenant-scoped dashboard credentials, where auth.agent_id is None).
     if auth.agent_id:
@@ -2074,16 +2194,22 @@ async def update_memory_status(
                 ),
             )
     old_status = memory.get("status")
-    await sc.update_memory_status(str(memory_id), status, tenant_id=tenant_id)
+    updated = await sc.update_memory_status(str(memory_id), status, tenant_id=tenant_id, release_hold=held)
+    if held and updated is None:
+        # Another reviewer released or rejected it first.
+        raise HTTPException(status_code=409, detail="This memory is no longer held.")
 
     # Audit stays a decoupled async POST (not folded into the storage txn).
+    # A release or reject names the person who decided it.
     await log_action(
         tenant_id=tenant_id,
         agent_id=memory.get("agent_id"),
-        action="status_update",
+        action=("quarantine.release" if status == "active" else "quarantine.reject")
+        if held
+        else "status_update",
         resource_type="memory",
         resource_id=memory_id,
-        detail={"old_status": old_status, "new_status": status},
+        detail={"old_status": old_status, "new_status": status, **(auth.audit_actor() if held else {})},
     )
     return {"memory_id": str(memory_id), "old_status": old_status, "new_status": status}
 
