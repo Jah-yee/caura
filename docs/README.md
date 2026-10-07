@@ -16,6 +16,8 @@ agent.
   what to expect in your own system, and what the numbers cannot tell you.
 - [`operator-forge-cron.md`](operator-forge-cron.md) — driving the Skill
   Factory's Forge and promoter ticks from an external scheduler.
+- [`telemetry.md`](telemetry.md) — the anonymous daily heartbeat a
+  self-hosted server sends, and how to opt out.
 
 ## Building against the API
 
